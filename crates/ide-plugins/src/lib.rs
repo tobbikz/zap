@@ -125,8 +125,5 @@ impl PluginHost {
 }
 
 fn plugins_dir() -> Option<PathBuf> {
-    let mut p = dirs::config_dir()?;
-    p.push("tui-ide");
-    p.push("plugins");
-    Some(p)
+    Some(ide_core::config_dir()?.join("plugins"))
 }

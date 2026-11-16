@@ -1,6 +1,6 @@
-# Feature inventory — DB Studio
+# Feature inventory — Zap
 
-Complete map of what ships in **v0.5.0**. Companion to the [README](../README.md).
+Complete map of what ships in **v0.6.0**. Companion to the [README](../README.md).
 
 <p align="center">
   <img src="assets/hero-results-hover.png" alt="Results hover preview" width="860" />
@@ -10,13 +10,13 @@ Complete map of what ships in **v0.5.0**. Companion to the [README](../README.md
 
 ## Positioning
 
-DB Studio is a **keyboard-first Database IDE in the terminal** for DBAs, SREs, and data engineers who:
+Zap is a **keyboard-first Database IDE in the terminal** for DBAs, SREs, and data engineers who:
 
 - Work over **SSH / bastions / tmux** where Electron IDEs crawl
 - Want **Explorer → Structure → Console → Results** without leaving the keyboard
 - Need **inline grid edit → SQL preview → Apply**, EXPLAIN visuals, dump/restore, and multi-engine drivers in one binary
 
-Desktop IDEs (DataGrip, DBeaver, Azure Data Studio, …) remain excellent for heavy GUI modeling and some enterprise connectors. For the daily DBA loop — connect, browse, filter, edit, explain, export — **DB Studio is designed to feel faster and lighter**, especially remote.
+Desktop IDEs (DataGrip, DBeaver, Azure Data Studio, …) remain excellent for heavy GUI modeling and some enterprise connectors. For the daily DBA loop — connect, browse, filter, edit, explain, export — **Zap is designed to feel faster and lighter**, especially remote.
 
 ---
 
@@ -182,11 +182,11 @@ Palette recipes (seed / gallery):
 
 | | |
 |--|--|
-| **Binary** | Rust · `db-studio` |
+| **Binary** | Rust · `zap` |
 | **OS** | Linux · Windows ([INSTALL.md](INSTALL.md)) |
-| **Config** | `~/.config/tui-ide/` · `%APPDATA%\tui-ide\` |
+| **Config** | `~/.config/zap/` · `%APPDATA%\zap\` |
 | **License** | Apache-2.0 |
-| **Release** | [v0.5.0](https://github.com/tobbikz/db-studio/releases/tag/v0.5.0) |
+| **Release** | [v0.6.0](https://github.com/tobbikz/zap/releases/tag/v0.6.0) |
 
 ---
 

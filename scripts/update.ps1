@@ -1,4 +1,4 @@
-# Update db-studio from git and reinstall on Windows
+# Update zap from git and reinstall on Windows
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $Root

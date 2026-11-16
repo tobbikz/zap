@@ -6,7 +6,7 @@
 - RDP: `std::process::Command` → `xfreerdp` / `wlfreerdp` / `remmina` (`which`)
 
 ## Store
-`~/.config/tui-ide/sessions.toml` — list of profiles. **No password fields**; identity file path + ssh-agent only. Save refuses content containing `password`.
+`~/.config/zap/sessions.toml` — list of profiles. **No password fields**; identity file path + ssh-agent only. Save refuses content containing `password`.
 
 ## Profile fields
 | Field | SSH | RDP |

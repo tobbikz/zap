@@ -3,9 +3,10 @@ name = "ide-agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Agent CLI profiles and PTY launch helpers for tui-ide"
+description = "Agent CLI profiles and PTY launch helpers for Zap"
 
 [dependencies]
+ide-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true

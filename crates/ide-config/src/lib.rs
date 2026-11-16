@@ -263,10 +263,7 @@ fn default_keymaps() -> HashMap<String, String> {
 
 impl IdeConfig {
     pub fn config_path() -> Option<PathBuf> {
-        let mut p = dirs::config_dir()?;
-        p.push("tui-ide");
-        p.push("config.toml");
-        Some(p)
+        Some(ide_core::config_dir()?.join("config.toml"))
     }
 
     pub fn load() -> Self {

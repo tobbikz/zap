@@ -1,8 +1,34 @@
-//! Shared types, errors, and editor mode for tui-ide.
+//! Shared types, errors, and editor mode for Zap.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+/// Product display name.
+pub const PRODUCT_NAME: &str = "Zap";
+
+/// CLI / binary name.
+pub const PRODUCT_BIN: &str = "zap";
+
+/// Resolve the config directory.
+/// Preference: `zap` → `tui-ide` (first that exists, else create `zap`).
+pub fn config_dir() -> Option<PathBuf> {
+    let base = dirs::config_dir()?;
+    let zap = base.join("zap");
+    let ide = base.join("tui-ide");
+    Some(if zap.exists() {
+        zap
+    } else if ide.exists() {
+        ide
+    } else {
+        zap
+    })
+}
+
+/// Cache / log directory (`~/.cache/zap`).
+pub fn cache_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join(PRODUCT_BIN))
+}
 
 #[derive(Debug, Error)]
 pub enum IdeError {

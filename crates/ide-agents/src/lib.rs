@@ -1,6 +1,6 @@
 //! Agent CLI profiles (Cursor `agent`, Claude Code, OpenCode, custom).
 //!
-//! SSOT file: `~/.config/tui-ide/agents.toml`
+//! SSOT file: `~/.config/zap/agents.toml`
 //! Never stores API keys / passwords — env vars only.
 
 use anyhow::{Context, Result, bail};
@@ -378,10 +378,7 @@ pub struct LaunchOutcome {
 }
 
 pub fn agents_path() -> Option<PathBuf> {
-    let mut p = dirs::config_dir()?;
-    p.push("tui-ide");
-    p.push("agents.toml");
-    Some(p)
+    Some(ide_core::config_dir()?.join("agents.toml"))
 }
 
 pub fn default_profiles() -> Vec<AgentProfile> {

@@ -1736,10 +1736,11 @@ dependencies = [
 
 [[package]]
 name = "ide-agents"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "ide-core",
  "ide-term",
  "serde",
  "tempfile",
@@ -1749,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "ide-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1783,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "ide-buffer"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ide-core",
  "ropey",
@@ -1794,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "ide-config"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1806,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "ide-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1817,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "ide-dap"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -1831,13 +1832,14 @@ dependencies = [
 
 [[package]]
 name = "ide-db"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
  "dirs",
  "duckdb",
  "futures-util",
+ "ide-core",
  "mongodb",
  "redis",
  "regex",
@@ -1856,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "ide-fs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "ide-core",
@@ -1866,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "ide-git"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1875,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "ide-lsp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes 1.12.1",
@@ -1896,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "ide-nvim"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1912,10 +1914,11 @@ dependencies = [
 
 [[package]]
 name = "ide-plugins"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "ide-core",
  "serde",
  "toml",
  "tracing",
@@ -1923,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "ide-search"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "ignore",
@@ -1934,10 +1937,11 @@ dependencies = [
 
 [[package]]
 name = "ide-sessions"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "ide-core",
  "ide-term",
  "serde",
  "tempfile",
@@ -1947,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "ide-syntax"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ide-core",
  "parking_lot",
@@ -1965,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "ide-term"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -1975,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "ide-ui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "crossterm",

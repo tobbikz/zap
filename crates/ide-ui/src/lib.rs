@@ -946,7 +946,7 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
 
 fn render_breadcrumbs(frame: &mut Frame, area: Rect, ui: &UiState) {
     let text = if ui.breadcrumbs.is_empty() {
-        " tui-ide "
+        " Zap "
     } else {
         ui.breadcrumbs.as_str()
     };
@@ -1833,7 +1833,7 @@ fn render_sessions(
                 Style::default().fg(Color::DarkGray),
             )));
             items.push(ListItem::new(Span::styled(
-                " Ctrl-Shift-S Sessions · ~/.config/tui-ide/sessions.toml ",
+                " Ctrl-Shift-S Sessions · ~/.config/zap/sessions.toml ",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -3278,7 +3278,7 @@ fn hover_wrap_lines(s: &str, width: usize) -> Vec<String> {
 fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_active: bool) {
     // Quiet brand — no inverted pill, no redundant "studio" chip.
     let brand = Span::styled(
-        " DB Studio",
+        " Zap",
         theme::style_text().add_modifier(Modifier::BOLD),
     );
 
@@ -3360,7 +3360,7 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
 
     let width = area.width as usize;
     let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
-    let left_w = " DB Studio".chars().count();
+    let left_w = " Zap".chars().count();
     let gap = width.saturating_sub(left_w + right_w).max(2);
     let mut spans = vec![brand, Span::raw(" ".repeat(gap))];
     spans.extend(right_spans);

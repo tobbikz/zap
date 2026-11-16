@@ -12,7 +12,7 @@ struct SecretsFile {
 }
 
 fn secrets_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("tui-ide").join("secrets.toml"))
+    ide_core::config_dir().map(|p| p.join("secrets.toml"))
 }
 
 fn load() -> SecretsFile {

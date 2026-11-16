@@ -1,13 +1,13 @@
-# Install & update — DB Studio
+# Install & update — Zap
 
 Requires a [Rust toolchain](https://rustup.rs/) (1.75+) and a terminal with truecolor + a Nerd Font recommended.
 
 ## Linux
 
 ```bash
-git clone https://github.com/tobbikz/db-studio.git && cd db-studio
+git clone https://github.com/tobbikz/zap.git && cd zap
 ./scripts/install.sh
-# binary → ~/.local/bin/db-studio
+# binary → ~/.local/bin/zap
 ```
 
 Ensure `~/.local/bin` is on `PATH`:
@@ -19,7 +19,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
 Update later:
 
 ```bash
-cd db-studio && ./scripts/update.sh
+cd zap && ./scripts/update.sh
 ```
 
 ## Windows
@@ -27,10 +27,10 @@ cd db-studio && ./scripts/update.sh
 In PowerShell (Developer / user):
 
 ```powershell
-git clone https://github.com/tobbikz/db-studio.git
-cd db-studio
+git clone https://github.com/tobbikz/zap.git
+cd zap
 .\scripts\install.ps1
-# binary → %LOCALAPPDATA%\db-studio\db-studio.exe
+# binary → %LOCALAPPDATA%\zap\zap.exe
 ```
 
 Reopen the terminal after first install so `PATH` picks up the folder.
@@ -38,7 +38,7 @@ Reopen the terminal after first install so `PATH` picks up the folder.
 Update:
 
 ```powershell
-cd db-studio
+cd zap
 .\scripts\update.ps1
 ```
 
@@ -46,12 +46,12 @@ cd db-studio
 
 ```bash
 cargo build -p ide-app --release
-./target/release/db-studio          # Unix
-.\target\release\db-studio.exe      # Windows
+./target/release/zap          # Unix
+.\target\release\zap.exe      # Windows
 ```
 
 ## Config
 
-User config and connections: `~/.config/tui-ide/` (Linux/macOS) or `%APPDATA%\tui-ide\` (Windows via `dirs` crate).
+User config and connections: `~/.config/zap/` (Linux/macOS) or `%APPDATA%\zap\` (Windows via `dirs` crate).
 
 Themes: `…/tui-ide/themes/*.toml` — see [THEMES.md](./THEMES.md).

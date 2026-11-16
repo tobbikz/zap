@@ -221,7 +221,7 @@ impl LspClient {
                     .to_string(),
             }]),
             client_info: Some(ClientInfo {
-                name: "tui-ide".into(),
+                name: "zap".into(),
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
             locale: None,

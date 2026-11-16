@@ -57,16 +57,14 @@ impl PersonaConfig {
 }
 
 fn config_path() -> PathBuf {
-    dirs::config_dir()
+    ide_core::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("tui-ide")
         .join("persona.toml")
 }
 
 pub fn audit_log_path() -> PathBuf {
-    dirs::config_dir()
+    ide_core::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("tui-ide")
         .join("audit.log")
 }
 
@@ -411,19 +409,19 @@ pub fn bi_deep_link(cfg: &PersonaConfig, schema: &str, table: &str) -> Result<St
         let base = cfg.metabase_url.trim_end_matches('/');
         return Ok(format!("{base}/question#?schema={schema}&table={table}"));
     }
-    bail!("set superset_url or metabase_url in ~/.config/tui-ide/persona.toml");
+    bail!("set superset_url or metabase_url in ~/.config/zap/persona.toml");
 }
 
 pub fn airflow_deep_link(cfg: &PersonaConfig) -> Result<String> {
     if cfg.airflow_url.is_empty() {
-        bail!("set airflow_url in ~/.config/tui-ide/persona.toml");
+        bail!("set airflow_url in ~/.config/zap/persona.toml");
     }
     Ok(format!("{}/dags", cfg.airflow_url.trim_end_matches('/')))
 }
 
 pub fn model_registry_link(cfg: &PersonaConfig) -> Result<String> {
     if cfg.model_registry_url.is_empty() {
-        bail!("set model_registry_url in ~/.config/tui-ide/persona.toml");
+        bail!("set model_registry_url in ~/.config/zap/persona.toml");
     }
     Ok(cfg.model_registry_url.trim_end_matches('/').to_string())
 }
@@ -741,7 +739,7 @@ pub fn studio_help_personas() -> &'static str {
      QA        golden CSV diff · testdata fixtures · fan-out rowcount assert\n\
      Quant     EXPLAIN cost/bytes · warehouse Create · history cost · help\n\
      \n\
-     Config: ~/.config/tui-ide/persona.toml · audit: ~/.config/tui-ide/audit.log\n\
+     Config: ~/.config/zap/persona.toml · audit: ~/.config/zap/audit.log\n\
      Vault: password env:VAR or secrets.toml — never plaintext in packs\n\
      Fixtures: workspace/testdata/*.sql · golden: testdata/golden/*.csv\n"
 }
@@ -776,7 +774,7 @@ pub fn signed_pack_export(sources_toml: &str, out: &Path) -> Result<()> {
     let mut h = DefaultHasher::new();
     sources_toml.hash(&mut h);
     let sig = format!("{:x}", h.finish());
-    let body = format!("# tui-ide connection pack · sig={sig}\n{sources_toml}");
+    let body = format!("# zap connection pack · sig={sig}\n{sources_toml}");
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }

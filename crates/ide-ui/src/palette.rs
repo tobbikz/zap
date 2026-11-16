@@ -1144,7 +1144,7 @@ pub fn render_settings_modal(frame: &mut Frame, screen: Rect, draft: &str) {
         .split(area);
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "  ~/.config/tui-ide/config.toml",
+            "  ~/.config/zap/config.toml",
             theme::style_muted(),
         )),
         inner[0],

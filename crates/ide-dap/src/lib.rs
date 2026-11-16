@@ -107,8 +107,8 @@ impl DapClient {
             .request(
                 "initialize",
                 json!({
-                    "clientID": "tui-ide",
-                    "clientName": "tui-ide",
+                    "clientID": "zap",
+                    "clientName": "zap",
                     "adapterID": "lldb",
                     "pathFormat": "path",
                     "linesStartAt1": true,

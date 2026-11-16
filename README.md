@@ -1,28 +1,28 @@
-# DB Studio
+# Zap
 
 **The keyboard-first Database IDE for DBAs and data engineers.**  
 A truecolor terminal studio — Explorer · Structure · Console · Results — that stays fast over SSH, respects your muscle memory, and never forces a heavyweight desktop IDE.
 
-[![Release](https://img.shields.io/github/v/release/tobbikz/db-studio)](https://github.com/tobbikz/db-studio/releases)
+[![Release](https://img.shields.io/github/v/release/tobbikz/zap)](https://github.com/tobbikz/zap/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-**v0.5.0** · Linux & Windows · Postgres · MySQL · MSSQL · SQLite · DuckDB · ClickHouse · Redis · Mongo · Snowflake · BigQuery · Elasticsearch · Trino
+**v0.6.0** · Linux & Windows · Postgres · MySQL · MSSQL · SQLite · DuckDB · ClickHouse · Redis · Mongo · Snowflake · BigQuery · Elasticsearch · Trino
 
 ---
 
 <p align="center">
-  <img src="docs/assets/hero-results-hover.png" alt="DB Studio Results grid with cell hover preview" width="920" />
+  <img src="docs/assets/hero-results-hover.png" alt="Zap Results grid with cell hover preview" width="920" />
 </p>
 
 <p align="center"><em>Results grid — compact density, WHERE/ORDER wells, cell hover preview, keyboard footer. Built for people who live in SQL.</em></p>
 
 ---
 
-## Why DB Studio (and why desktop IDEs feel slow)
+## Why Zap (and why desktop IDEs feel slow)
 
-We built DB Studio for the DBA who already lives in a terminal — SSH jump boxes, bastions, tmux, Neovim muscle memory — and refuses to wait on Electron chrome or a JetBrains license just to peek at a table.
+We built Zap for the DBA who already lives in a terminal — SSH jump boxes, bastions, tmux, Neovim muscle memory — and refuses to wait on Electron chrome or a JetBrains license just to peek at a table.
 
-| | **DB Studio** | Typical desktop IDE (e.g. DataGrip) |
+| | **Zap** | Typical desktop IDE (e.g. DataGrip) |
 |--|--|--|
 | **Latency feel** | Instant TUI redraw; runs great over SSH | Heavy GUI; painful on high-latency links |
 | **Input model** | Keyboard-first (`Ctrl-P`, `Space` discover, vim-ish normals) | Mouse + menus first |
@@ -32,7 +32,7 @@ We built DB Studio for the DBA who already lives in a terminal — SSH jump boxe
 | **Grid editing** | Inline edit → SQL preview → Apply | Strong — we match the *workflow*, without the bloat |
 | **Ops** | Health, EXPLAIN visuals, dump/restore, migrations | Excellent — we cover the daily 80% in-terminal |
 
-**Honest take:** DataGrip is a fantastic product. For day-to-day DBA work on a bastion — inspect, filter, edit a cell, EXPLAIN, export, switch connections — **DB Studio is the tool you keep open**. No splash screen. No project wizard. Open → connect → query.
+**Honest take:** DataGrip is a fantastic product. For day-to-day DBA work on a bastion — inspect, filter, edit a cell, EXPLAIN, export, switch connections — **Zap is the tool you keep open**. No splash screen. No project wizard. Open → connect → query.
 
 ---
 
@@ -71,7 +71,7 @@ We built DB Studio for the DBA who already lives in a terminal — SSH jump boxe
   <img src="docs/assets/theme-light-preview.png" alt="Theme palette live preview" width="920" />
 </p>
 
-↑↓ previews · Enter keeps · Esc restores · custom TOML under `~/.config/tui-ide/themes/`
+↑↓ previews · Enter keeps · Esc restores · custom TOML under `~/.config/zap/themes/`
 
 ### Space discover
 
@@ -121,22 +121,22 @@ Full inventory: **[docs/FEATURES.md](docs/FEATURES.md)** · Themes: **[docs/THEM
 
 | OS | Install | Update |
 |----|---------|--------|
-| **Linux** | `./scripts/install.sh` → `~/.local/bin/db-studio` | `./scripts/update.sh` |
-| **Windows** | `.\scripts\install.ps1` → `%LOCALAPPDATA%\db-studio\` | `.\scripts\update.ps1` |
+| **Linux** | `./scripts/install.sh` → `~/.local/bin/zap` | `./scripts/update.sh` |
+| **Windows** | `.\scripts\install.ps1` → `%LOCALAPPDATA%\zap\` | `.\scripts\update.ps1` |
 
 Needs [Rust](https://rustup.rs/) 1.75+. Details: **[docs/INSTALL.md](docs/INSTALL.md)**.
 
 ```bash
-git clone https://github.com/tobbikz/db-studio.git && cd db-studio
+git clone https://github.com/tobbikz/zap.git && cd zap
 ./scripts/install.sh
-db-studio
+zap
 ```
 
 ```powershell
-git clone https://github.com/tobbikz/db-studio.git
-cd db-studio
+git clone https://github.com/tobbikz/zap.git
+cd zap
 .\scripts\install.ps1
-db-studio
+zap
 ```
 
 ---
@@ -162,7 +162,7 @@ db-studio
 
 ## Config
 
-`~/.config/tui-ide/` (Linux) · `%APPDATA%\tui-ide\` (Windows)
+`~/.config/zap/` (Linux) · `%APPDATA%\zap\` (Windows)
 
 Connections, `config.toml` (`theme.name = "dark"`), custom themes in `themes/*.toml`.
 
@@ -182,4 +182,4 @@ Connections, `config.toml` (`theme.name = "dark"`), custom themes in `themes/*.t
 
 ## License
 
-Apache-2.0 · [Releases](https://github.com/tobbikz/db-studio/releases)
+Apache-2.0 · [Releases](https://github.com/tobbikz/zap/releases)

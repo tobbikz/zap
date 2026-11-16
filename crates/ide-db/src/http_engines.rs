@@ -103,7 +103,7 @@ async fn exec_trino(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
         .post(format!("{}/v1/statement", conn.base))
         .header("X-Trino-Catalog", catalog)
         .header("X-Trino-Schema", "default")
-        .header("X-Trino-User", if conn.user.is_empty() { "tui-ide" } else { &conn.user })
+        .header("X-Trino-User", if conn.user.is_empty() { "zap" } else { &conn.user })
         .header("Content-Type", "text/plain")
         .body(sql.to_string());
     if !conn.password.is_empty() {

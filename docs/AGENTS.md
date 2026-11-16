@@ -7,7 +7,7 @@
 
 ## Config
 
-`~/.config/tui-ide/agents.toml` — list of profiles.
+`~/.config/zap/agents.toml` — list of profiles.
 
 **Never** store API keys / passwords / tokens in TOML. Use env (`CURSOR_API_KEY`, Claude/OpenCode env, etc.).
 

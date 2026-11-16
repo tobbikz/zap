@@ -1,4 +1,4 @@
-//! db-studio — terminal Database Studio (explorer · SQL · results).
+//! Zap — keyboard-first Database IDE for the terminal (explorer · SQL · results).
 
 mod app;
 
@@ -7,10 +7,9 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if let Some(mut dir) = dirs::cache_dir() {
-        dir.push("db-studio");
+    if let Some(dir) = ide_core::cache_dir() {
         let _ = std::fs::create_dir_all(&dir);
-        let file = std::fs::File::create(dir.join("db-studio.log"))?;
+        let file = std::fs::File::create(dir.join("zap.log"))?;
         tracing_subscriber::fmt()
             .with_writer(file)
             .with_env_filter(

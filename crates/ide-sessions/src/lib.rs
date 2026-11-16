@@ -1,6 +1,6 @@
 //! Remote session profiles (SSH PTY + RDP external launcher).
 //!
-//! SSOT file: `~/.config/tui-ide/sessions.toml`
+//! SSOT file: `~/.config/zap/sessions.toml`
 //! Never stores plaintext passwords — identity files / ssh-agent / env only.
 
 use anyhow::{Context, Result, bail};
@@ -420,10 +420,7 @@ pub enum ConnectOutcome {
 }
 
 pub fn sessions_path() -> Option<PathBuf> {
-    let mut p = dirs::config_dir()?;
-    p.push("tui-ide");
-    p.push("sessions.toml");
-    Some(p)
+    Some(ide_core::config_dir()?.join("sessions.toml"))
 }
 
 fn load_file(path: &Path) -> Result<SessionsFile> {

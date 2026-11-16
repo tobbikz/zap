@@ -117,10 +117,7 @@ static CUSTOMS: Mutex<Vec<OwnedPalette>> = Mutex::new(Vec::new());
 static ACTIVE: Mutex<Option<OwnedPalette>> = Mutex::new(None);
 
 pub fn themes_dir() -> Option<PathBuf> {
-    let mut p = dirs::config_dir()?;
-    p.push("tui-ide");
-    p.push("themes");
-    Some(p)
+    Some(ide_core::config_dir()?.join("themes"))
 }
 
 pub fn reload_customs() {
@@ -151,7 +148,7 @@ pub fn reload_customs() {
         }
         match load_theme_file(&path, &stem) {
             Ok(p) => out.push(p),
-            Err(e) => eprintln!("db-studio theme {}: {e:#}", path.display()),
+            Err(e) => eprintln!("zap theme {}: {e:#}", path.display()),
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -209,7 +206,7 @@ pub fn create_custom_theme(name: &str, extends: &str) -> Result<PathBuf> {
         bail!("theme file already exists: {}", path.display());
     }
     let body = format!(
-        r#"# DB Studio custom theme — edit colours, then : Theme: reload customs
+        r#"# Zap custom theme — edit colours, then : Theme: reload customs
 # or restart. Use theme = "{name}" in config.toml
 extends = "{ext}"
 label = "{name}"

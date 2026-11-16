@@ -27,7 +27,7 @@ async fn sqlite_query_and_introspect() {
         pinned: false,
     };
     let id = src.id.clone();
-    // Avoid add_source — it writes ~/.config/tui-ide/datasources.toml (racy in parallel tests).
+    // Avoid add_source — it writes ~/.config/zap/datasources.toml (racy in parallel tests).
     ws.sources.push(src);
     ws.ensure_connected(&id, None).await.unwrap();
     ws.active_source = Some(id);

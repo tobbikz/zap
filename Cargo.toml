@@ -22,10 +22,10 @@ members = [
 default-members = ["crates/ide-app"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["tui-ide contributors"]
+authors = ["Zap contributors"]
 rust-version = "1.75"
 
 [workspace.dependencies]

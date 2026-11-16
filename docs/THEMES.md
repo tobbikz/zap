@@ -1,4 +1,4 @@
-# Themes — DB Studio
+# Themes — Zap
 
 <p align="center">
   <img src="assets/theme-light-preview.png" alt="Live theme preview in palette" width="720" />
@@ -26,7 +26,7 @@ Built-ins (palette: `Ctrl-P` → type `theme`):
 ## Custom themes
 
 1. Palette → **Theme: new custom…**  
-   or create `~/.config/tui-ide/themes/mytheme.toml` (Windows: `%APPDATA%\tui-ide\themes\`).
+   or create `~/.config/zap/themes/mytheme.toml` (Windows: `%APPDATA%\zap\themes\`).
 
 2. Edit colours (hex `#rrggbb`). Example:
 

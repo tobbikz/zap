@@ -611,7 +611,7 @@ impl App {
             .map(|(plugin, id, title)| (format!("[{plugin}] {title}"), format!("plugin:{id}")))
             .collect();
         self.ui.palette.append_items(plugin_items);
-        // Custom themes from ~/.config/tui-ide/themes/*.toml
+        // Custom themes from ~/.config/zap/themes/*.toml
         ide_ui::theme::reload_customs();
         let custom_items: Vec<(String, String)> = ide_ui::theme::customs()
             .into_iter()
@@ -3096,7 +3096,7 @@ impl App {
             1 => self.focus_db_pane(2),
             2 => self.focus_db_pane(3),
             3 => self.focus_db_pane(4),
-            _ => self.set_status("DB Studio · 1–4 panes · a connect · Ctrl-⇧H home", false),
+            _ => self.set_status("Zap · 1–4 panes · a connect · Ctrl-⇧H home", false),
         }
         Ok(())
     }
@@ -6624,7 +6624,7 @@ impl App {
                     .map(|(name, _body)| (name.clone(), format!("snippet:{name}")))
                     .collect();
                 if items.is_empty() {
-                    self.set_status("no snippets in ~/.config/tui-ide/snippets", true);
+                    self.set_status("no snippets in ~/.config/zap/snippets", true);
                 } else {
                     let mut p = Palette::open_actions(items);
                     p.mode = PaletteMode::Commands;
@@ -7204,7 +7204,7 @@ impl App {
             }
             "health_webhook" => {
                 let url = self.db.persona.health_webhook_url.clone();
-                match ide_db::post_health_webhook(&url, "db-studio health check fail test") {
+                match ide_db::post_health_webhook(&url, "zap health check fail test") {
                     Ok(()) => self.set_status("webhook POST ok", false),
                     Err(e) => self.set_status(format!("webhook: {e:#}"), true),
                 }
@@ -8481,7 +8481,7 @@ async fn event_loop(
                                 )
                             {
                                 app.set_status(
-                                    "db-studio · Super-⇧H home · Super-⇧D studio · 1–4 panes",
+                                    "Zap · Super-⇧H home · Super-⇧D studio · 1–4 panes",
                                     false,
                                 );
                                 continue;

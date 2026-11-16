@@ -1,11 +1,11 @@
-//! Local SQL snippets under `~/.config/tui-ide/snippets/`.
+//! Local SQL snippets under `~/.config/zap/snippets/`.
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
 pub fn snippets_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("tui-ide").join("snippets"))
+    ide_core::config_dir().map(|p| p.join("snippets"))
 }
 
 pub fn list_snippets() -> Vec<(String, String)> {

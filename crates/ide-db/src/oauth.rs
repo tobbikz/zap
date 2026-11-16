@@ -15,7 +15,7 @@ struct OauthFile {
 }
 
 fn oauth_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("tui-ide").join("oauth.toml"))
+    ide_core::config_dir().map(|p| p.join("oauth.toml"))
 }
 
 fn load_file() -> OauthFile {
@@ -103,7 +103,7 @@ pub fn apply_pasted_token(driver: DbDriver, token: &str) -> Result<String> {
     let mut file = load_file();
     file.tokens.insert(key.to_string(), t.to_string());
     save_file(&file)?;
-    Ok(format!("{key} set (process + ~/.config/tui-ide/oauth.toml)"))
+    Ok(format!("{key} set (process + ~/.config/zap/oauth.toml)"))
 }
 
 /// Load persisted tokens into the process env (no overwrite if already set).
