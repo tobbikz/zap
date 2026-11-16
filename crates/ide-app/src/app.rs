@@ -1490,7 +1490,7 @@ impl App {
     }
 
     fn toggle_product_mode(&mut self) {
-        // db-studio is Database-only — toggle between Home and Studio.
+        // Zap is Database-only — toggle between Home and Studio.
         if self.ui.db_surface == DbSurface::Studio {
             self.go_db_home();
             self.set_status("DB Home · a connect · e studio", false);
@@ -3085,7 +3085,7 @@ impl App {
         self.ui.mode = Mode::Settings;
     }
 
-    /// db-studio: Ctrl-1…4 map to studio panes (not Code/Sessions products).
+    /// Zap: Ctrl-1…4 map to studio panes (not Code/Sessions products).
     async fn goto_product_tab(&mut self, n: u8) -> Result<()> {
         self.ui.product = ProductMode::Database;
         if self.ui.db_surface != DbSurface::Studio {
@@ -7890,7 +7890,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
         }
         Err(e) => warn!("git: {e:#}"),
     }
-    // db-studio: entry Home (not Studio). Restore last source; soft health ping.
+    // Zap: entry Home (not Studio). Restore last source; soft health ping.
     app.ui.product = ProductMode::Database;
     app.ui.db_surface = DbSurface::Home;
     app.ui.focus = Focus::Database;
@@ -7927,7 +7927,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let _size = terminal.size()?;
-    // db-studio: no Neovim embed / LSP IDE stack.
+    // Zap: no Neovim embed / LSP IDE stack.
 
     let result = event_loop(&mut terminal, &mut app).await;
 
@@ -8439,7 +8439,7 @@ async fn event_loop(
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
                             {
-                                // db-studio: Home ↔ Studio (not Code).
+                                // Zap: Home ↔ Studio (not Code).
                                 app.toggle_product_mode();
                                 continue;
                             }
@@ -8465,7 +8465,7 @@ async fn event_loop(
                                     .await?;
                                 continue;
                             }
-                            // Git / Sessions / Agents / Outline are not part of db-studio.
+                            // Git / Sessions / Agents / Outline are not part of Zap.
                             if modk
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(

@@ -108,7 +108,7 @@ impl DapClient {
                 "initialize",
                 json!({
                     "clientID": "zap",
-                    "clientName": "zap",
+                    "clientName": "Zap",
                     "adapterID": "lldb",
                     "pathFormat": "path",
                     "linesStartAt1": true,
@@ -129,7 +129,7 @@ impl DapClient {
                     "program": program,
                     "args": args,
                     "cwd": program.parent().map(|p| p.display().to_string()),
-                    "name": "tui-ide-debug",
+                    "name": "zap-debug",
                 }),
             )
             .await;

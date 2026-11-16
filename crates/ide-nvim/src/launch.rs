@@ -81,7 +81,7 @@ pub fn detect_astronvim() -> NvimLaunchConfig {
         ));
     } else {
         cfg.notes.push(
-            "No ~/.config/nvim found. Install AstroNvim: https://astronvim.com/ — then restart tui-ide."
+            "No ~/.config/nvim found. Install AstroNvim: https://astronvim.com/ — then restart Zap."
                 .into(),
         );
     }

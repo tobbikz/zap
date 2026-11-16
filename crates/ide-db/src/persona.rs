@@ -774,7 +774,7 @@ pub fn signed_pack_export(sources_toml: &str, out: &Path) -> Result<()> {
     let mut h = DefaultHasher::new();
     sources_toml.hash(&mut h);
     let sig = format!("{:x}", h.finish());
-    let body = format!("# zap connection pack · sig={sig}\n{sources_toml}");
+    let body = format!("# Zap connection pack · sig={sig}\n{sources_toml}");
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -54,4 +54,4 @@ cargo build -p ide-app --release
 
 User config and connections: `~/.config/zap/` (Linux/macOS) or `%APPDATA%\zap\` (Windows via `dirs` crate).
 
-Themes: `…/tui-ide/themes/*.toml` — see [THEMES.md](./THEMES.md).
+Themes: `…/zap/themes/*.toml` (legacy `tui-ide` still works) — see [THEMES.md](./THEMES.md).

@@ -1,4 +1,4 @@
-//! User themes: `~/.config/tui-ide/themes/<name>.toml` (DataRig-inspired).
+//! User themes: `~/.config/zap/themes/<name>.toml` (DataRig-inspired).
 
 use super::Palette;
 use anyhow::{bail, Context, Result};
@@ -148,7 +148,7 @@ pub fn reload_customs() {
         }
         match load_theme_file(&path, &stem) {
             Ok(p) => out.push(p),
-            Err(e) => eprintln!("zap theme {}: {e:#}", path.display()),
+            Err(e) => eprintln!("Zap theme {}: {e:#}", path.display()),
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));

@@ -4,4 +4,4 @@
 
 ### Changed
 
-- **Rebrand to Zap** — binary `zap`, display name Zap, config `~/.config/zap` (falls back to existing `~/.config/tui-ide`), GitHub `tobbikz/zap`.
+- **Rebrand to Zap** — display name **Zap** (capital Z), binary `zap`, config `~/.config/zap` (falls back to existing `~/.config/tui-ide`), GitHub `tobbikz/zap`.

@@ -946,9 +946,9 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
 
 fn render_breadcrumbs(frame: &mut Frame, area: Rect, ui: &UiState) {
     let text = if ui.breadcrumbs.is_empty() {
-        " Zap "
+        ide_core::PRODUCT_NAME.to_string()
     } else {
-        ui.breadcrumbs.as_str()
+        ui.breadcrumbs.clone()
     };
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -1687,7 +1687,7 @@ fn render_tree(frame: &mut Frame, area: Rect, ws: &Workspace, focused: bool) {
     );
 }
 
-/// Hit-test product ribbon tabs on row 0. db-studio has no multi-product ribbon.
+/// Hit-test product ribbon tabs on row 0. db-studio has Zap has no multi-product ribbon.
 pub fn product_tab_at_col(_col: u16) -> Option<u8> {
     None
 }
@@ -3278,7 +3278,7 @@ fn hover_wrap_lines(s: &str, width: usize) -> Vec<String> {
 fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_active: bool) {
     // Quiet brand — no inverted pill, no redundant "studio" chip.
     let brand = Span::styled(
-        " Zap",
+        format!(" {}", ide_core::PRODUCT_NAME),
         theme::style_text().add_modifier(Modifier::BOLD),
     );
 
@@ -3360,7 +3360,7 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
 
     let width = area.width as usize;
     let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
-    let left_w = " Zap".chars().count();
+    let left_w = format!(" {}", ide_core::PRODUCT_NAME).chars().count();
     let gap = width.saturating_sub(left_w + right_w).max(2);
     let mut spans = vec![brand, Span::raw(" ".repeat(gap))];
     spans.extend(right_spans);
