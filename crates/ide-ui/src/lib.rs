@@ -2651,10 +2651,8 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             let style = if is_cursor && editing {
                 theme::style_chip_run()
             } else if is_cursor {
-                // Clean caret: bold + underline only — no full-row wash.
-                Style::default()
-                    .fg(theme::text())
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                // Caret cell = solid invert “cuadrado” (Explorer-style), not underline / row wash.
+                theme::style_grid_cursor_cell()
             } else if on_cursor_row {
                 theme::style_text().add_modifier(Modifier::BOLD)
             } else if row_dirty {

@@ -681,8 +681,7 @@ pub fn style_grid_cursor_row() -> Style {
     }
 }
 
-/// Results grid: focused cell.
-/// Chromatic accents (DataRig teal) get a filled chip; AMOLED uses invert + underline.
+/// Results grid: focused cell — solid “cuadrado” (accent fill or AMOLED invert).
 pub fn style_grid_cursor_cell() -> Style {
     if accent_fill_safe() {
         Style::default()
@@ -690,7 +689,7 @@ pub fn style_grid_cursor_cell() -> Style {
             .bg(accent())
             .add_modifier(Modifier::BOLD)
     } else {
-        style_mono_invert().add_modifier(Modifier::UNDERLINED)
+        style_mono_invert()
     }
 }
 
