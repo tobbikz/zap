@@ -1031,8 +1031,13 @@ impl App {
     fn db_undo_sql(&mut self) {
         if let Some(prev) = self.db_sql_undo_stack.pop() {
             self.db.sql = prev;
+            self.ui.db_sql_all_selected = false;
             self.db_clamp_cursor();
         }
+    }
+
+    fn clear_db_sql_all_selected(&mut self) {
+        self.ui.db_sql_all_selected = false;
     }
 
     fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -1150,6 +1155,7 @@ impl App {
         }
         self.ui.show_completions = false;
         self.ui.completions.clear();
+        self.clear_db_sql_all_selected();
         self.ui.focus = match self.ui.focus {
             Focus::Database => Focus::Structure,
             Focus::Structure => Focus::Editor,
@@ -1300,6 +1306,7 @@ impl App {
         self.ui.mode = Mode::Normal;
         self.ui.show_completions = false;
         self.ui.completions.clear();
+        self.clear_db_sql_all_selected();
         if let Some(id) = self.db.active_source.clone() {
             if let Some(i) = self.db.sources.iter().position(|s| s.id == id) {
                 self.ui.home_selected = i.min(8);
@@ -4175,6 +4182,7 @@ impl App {
         self.ui.db_cursor.col = start + item.insert_text.chars().count();
         self.ui.show_completions = false;
         self.ui.completions.clear();
+        self.clear_db_sql_all_selected();
     }
 
     fn accept_completion(&mut self) {
@@ -9055,6 +9063,9 @@ async fn event_loop(
                                     } else {
                                         app.db.next_tab();
                                     }
+                                    app.clear_db_sql_all_selected();
+                                    app.ui.show_completions = false;
+                                    app.ui.completions.clear();
                                     app.ui.db_cursor = Cursor::default();
                                     app.ui.db_scroll_row = 0;
                                     let _ = app.db.refresh_structure_for_active_tab().await;
@@ -9150,6 +9161,9 @@ async fn event_loop(
                                         KeyCode::Char(']') => app.db.next_tab(),
                                         _ => app.db.prev_tab(),
                                     }
+                                    app.clear_db_sql_all_selected();
+                                    app.ui.show_completions = false;
+                                    app.ui.completions.clear();
                                     app.ui.db_cursor = Cursor::default();
                                     app.ui.db_scroll_row = 0;
                                     let _ = app.db.refresh_structure_for_active_tab().await;
@@ -9186,6 +9200,8 @@ async fn event_loop(
                                     // Do not leave the SQL completion popup stuck across panes (#183).
                                     app.ui.show_completions = false;
                                     app.ui.completions.clear();
+                                    // Ctrl-A selection must not leak to the next tab (#182).
+                                    app.clear_db_sql_all_selected();
                                     continue;
                                 }
                                 KeyCode::Esc
