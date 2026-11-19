@@ -12,6 +12,7 @@ pub struct HttpSqlConn {
     pub user: String,
     pub password: String,
     pub database: String,
+    pub client: reqwest::Client,
 }
 
 pub fn connect_http(src: &DataSource) -> Result<HttpSqlConn> {
@@ -36,6 +37,7 @@ pub fn connect_http(src: &DataSource) -> Result<HttpSqlConn> {
         user: src.user.clone(),
         password: src.password.clone(),
         database: src.database.clone(),
+        client: crate::engines::build_http_client(src)?,
     })
 }
 
@@ -50,7 +52,7 @@ pub async fn exec_http(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
 /// Elasticsearch: `GET index/_search` JSON body, or `GET /_cat/indices`.
 async fn exec_elasticsearch(conn: &HttpSqlConn, line: &str) -> Result<QueryResult> {
     let line = line.trim();
-    let client = reqwest::Client::new();
+    let client = conn.client.clone();
     let mut req = if line.to_ascii_lowercase().starts_with("get ")
         || line.to_ascii_lowercase().starts_with("post ")
     {
@@ -93,7 +95,7 @@ async fn exec_elasticsearch(conn: &HttpSqlConn, line: &str) -> Result<QueryResul
 }
 
 async fn exec_trino(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
-    let client = reqwest::Client::new();
+    let client = conn.client.clone();
     let catalog = if conn.database.is_empty() {
         "memory"
     } else {
@@ -204,7 +206,7 @@ fn json_to_result(text: &str) -> Result<QueryResult> {
 }
 
 pub async fn elasticsearch_indices(conn: &HttpSqlConn, source_id: &str) -> Result<Vec<DbTreeNode>> {
-    let client = reqwest::Client::new();
+    let client = conn.client.clone();
     let mut req = client.get(format!("{}/_cat/indices?format=json", conn.base));
     if !conn.user.is_empty() {
         req = req.basic_auth(&conn.user, Some(&conn.password));

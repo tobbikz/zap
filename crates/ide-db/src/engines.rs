@@ -12,6 +12,22 @@ use crate::{ColumnInfo, DataSource, DbNodeKind, DbTreeNode, QueryResult};
 
 pub type MssqlClient = Client<Compat<TcpStream>>;
 
+/// Shared reqwest client for HTTP engines: `ssl_ca` and `ssl_trust_cert` (#205).
+pub(crate) fn build_http_client(src: &DataSource) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if !src.ssl_ca.trim().is_empty() {
+        let pem = std::fs::read(src.ssl_ca.trim())
+            .with_context(|| format!("read ssl CA {}", src.ssl_ca))?;
+        builder = builder.add_root_certificate(
+            reqwest::Certificate::from_pem(&pem).context("parse ssl CA PEM")?,
+        );
+    }
+    if src.accepts_invalid_certs() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().context("http client")
+}
+
 #[derive(Clone)]
 pub struct ClickhouseHttp {
     http: reqwest::Client,
@@ -40,15 +56,7 @@ impl ClickhouseHttp {
             "http"
         };
         let base = format!("{scheme}://{host}:{port}/");
-        let mut builder = reqwest::Client::builder();
-        if !src.ssl_ca.trim().is_empty() {
-            let pem = std::fs::read(src.ssl_ca.trim())
-                .with_context(|| format!("read ssl CA {}", src.ssl_ca))?;
-            builder = builder.add_root_certificate(
-                reqwest::Certificate::from_pem(&pem).context("parse ssl CA PEM")?,
-            );
-        }
-        let http = builder.build().context("clickhouse http client")?;
+        let http = build_http_client(src)?;
         Ok(Self {
             http,
             base,
