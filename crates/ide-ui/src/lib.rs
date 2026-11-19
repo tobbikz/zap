@@ -2561,16 +2561,14 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         let t = pad_display(&label, w);
         let style = if ci == result.cursor_col {
-            // Active column: accent ink + bold (underline lives in the rule below).
-            Style::default()
-                .fg(theme::accent())
-                .add_modifier(Modifier::BOLD)
+            // Active column: soft header fill + accent ink (rule below reinforces).
+            theme::style_grid_cursor_header()
         } else {
             theme::style_muted().add_modifier(Modifier::BOLD)
         };
         header_spans.push(Span::styled(format!("{t}"), style));
     }
-    // DataRig grid header sits on surface; active column is marked in the rule below.
+    // Header strip on L1 surface; active column uses grid_cursor_header fill.
     let header: Line = Line::from(header_spans).style(Style::default().bg(theme::surface()));
 
     let filter = db.results_filter.clone();

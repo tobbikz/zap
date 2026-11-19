@@ -18,15 +18,15 @@ Synthesizes the same four references Hop uses (`product-hop` → uses in Brain),
 | Level | Zap use |
 |-------|---------|
 | L0 | Full-bleed app background (`theme::bg`) painted before chrome |
-| L1 | Header, panes, footer (`surface` / `bg`) |
-| L2 | Soft selection (`surface_3` + accent rail `▎` / `│` on Consolas) |
+| L1 | Studio panes (`pane_block` → `surface` fill) sit above L0 |
+| L2 | Soft selection / Results cursor row (`surface_3` + accent rail `▎` / `│` on Consolas) |
 | L3 | Modals / palette / discover (`modal` + opaque scrim) |
 
 ## Focus
 
 - Exactly one interaction owner.
-- Focused pane: accent border + brighter title.
-- Unfocused: idle border, muted title.
+- Focused pane: accent border + quiet accent title (no heavy bold wash).
+- Unfocused: idle border, faint title.
 - List selection: left rail (never a full reverse-video wash on DataRig themes).
 
 ## Footer

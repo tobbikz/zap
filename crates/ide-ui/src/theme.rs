@@ -618,12 +618,11 @@ pub fn style_warn() -> Style {
     Style::default().fg(warn()).add_modifier(Modifier::BOLD)
 }
 pub fn style_title(focused: bool) -> Style {
+    // DataRig pane titles stay quiet: accent when focused, faint when idle — no heavy bold wash.
     if focused {
-        Style::default()
-            .fg(accent())
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(accent())
     } else {
-        Style::default().fg(muted())
+        Style::default().fg(faint())
     }
 }
 pub fn style_selected() -> Style {
@@ -644,6 +643,14 @@ pub fn style_grid_cursor_cell() -> Style {
     Style::default()
         .fg(contrast_on(accent()))
         .bg(accent())
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Results header cell for the cursor column (DataRig `grid_cursor_header`).
+pub fn style_grid_cursor_header() -> Style {
+    Style::default()
+        .fg(accent())
+        .bg(surface_2())
         .add_modifier(Modifier::BOLD)
 }
 
@@ -693,16 +700,22 @@ pub fn style_pill_off() -> Style {
     Style::default().fg(muted()).bg(surface_2())
 }
 
-/// Studio pane block — DataRig quiet titles + focus border.
+/// Studio pane block — L1 `surface` fill on L0 `bg`, quiet title, accent border when focused.
 pub fn pane_block(title: impl Into<String>, focused: bool) -> ratatui::widgets::Block<'static> {
     use ratatui::widgets::{Block, Borders};
-    let title: String = title.into();
+    let raw: String = title.into();
+    // Breath around the title label (DataRig-style air).
+    let title = if raw.starts_with(' ') || raw.is_empty() {
+        raw
+    } else {
+        format!(" {raw} ")
+    };
     Block::default()
         .borders(Borders::ALL)
         .border_type(border_type())
         .title(ratatui::text::Span::styled(title, style_title(focused)))
         .border_style(Style::default().fg(border(focused)))
-        .style(Style::default().bg(bg()))
+        .style(Style::default().bg(surface()))
 }
 pub fn border(focused: bool) -> Color {
     if focused {
