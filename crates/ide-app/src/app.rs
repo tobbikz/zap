@@ -2338,9 +2338,12 @@ impl App {
             page: 0,
             has_more: false,
         });
-        // Stay in Console Insert so Backspace / typing work immediately after dismiss.
-        self.ui.focus = Focus::Editor;
-        self.ui.mode = Mode::Insert;
+        let modal_open = !matches!(self.ui.mode, Mode::Normal | Mode::Insert);
+        if !modal_open {
+            // Stay in Console Insert so Backspace / typing work immediately after dismiss.
+            self.ui.focus = Focus::Editor;
+            self.ui.mode = Mode::Insert;
+        }
         self.ui.bottom = BottomPanel::Results;
         self.ui.query_error = Some(msg.clone());
         self.set_status(format!("query: {msg}"), true);
@@ -2364,8 +2367,13 @@ impl App {
         self.finish_query_ui();
         match result {
             Ok(()) => {
-                self.ui.focus = Focus::Results;
-                self.ui.mode = Mode::Normal;
+                // Do not dismiss Palette / connect / create modals when a background
+                // Health Activity refresh finishes (#188).
+                let modal_open = !matches!(self.ui.mode, Mode::Normal | Mode::Insert);
+                if !modal_open {
+                    self.ui.focus = Focus::Results;
+                    self.ui.mode = Mode::Normal;
+                }
                 self.ui.query_error = None;
                 let _ = self.db.refresh_structure_from_console_query().await;
                 self.set_status(self.db.status.clone(), false);
@@ -8242,8 +8250,10 @@ async fn event_loop(
                     }
                 }
                 // ~ every 5s: re-run Health · Activity when auto-refresh is on (Wave 9).
+                // Skip while a modal/palette is open so completion cannot wipe ui.mode (#188).
                 if app.db.health_activity_auto_refresh
                     && app.ui.product == ProductMode::Database
+                    && app.ui.mode == Mode::Normal
                     && !app.db.query_running
                     && !app.pending_db_query
                     && app.db.active_tab_is_health_activity()
