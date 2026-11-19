@@ -723,17 +723,20 @@ impl SqlTab {
     }
 
     pub fn display_title(&self) -> String {
-        if self.pinned {
-            format!("📌{}", self.title)
-        } else if self
+        let dirty = self
             .result
             .as_ref()
-            .is_some_and(|r| !r.dirty_rows().is_empty())
-        {
-            format!("{}*", self.title)
+            .is_some_and(|r| !r.dirty_rows().is_empty());
+        let mut title = if self.pinned {
+            format!("📌{}", self.title)
         } else {
             self.title.clone()
+        };
+        // Pinned tabs still show dirty (#186).
+        if dirty {
+            title.push('*');
         }
+        title
     }
 }
 
@@ -2296,6 +2299,7 @@ impl DbWorkspace {
             .get(self.active_tab)
             .and_then(|t| t.result.as_ref())
             .is_some_and(|r| !r.dirty_rows().is_empty())
+            || !self.pending_row_deletes.is_empty()
         {
             self.status = "tab has dirty cells — Apply or Undo first".into();
             return false;
@@ -6630,6 +6634,8 @@ impl DbWorkspace {
             res.original_rows = res.rows.clone();
         }
         self.pending_row_deletes.clear();
+        // Keep tab.result in sync so close_active_tab no longer sees stale dirty (#186).
+        self.flush_active_tab();
         let n = stmts.len();
         self.status = format!("applied {n} mutation(s)");
         Ok(n)
@@ -11349,6 +11355,24 @@ mod migration_txn_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction is open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod apply_dirty_tab_tests {
+    use super::{QueryResult, SqlTab};
+
+    #[test]
+    fn pinned_tab_shows_dirty_star() {
+        let mut tab = SqlTab::query(1);
+        tab.pinned = true;
+        tab.title = "t".into();
+        let mut qr = QueryResult::empty();
+        qr.columns = vec!["a".into()];
+        qr.rows = vec![vec!["1".into()]];
+        qr.original_rows = vec![vec!["0".into()]];
+        tab.result = Some(qr);
+        assert_eq!(tab.display_title(), "📌t*");
     }
 }
 
