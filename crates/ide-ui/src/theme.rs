@@ -634,16 +634,16 @@ pub fn style_selected() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Results grid: subtle tint for the whole cursor row (DataRig `grid_cursor_row`).
+/// Results grid: whole cursor row — selection tint so the row is obvious.
 pub fn style_grid_cursor_row() -> Style {
-    Style::default().bg(surface_2())
+    Style::default().bg(surface_3())
 }
 
-/// Results grid: cursor cell (DataRig `selection` on the focused cell).
+/// Results grid: focused cell — accent fill so the caret cell pops (DataRig-loud).
 pub fn style_grid_cursor_cell() -> Style {
     Style::default()
-        .fg(text())
-        .bg(surface_3())
+        .fg(contrast_on(accent()))
+        .bg(accent())
         .add_modifier(Modifier::BOLD)
 }
 
@@ -660,11 +660,19 @@ pub fn style_chip() -> Style {
     Style::default().fg(muted()).bg(surface_2())
 }
 
-/// Run / primary action chip.
+/// Run chip when Console is focused — filled accent (teal on DataRig dark).
 pub fn style_chip_run() -> Style {
     Style::default()
         .fg(contrast_on(accent()))
         .bg(accent())
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Run chip when Console is idle — accent ink on surface (quiet “off” state).
+pub fn style_chip_run_idle() -> Style {
+    Style::default()
+        .fg(accent())
+        .bg(surface_2())
         .add_modifier(Modifier::BOLD)
 }
 

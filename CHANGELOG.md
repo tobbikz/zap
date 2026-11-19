@@ -9,6 +9,7 @@
 ### Changed
 
 - Default `dark` theme retuned to DataRig’s teal accent / quiet borders / selection tints; Studio panes, Console Run chip, active tabs, and Results cursor row/cell follow that chrome.
+- Console F5 chip: filled accent when Console is focused, accent-ink idle when not; Results cursor row uses selection tint and the focused cell is accent-filled; column header rule uses an accent segment under the active column.
 
 ## [0.6.1] - 2026-11-18
 

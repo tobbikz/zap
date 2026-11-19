@@ -11,7 +11,7 @@ Synthesizes the same four references Hop uses (`product-hop` → uses in Brain),
 
 **Unlike Hop:** Zap does **not** lock to a single AMOLED mono palette. Built-in themes (dark, nord, mocha, …) and custom TOML stay first-class. Roles map onto the *active* palette.
 
-**DataRig dark (default):** palette values follow [DokaDev/datarig](https://github.com/DokaDev/datarig) `DARK` — teal accent `#4FB3A9`, quiet borders `#2E3440`, selection `#2A3B4D`, subtle grid cursor row on `surface_2`. Console Run is an accent-filled chip; tabs use a tinted active fill.
+**DataRig dark (default):** palette values follow [DokaDev/datarig](https://github.com/DokaDev/datarig) `DARK` — teal accent `#4FB3A9`, quiet borders `#2E3440`, selection `#2A3B4D`. Results cursor: whole row on `surface_3`, focused cell accent-filled. Column rule under the header uses border ink with an accent segment on the active column. Console Run chip is accent-filled when Console is focused, accent-ink on `surface_2` when idle; tabs use a tinted active fill.
 
 ## Surfaces
 

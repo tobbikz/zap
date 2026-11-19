@@ -1433,7 +1433,14 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             0 => "off".into(),
             n => n.to_string(),
         };
-        let spans = console_toolbar_spans(running, &db_label, &schema_label, &lim, inner.width);
+        let spans = console_toolbar_spans(
+            running,
+            focused,
+            &db_label,
+            &schema_label,
+            &lim,
+            inner.width,
+        );
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::surface_2())),
             Rect {
@@ -2554,13 +2561,16 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         let t = pad_display(&label, w);
         let style = if ci == result.cursor_col {
-            theme::style_text().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            // Active column: accent ink + bold (underline lives in the rule below).
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD)
         } else {
             theme::style_muted().add_modifier(Modifier::BOLD)
         };
         header_spans.push(Span::styled(format!("{t}"), style));
     }
-    // DataRig grid header sits on surface; cursor column stays underlined above.
+    // DataRig grid header sits on surface; active column is marked in the rule below.
     let header: Line = Line::from(header_spans).style(Style::default().bg(theme::surface()));
 
     let filter = db.results_filter.clone();
@@ -2626,7 +2636,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             let style = if is_cursor && editing {
                 theme::style_chip_run()
             } else if is_cursor {
-                // DataRig: selection sits on the cell; the row keeps a quieter tint.
+                // Loud cell (accent fill) + selection tint on the row.
                 theme::style_grid_cursor_cell()
             } else if row_dirty {
                 Style::default().fg(theme::accent_warm()).add_modifier(Modifier::BOLD)
@@ -2667,16 +2677,28 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     } else {
         String::new()
     };
-    // One quiet rule under the header — continuous, no ┼ junctions.
-    let rule_w = (grid_area.width as usize).saturating_sub(gutter_w + 2);
-    let mut rule_spans = vec![
-        Span::styled(format!("{:>gutter_w$}  ", ""), theme::style_faint()),
-        Span::styled("─".repeat(rule_w.min(120).max(8)), theme::style_faint()),
-    ];
+    // Column rule: muted `─` with an accent segment under the active column.
+    let mut rule_spans = vec![Span::styled(
+        format!("{:>gutter_w$}  ", ""),
+        theme::style_faint(),
+    )];
+    for (pos, &ci) in col_indices.iter().enumerate() {
+        if pos > 0 {
+            rule_spans.push(Span::styled("  ", theme::style_faint()));
+        }
+        let w = col_widths[pos];
+        let seg = "─".repeat(w.max(1));
+        let style = if ci == result.cursor_col {
+            Style::default().fg(theme::accent())
+        } else {
+            Style::default().fg(theme::border_idle())
+        };
+        rule_spans.push(Span::styled(seg, style));
+    }
     if !h_hint.is_empty() {
         rule_spans.push(Span::styled(h_hint, theme::style_faint()));
     }
-    let rule = Line::from(rule_spans);
+    let rule = Line::from(rule_spans).style(Style::default().bg(theme::surface()));
     let mut lines = vec![header, rule];
     if nrows == 0 {
         lines.push(Line::from(Span::styled(
@@ -5620,6 +5642,7 @@ fn pad_display(s: &str, width: usize) -> String {
 /// Build Console toolbar spans; drop schema then database as whole chips when narrow.
 fn console_toolbar_spans(
     running: bool,
+    console_focused: bool,
     db_label: &str,
     schema_label: &str,
     lim: &str,
@@ -5631,9 +5654,14 @@ fn console_toolbar_spans(
             theme::style_warn(),
         )
     } else {
+        // Focused Console → filled accent chip; idle → accent ink (clear “hot” state).
         Span::styled(
             format!(" {} F5 ", icons::run_glyph()),
-            theme::style_chip_run(),
+            if console_focused {
+                theme::style_chip_run()
+            } else {
+                theme::style_chip_run_idle()
+            },
         )
     };
     let sep = Span::styled(" · ", theme::Role::Faint.style());
@@ -5675,7 +5703,11 @@ fn console_toolbar_spans(
     }
     vec![Span::styled(
         format!(" {} F5 ", icons::run_glyph()),
-        theme::style_chip_run(),
+        if console_focused {
+            theme::style_chip_run()
+        } else {
+            theme::style_chip_run_idle()
+        },
     )]
 }
 
