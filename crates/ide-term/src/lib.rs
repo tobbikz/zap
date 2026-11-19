@@ -20,7 +20,7 @@ pub struct TerminalPane {
 
 impl TerminalPane {
     pub fn spawn(cwd: &std::path::Path, cols: u16, rows: u16) -> Result<Self> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let shell = default_shell();
         Self::spawn_command(cwd, cols, rows, &shell, &[])
     }
 
@@ -156,6 +156,63 @@ impl TerminalPane {
     }
 }
 
+/// Default interactive shell (#198): `$SHELL` on Unix; on Windows prefer
+/// `pwsh` / `powershell`, then `%COMSPEC%`, then `cmd.exe`.
+pub fn default_shell() -> String {
+    pick_default_shell(
+        cfg!(windows),
+        std::env::var("SHELL").ok(),
+        std::env::var("COMSPEC").ok(),
+        which_on_path,
+    )
+}
+
+fn pick_default_shell(
+    windows: bool,
+    shell: Option<String>,
+    comspec: Option<String>,
+    on_path: impl Fn(&str) -> bool,
+) -> String {
+    let nonempty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    if windows {
+        if let Some(sh) = nonempty(shell) {
+            if std::path::Path::new(&sh).is_absolute() || on_path(&sh) {
+                return sh;
+            }
+        }
+        for cand in ["pwsh", "powershell"] {
+            if on_path(cand) {
+                return cand.into();
+            }
+        }
+        nonempty(comspec).unwrap_or_else(|| "cmd.exe".into())
+    } else {
+        nonempty(shell).unwrap_or_else(|| "/bin/sh".into())
+    }
+}
+
+fn which_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            for ext in ["EXE", "CMD", "BAT"] {
+                let with_ext = dir.join(format!("{name}.{ext}"));
+                if with_ext.is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Drop the oldest bytes of `buf` once it exceeds `max`, keeping about `keep_len`.
 /// Advances the cut to a UTF-8 char boundary so `drain` never panics (#199).
 fn trim_buffer(buf: &mut String, max: usize, keep_len: usize) {
@@ -264,6 +321,45 @@ mod trim_tests {
         assert!(s.len() <= 20);
         assert!(std::str::from_utf8(s.as_bytes()).is_ok());
         assert!(!s.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::pick_default_shell;
+
+    #[test]
+    fn unix_falls_back_to_bin_sh() {
+        assert_eq!(
+            pick_default_shell(false, None, None, |_| false),
+            "/bin/sh"
+        );
+        assert_eq!(
+            pick_default_shell(false, Some("/bin/zsh".into()), None, |_| false),
+            "/bin/zsh"
+        );
+    }
+
+    #[test]
+    fn windows_prefers_pwsh_then_comspec() {
+        assert_eq!(
+            pick_default_shell(true, None, None, |n| n == "pwsh"),
+            "pwsh"
+        );
+        assert_eq!(
+            pick_default_shell(true, None, None, |n| n == "powershell"),
+            "powershell"
+        );
+        assert_eq!(
+            pick_default_shell(true, None, Some(r"C:\Windows\System32\cmd.exe".into()), |_| {
+                false
+            }),
+            r"C:\Windows\System32\cmd.exe"
+        );
+        assert_eq!(
+            pick_default_shell(true, None, None, |_| false),
+            "cmd.exe"
+        );
     }
 }
 
