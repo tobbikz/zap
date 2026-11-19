@@ -306,10 +306,8 @@ impl DataSource {
             DbDriver::Sqlite => {
                 if self.file.is_empty() || self.file == ":memory:" {
                     "sqlite::memory:".into()
-                } else if self.file.starts_with('/') {
-                    format!("sqlite://{}", self.file)
                 } else {
-                    format!("sqlite://{}", self.file)
+                    sqlite_url_from_path(&self.file)
                 }
             }
             DbDriver::Mssql => {
@@ -359,6 +357,32 @@ fn whoami_user() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "postgres".into())
+}
+
+/// Build an sqlx-friendly SQLite URL from a filesystem path (#200).
+/// Windows drive / verbatim / UNC paths become `sqlite:///C:/…` with forward slashes.
+pub(crate) fn sqlite_url_from_path(file: &str) -> String {
+    let mut p = file.trim().to_string();
+    // Strip Windows verbatim prefixes: \\?\C:\… and \\?\UNC\server\share\…
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        p = format!(r"\\{rest}");
+    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+        p = rest.to_string();
+    } else if let Some(rest) = p.strip_prefix("//?/") {
+        p = rest.to_string();
+    }
+    let p = p.replace('\\', "/");
+    let b = p.as_bytes();
+    let is_drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    if is_drive {
+        format!("sqlite:///{p}")
+    } else if p.starts_with("//") {
+        // UNC → sqlite://server/share/…
+        format!("sqlite:{p}")
+    } else {
+        // Absolute POSIX (`/x` → sqlite:///x) or relative (`x` → sqlite://x).
+        format!("sqlite://{p}")
+    }
 }
 
 fn append_pg_ssl_query(url: &mut String, ssl_mode: &str, ssl_ca: &str) {
@@ -11018,5 +11042,29 @@ mod dba_engines_tests {
         let s = duckdb_inserts_from_result(&qr, "main", "t");
         assert!(s.contains("INSERT INTO"));
         assert!(s.contains("\"id\""));
+    }
+}
+
+#[cfg(test)]
+mod sqlite_url_tests {
+    use super::sqlite_url_from_path;
+
+    #[test]
+    fn normalizes_windows_and_posix_paths() {
+        assert_eq!(
+            sqlite_url_from_path(r"C:\Users\me\a b.db"),
+            "sqlite:///C:/Users/me/a b.db"
+        );
+        assert_eq!(
+            sqlite_url_from_path(r"\\?\C:\data\x.db"),
+            "sqlite:///C:/data/x.db"
+        );
+        assert_eq!(
+            sqlite_url_from_path(r"\\?\UNC\srv\share\x.db"),
+            "sqlite://srv/share/x.db"
+        );
+        assert_eq!(sqlite_url_from_path(r"D:/x.db"), "sqlite:///D:/x.db");
+        assert_eq!(sqlite_url_from_path("/tmp/x.db"), "sqlite:///tmp/x.db");
+        assert_eq!(sqlite_url_from_path("rel/x.db"), "sqlite://rel/x.db");
     }
 }
