@@ -5928,8 +5928,16 @@ impl DbWorkspace {
         let Some((_, body)) = recipe_gallery().into_iter().find(|(n, _)| *n == id) else {
             bail!("unknown recipe {id}");
         };
+        // New tab so prior SQL is not clobbered; flush keeps tab buffer in sync (#176).
+        self.new_query_tab();
         self.sql = body.to_string();
-        self.status = format!("recipe {id} loaded");
+        self.last_result = None;
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.sql = self.sql.clone();
+            tab.result = None;
+            tab.title = format!("recipe · {id}");
+        }
+        self.status = format!("recipe {id} loaded · Console");
         Ok(())
     }
 
@@ -11401,6 +11409,25 @@ mod migration_txn_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction is open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod insert_recipe_tests {
+    use super::DbWorkspace;
+
+    #[test]
+    fn insert_recipe_flushes_new_tab_and_clears_result() {
+        let mut ws = DbWorkspace::default();
+        ws.sql = "SELECT 1;".into();
+        ws.flush_active_tab();
+        ws.insert_recipe("top_customers").expect("recipe");
+        assert!(ws.sql.contains("top customers"), "{}", ws.sql);
+        assert!(ws.last_result.is_none());
+        let tab = ws.tabs.get(ws.active_tab).expect("tab");
+        assert_eq!(tab.sql, ws.sql);
+        assert!(tab.title.contains("top_customers"), "{}", tab.title);
+        assert!(ws.tabs.len() >= 2, "expected new tab");
     }
 }
 
