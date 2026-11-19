@@ -1470,6 +1470,15 @@ struct SshTunnel {
     child: Child,
 }
 
+/// True when `ssh -L` lost the ephemeral local port to another binder (TOCTOU, #204).
+fn ssh_forward_port_busy(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("address already in use")
+        || msg.contains("cannot listen")
+        || msg.contains("bind: ")
+        || msg.contains("error: bind")
+}
+
 impl Default for DbWorkspace {
     fn default() -> Self {
         Self {
@@ -4620,6 +4629,33 @@ impl DbWorkspace {
             }
         }
 
+        // OpenSSH cannot take `-L 0:…`, so we still probe an ephemeral port then hand it to
+        // `ssh -L`. Retry when another process wins the bind-drop race (#204).
+        const ATTEMPTS: u32 = 8;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=ATTEMPTS {
+            match Self::spawn_ssh_tunnel(src) {
+                Ok((local_port, child)) => {
+                    self.ssh_tunnels.insert(
+                        src.id.clone(),
+                        SshTunnel {
+                            local_port,
+                            child,
+                        },
+                    );
+                    return Ok(local_port);
+                }
+                Err(e) if attempt < ATTEMPTS && ssh_forward_port_busy(&e) => {
+                    last_err = Some(e);
+                    thread::sleep(Duration::from_millis(25 * u64::from(attempt)));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("SSH tunnel port busy")))
+    }
+
+    fn spawn_ssh_tunnel(src: &DataSource) -> Result<(u16, std::process::Child)> {
         let local_port = {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .context("bind local port for SSH tunnel")?;
@@ -4673,7 +4709,7 @@ impl DbWorkspace {
             )
             .is_ok()
             {
-                break;
+                return Ok((local_port, child));
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -4694,15 +4730,6 @@ impl DbWorkspace {
                 Err(e) => bail!("SSH tunnel wait: {e}"),
             }
         }
-
-        self.ssh_tunnels.insert(
-            src.id.clone(),
-            SshTunnel {
-                local_port,
-                child,
-            },
-        );
-        Ok(local_port)
     }
 
     async fn introspect_databases(&self, source_id: &str) -> Result<Vec<DbTreeNode>> {
@@ -11149,5 +11176,20 @@ mod paste_grid_tests {
             ]
         );
         assert_eq!(parse_paste_grid("plain"), vec![vec!["plain".to_string()]]);
+    }
+}
+
+#[cfg(test)]
+mod ssh_tunnel_port_tests {
+    use super::ssh_forward_port_busy;
+
+    #[test]
+    fn detects_bind_busy_from_ssh_stderr() {
+        let busy = anyhow::anyhow!(
+            "SSH tunnel failed (exit status: 255): Error: bind: Address already in use"
+        );
+        assert!(ssh_forward_port_busy(&busy));
+        let other = anyhow::anyhow!("SSH tunnel failed (exit status: 255): Permission denied");
+        assert!(!ssh_forward_port_busy(&other));
     }
 }
