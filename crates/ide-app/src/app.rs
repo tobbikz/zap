@@ -34,7 +34,7 @@ use ide_term::TerminalPane;
 use ide_sessions::{ConnectOutcome, SessionManager};
 use ide_agents::AgentManager;
 use ide_ui::{
-    home_recent_slots, render, Action, CreateObjectForm, CreateObjectKind, DbConnectForm,
+    home_recent_slots, render, Action, Anim, CreateObjectForm, CreateObjectKind, DbConnectForm,
     HomeRecentSlot, Keymap, Palette, PaletteMode, RenderCtx, StatusMessage, UiState,
 };
 use lsp_types::{
@@ -45,7 +45,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 pub struct App {
@@ -98,6 +98,8 @@ pub struct App {
     health_activity_tick: u32,
     /// Theme id before palette live-preview (Esc restores).
     theme_before_preview: Option<String>,
+    /// Origin for restrained TUI motion (spinner / pulse).
+    anim_origin: Instant,
 }
 
 impl App {
@@ -143,6 +145,7 @@ impl App {
             health_tick_counter: 0,
             health_activity_tick: 0,
             theme_before_preview: None,
+            anim_origin: Instant::now(),
         };
         app.config.remember_project(&app.workspace.root);
         app.db.query_timeout_secs = app.config.database.query_timeout_secs;
@@ -8199,6 +8202,7 @@ async fn event_loop(
                     nvim_diag: app.nvim_diag,
                     recent_projects,
                     recent_files,
+                    anim: Anim::new(app.anim_origin),
                 },
             );
         })?;

@@ -1,5 +1,6 @@
 //! TUI layouts, keymap, and command palette.
 
+mod anim;
 pub mod create_dialect;
 mod create_object_form;
 mod db_connect_form;
@@ -9,11 +10,13 @@ mod palette;
 pub mod theme;
 mod widgets;
 
+pub use anim::{animations_enabled, Anim};
 pub use create_object_form::{CreateObjectForm, CreateObjectKind};
 pub use create_dialect::supports_kind as create_dialect_supports;
 pub use db_connect_form::DbConnectForm;
 pub use keymap::{Action, KeyContext, Keymap};
 pub use palette::{Palette, PaletteMode};
+pub use widgets::{modal_chrome, paint_l0, paint_scrim};
 // HomeRecentSlot exported via lib for app quick-jump.
 
 use ide_buffer::BufferSet;
@@ -312,10 +315,14 @@ pub struct RenderCtx<'a> {
     pub nvim_diag: (u64, u64),
     pub recent_projects: &'a [String],
     pub recent_files: &'a [String],
+    /// OpenCode/Hop-style motion clock (spinner / pulse).
+    pub anim: Anim,
 }
 
 pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
     let size = frame.area();
+    // jackin L0: full-bleed app background before chrome.
+    paint_l0(frame, size);
 
     // Code mode: our Home dashboard fills the center (not NVIM intro).
     // Editor surface paints the Neovim grid.
@@ -3339,10 +3346,14 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     ));
     if let Some(b) = busy {
-        right_spans.push(Span::styled("  ·  ", theme::style_faint()));
+        right_spans.push(Span::styled("  ·  ", theme::Role::Faint.style()));
+        right_spans.push(Span::styled(
+            format!("{} ", ctx.anim.braille()),
+            theme::Role::Muted.style(),
+        ));
         right_spans.push(Span::styled(
             b.to_string(),
-            theme::style_accent().add_modifier(Modifier::BOLD),
+            theme::Role::Accent.style(),
         ));
     }
     right_spans.push(Span::raw(" "));
@@ -3775,8 +3786,16 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 }
 
 fn render_db_home_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
-    // One footer only — toast then keybinds. Green OK only for Success tone.
-    let line = if let Some(msg) = &ctx.ui.status {
+    // One footer only — toast then tuile key chips. Green OK only for Success tone.
+    let line = if let Some(busy) = ctx.ui.busy_label.as_deref() {
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", ctx.anim.braille()),
+                theme::Role::Muted.style(),
+            ),
+            Span::styled(busy.to_string(), theme::Role::Muted.style()),
+        ])
+    } else if let Some(msg) = &ctx.ui.status {
         let mut spans = Vec::new();
         match msg.tone {
             StatusTone::Success => {
@@ -3786,28 +3805,33 @@ fn render_db_home_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 spans.push(Span::styled(" ERR ", theme::style_err_badge()));
             }
             StatusTone::Info => {
-                spans.push(Span::styled(" · ", theme::style_faint()));
+                spans.push(Span::styled(" · ", theme::Role::Faint.style()));
             }
         }
         spans.push(Span::styled(
             format!(" {} ", msg.text),
-            theme::style_text(),
+            theme::Role::Text.style(),
         ));
         Line::from(spans)
     } else {
-        Line::from(vec![
-            Span::styled(
-                " DB Home ",
-                Style::default()
-                    .fg(theme::bg())
-                    .bg(theme::text())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  Enter open  ·  A add  ·  W workspaces ",
-                theme::style_faint(),
-            ),
-        ])
+        let mut spans = vec![Span::styled(
+            format!(" {} ", ide_core::PRODUCT_NAME),
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        )];
+        theme::extend_footer_keys(
+            &mut spans,
+            &[
+                ("Enter", "open"),
+                ("A", "add"),
+                ("W", "workspaces"),
+                ("Space", "keys"),
+                ("Ctrl-P", "palette"),
+            ],
+        );
+        Line::from(spans)
     };
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme::bg())),
@@ -3955,56 +3979,103 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
     render_studio_footer(frame, root[2], ctx);
 }
 
-/// Contextual keybindings for the focused Studio pane (footer-only chrome).
-fn studio_context_bindings(ui: &UiState) -> &'static str {
+/// Contextual key chips for the focused Studio pane (footer-only chrome).
+fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
     if ui.admin_modal {
-        return "Esc close  ·  r refresh";
+        return vec![("Esc", "close"), ("r", "refresh")];
     }
     if ui.cell_modal {
-        return "Tab Row/Plan/Chart/JSON  ·  Enter drill  ·  Esc close";
+        return vec![
+            ("Tab", "tabs"),
+            ("Enter", "drill"),
+            ("Esc", "close"),
+        ];
     }
     if ui.show_discover {
-        return "Space discover  ·  Esc close";
+        return vec![("Space", "close"), ("Esc", "close")];
     }
     match ui.mode {
         Mode::Insert if ui.focus == Focus::Editor => {
-            return "Esc normal  ·  F5 run  ·  Ctrl-Space complete";
+            return vec![
+                ("Esc", "normal"),
+                ("F5", "run"),
+                ("Ctrl-Space", "complete"),
+            ];
         }
-        Mode::EditCell => return "Enter apply  ·  Esc cancel",
+        Mode::EditCell => return vec![("Enter", "apply"), ("Esc", "cancel")],
         Mode::EditTableFilter => {
-            return "Tab accept col  ·  ↑↓  ·  Enter apply  ·  Esc";
+            return vec![
+                ("Tab", "accept"),
+                ("↑↓", "move"),
+                ("Enter", "apply"),
+                ("Esc", "cancel"),
+            ];
         }
         _ => {}
     }
-    let mut base = match ui.focus {
-        Focus::Database => "Enter open  ·  Ctrl-P palette  ·  Ctrl-W close tab  ·  Tab",
-        Focus::Structure => "↑↓  ·  Ctrl-P palette  ·  Tab  ·  Esc home",
-        Focus::Editor => "i insert  ·  F5  ·  Ctrl-P palette  ·  Ctrl-W close tab",
-        Focus::Results => {
-            "Space discover  ·  Ctrl-P palette  ·  Ctrl-W close  ·  m actions"
-        }
-        Focus::Search => "↑↓  ·  Enter open  ·  Esc",
-        Focus::Outline => "↑↓  ·  Enter  ·  Esc",
-        Focus::Debug => "F5 continue  ·  F10 step  ·  Esc",
-        Focus::Terminal => "Ctrl-` close  ·  Esc editor",
-        _ => "1–4 panes  ·  Tab  ·  ? help",
-    };
     if ui.db_fullscreen.is_some() {
-        base = match ui.focus {
-            Focus::Database => "f exit full  ·  Enter open  ·  d DDL",
-            Focus::Structure => "f exit full  ·  ↑↓",
-            Focus::Editor => "f exit full  ·  i insert  ·  F5",
-            Focus::Results => {
-                "f exit full  ·  Space discover  ·  Enter inspect  ·  m actions"
-            }
-            _ => "f exit full  ·  Esc",
+        return match ui.focus {
+            Focus::Database => vec![("f", "exit full"), ("Enter", "open"), ("d", "DDL")],
+            Focus::Structure => vec![("f", "exit full"), ("↑↓", "move")],
+            Focus::Editor => vec![("f", "exit full"), ("i", "insert"), ("F5", "run")],
+            Focus::Results => vec![
+                ("f", "exit full"),
+                ("Space", "keys"),
+                ("Enter", "inspect"),
+                ("m", "actions"),
+            ],
+            _ => vec![("f", "exit full"), ("Esc", "back")],
         };
     }
-    base
+    match ui.focus {
+        Focus::Database => vec![
+            ("Enter", "open"),
+            ("Ctrl-P", "palette"),
+            ("Ctrl-W", "close"),
+            ("Tab", "focus"),
+        ],
+        Focus::Structure => vec![
+            ("↑↓", "move"),
+            ("Ctrl-P", "palette"),
+            ("Tab", "focus"),
+            ("Esc", "home"),
+        ],
+        Focus::Editor => vec![
+            ("i", "insert"),
+            ("F5", "run"),
+            ("Ctrl-P", "palette"),
+            ("Ctrl-W", "close"),
+        ],
+        Focus::Results => vec![
+            ("Space", "keys"),
+            ("Ctrl-P", "palette"),
+            ("Ctrl-W", "close"),
+            ("m", "actions"),
+        ],
+        Focus::Search => vec![("↑↓", "move"), ("Enter", "open"), ("Esc", "back")],
+        Focus::Outline => vec![("↑↓", "move"), ("Enter", "go"), ("Esc", "back")],
+        Focus::Debug => vec![("F5", "continue"), ("F10", "step"), ("Esc", "back")],
+        Focus::Terminal => vec![("Ctrl-`", "close"), ("Esc", "editor")],
+        _ => vec![("1–4", "panes"), ("Tab", "focus"), ("?", "help")],
+    }
 }
 
 fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
-    // Toast briefly; otherwise only contextual bindings for the current focus.
+    // Busy spinner · toast · otherwise tuile footer-key chips.
+    if let Some(busy) = ctx.ui.busy_label.as_deref() {
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {} ", ctx.anim.braille()),
+                theme::Role::Muted.style(),
+            ),
+            Span::styled(busy.to_string(), theme::Role::Muted.style()),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme::bg())),
+            area,
+        );
+        return;
+    }
     if let Some(msg) = &ctx.ui.status {
         let text = if msg.text.chars().count() > 90 {
             format!("{}…", msg.text.chars().take(89).collect::<String>())
@@ -4013,31 +4084,33 @@ fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         let mut spans = Vec::new();
         match msg.tone {
-            StatusTone::Success => spans.push(Span::styled("ok", theme::style_ok())),
-            StatusTone::Error => spans.push(Span::styled("err", theme::style_err())),
-            StatusTone::Info => spans.push(Span::styled("·", theme::style_faint())),
+            StatusTone::Success => spans.push(Span::styled(" ok ", theme::style_ok())),
+            StatusTone::Error => spans.push(Span::styled(" err ", theme::style_err())),
+            StatusTone::Info => spans.push(Span::styled(" · ", theme::Role::Faint.style())),
         }
-        spans.push(Span::styled(format!("  {text}"), theme::style_muted()));
+        spans.push(Span::styled(format!(" {text} "), theme::Role::Muted.style()));
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::surface())),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
             area,
         );
         return;
     }
 
-    let bindings = studio_context_bindings(ctx.ui);
+    let keys = studio_context_keys(ctx.ui);
+    let mut spans = Vec::new();
+    theme::extend_footer_keys(&mut spans, &keys);
+    // Truncate whole chips from the right if the footer is narrow.
     let width = area.width as usize;
-    let shown = if bindings.chars().count() + 2 > width {
-        truncate_chars(bindings, width.saturating_sub(2))
-    } else {
-        bindings.to_string()
-    };
+    while spans.len() >= 2 {
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        if used <= width.saturating_sub(1) {
+            break;
+        }
+        spans.pop();
+        spans.pop();
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(shown, theme::style_faint()),
-        ]))
-        .style(Style::default().bg(theme::surface())),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
         area,
     );
 }
@@ -4260,12 +4333,6 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     let drill = ctx.ui.cell_modal_drill || editing;
     let tab = ctx.ui.cell_modal_tab.min(3);
 
-    // Soft backdrop — clears the stage so the plate reads as a focused object.
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme::bg())),
-        screen,
-    );
-
     let width = screen.width.saturating_sub(8).clamp(52, 100);
     let height = screen.height.saturating_sub(4).clamp(16, 28);
     let area = Rect {
@@ -4274,6 +4341,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         width,
         height,
     };
+    paint_scrim(frame, screen);
     frame.render_widget(Clear, area);
 
     let table = match (&result.source_schema, &result.source_table) {
@@ -5100,11 +5168,6 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     let is_overview = view.contains("overview");
     let is_blocking = view.contains("blocking") || view.contains("lock");
 
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme::bg())),
-        screen,
-    );
-
     let width = screen.width.saturating_sub(4).clamp(56, 120);
     let height = screen.height.saturating_sub(2).clamp(14, 36);
     let area = Rect {
@@ -5113,6 +5176,7 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         width,
         height,
     };
+    paint_scrim(frame, screen);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()
@@ -5471,6 +5535,7 @@ fn render_db_monitor(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         width,
         height,
     };
+    paint_scrim(frame, screen);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()

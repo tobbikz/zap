@@ -616,12 +616,6 @@ fn item(label: &str, id: &str) -> PaletteItem {
 }
 
 pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
-    // Full-screen black scrim — same plate language as Home / connect modal.
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme::bg())),
-        screen,
-    );
-
     let width = screen.width.min(64).max(40);
     let height = screen.height.min(18).max(10);
     let x = screen.x + (screen.width.saturating_sub(width)) / 2;
@@ -633,6 +627,8 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
         height,
     };
 
+    // Opaque Hop-style scrim — Clear alone leaves chrome ghosts.
+    crate::widgets::paint_scrim(frame, screen);
     frame.render_widget(Clear, area);
 
     let title = match palette.mode {

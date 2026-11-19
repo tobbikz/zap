@@ -113,7 +113,7 @@ Press **Space** — see what can follow. No memorization tax.
 - Themes: AMOLED mono · AMOLED light mono · Dark · Nord · Mocha · Tokyo Night · Dracula · Light · High contrast · **custom**
 - Agents / Sessions / Terminal surfaces for adjacent workflows
 
-Full inventory: **[docs/FEATURES.md](docs/FEATURES.md)** · Themes: **[docs/THEMES.md](docs/THEMES.md)**
+Full inventory: **[docs/FEATURES.md](docs/FEATURES.md)** · Themes: **[docs/THEMES.md](docs/THEMES.md)** · TUI design: **[docs/TUI-DESIGN.md](docs/TUI-DESIGN.md)**
 
 ---
 
