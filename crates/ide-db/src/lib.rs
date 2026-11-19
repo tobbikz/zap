@@ -285,6 +285,9 @@ impl DataSource {
             Some(lp) => ("127.0.0.1", lp),
             None => (self.host.as_str(), self.port),
         };
+        // Over a loopback SSH forward, hostname verification against 127.0.0.1 always
+        // fails — keep chain checks (`verify-ca`) but skip name checks (#196).
+        let ssl_mode = effective_ssl_mode(&self.ssl_mode, local_port.is_some());
         match self.driver {
             DbDriver::Postgres => {
                 let pass_part = if pass.is_empty() {
@@ -300,7 +303,7 @@ impl DataSource {
                     port,
                     self.database
                 );
-                append_pg_ssl_query(&mut url, &self.ssl_mode, &self.ssl_ca);
+                append_pg_ssl_query(&mut url, ssl_mode, &self.ssl_ca);
                 url
             }
             DbDriver::Mysql => {
@@ -317,7 +320,7 @@ impl DataSource {
                     port,
                     self.database
                 );
-                append_mysql_ssl_query(&mut url, &self.ssl_mode, &self.ssl_ca);
+                append_mysql_ssl_query(&mut url, ssl_mode, &self.ssl_ca);
                 url
             }
             DbDriver::Sqlite => {
@@ -402,6 +405,17 @@ pub(crate) fn sqlite_url_from_path(file: &str) -> String {
     }
 }
 
+/// Downgrade hostname-verifying modes when the connection goes through a loopback
+/// SSH forward: keep chain verification (`verify-ca`) but skip name checks (#196).
+pub(crate) fn effective_ssl_mode(mode: &str, tunneled: bool) -> &str {
+    let m = mode.trim();
+    if tunneled && matches!(m, "verify-full" | "verify_full" | "verify-identity") {
+        "verify-ca"
+    } else {
+        m
+    }
+}
+
 fn append_pg_ssl_query(url: &mut String, ssl_mode: &str, ssl_ca: &str) {
     let mode = ssl_mode.trim();
     if mode.is_empty() || mode == "prefer" {
@@ -421,7 +435,8 @@ fn append_mysql_ssl_query(url: &mut String, ssl_mode: &str, ssl_ca: &str) {
         "disable" => "DISABLED",
         "prefer" | "" => return,
         "require" => "REQUIRED",
-        "verify-full" | "verify_ca" => "VERIFY_IDENTITY",
+        "verify-ca" | "verify_ca" => "VERIFY_CA",
+        "verify-full" | "verify_full" | "verify-identity" => "VERIFY_IDENTITY",
         other => other,
     };
     url.push('?');
@@ -11213,7 +11228,7 @@ mod ssh_tunnel_port_tests {
 
 #[cfg(test)]
 mod ssl_trust_tests {
-    use super::DataSource;
+    use super::{effective_ssl_mode, DataSource, DbDriver};
 
     #[test]
     fn accepts_invalid_certs_only_for_require_plus_trust() {
@@ -11236,5 +11251,26 @@ mod ssl_trust_tests {
         s.ssl_ca.clear();
         s.ssl_mode = "prefer".into();
         assert!(!s.accepts_invalid_certs());
+    }
+
+    #[test]
+    fn verify_full_downgrades_over_ssh_tunnel() {
+        assert_eq!(effective_ssl_mode("verify-full", true), "verify-ca");
+        assert_eq!(effective_ssl_mode("verify-full", false), "verify-full");
+        assert_eq!(effective_ssl_mode("require", true), "require");
+
+        let mut s = DataSource::postgres_local("t", "db");
+        s.ssl_mode = "verify-full".into();
+        s.ssl_ca = "/tmp/ca.pem".into();
+        let direct = s.url_via(None);
+        assert!(direct.contains("sslmode=verify-full"), "{direct}");
+        let tunneled = s.url_via(Some(15432));
+        assert!(tunneled.contains("127.0.0.1:15432"), "{tunneled}");
+        assert!(tunneled.contains("sslmode=verify-ca"), "{tunneled}");
+        assert!(!tunneled.contains("sslmode=verify-full"), "{tunneled}");
+
+        s.driver = DbDriver::Mysql;
+        let mysql_t = s.url_via(Some(13306));
+        assert!(mysql_t.contains("ssl-mode=VERIFY_CA"), "{mysql_t}");
     }
 }
