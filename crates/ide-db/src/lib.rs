@@ -5908,15 +5908,33 @@ impl DbWorkspace {
         Ok(path)
     }
 
+    /// Show multi-line text in a disposable Results tab without wiping the
+    /// active query tab’s editable grid (#175).
     pub fn show_text_result(&mut self, title: &str, text: &str) {
+        self.flush_active_tab();
         let mut qr = QueryResult::empty();
         qr.columns = vec![title.into()];
         for line in text.lines() {
             qr.rows.push(vec![line.to_string()]);
         }
-        qr.source_table = Some(title.into());
-        self.last_result = Some(qr);
-        self.status = title.into();
+        qr.source_table = Some(format!("text::{title}"));
+        let n = self
+            .tabs
+            .iter()
+            .filter(|t| t.table_key.is_none())
+            .count()
+            .saturating_add(1);
+        let mut tab = SqlTab::query(n);
+        tab.title = format!("inspect · {title}");
+        tab.sql = format!("-- {title} (inspector — switch/close tab to return to query results)\n");
+        tab.result = Some(qr);
+        tab.source_id = self.active_source.clone();
+        tab.database = self.active_database.clone();
+        tab.schema = self.active_schema.clone();
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len() - 1;
+        self.load_active_tab();
+        self.status = format!("{title} · switch tab to restore grid");
     }
 
     pub fn reload_persona_config(&mut self) {
@@ -11409,6 +11427,36 @@ mod migration_txn_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction is open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod show_text_result_tests {
+    use super::{DbWorkspace, QueryResult};
+
+    #[test]
+    fn show_text_result_preserves_prior_tab_grid() {
+        let mut ws = DbWorkspace::default();
+        let mut qr = QueryResult::empty();
+        qr.columns = vec!["id".into()];
+        qr.rows = vec![vec!["1".into()]];
+        qr.original_rows = vec![vec!["1".into()]];
+        ws.sql = "SELECT 1 AS id;".into();
+        ws.last_result = Some(qr.clone());
+        ws.flush_active_tab();
+        let prior_tab = ws.active_tab;
+
+        ws.show_text_result("quality", "nulls: 0\nok");
+        assert!(ws.tabs.len() > prior_tab + 1 || ws.tabs.len() >= 2);
+        assert_ne!(ws.active_tab, prior_tab);
+        let kept = ws.tabs[prior_tab].result.as_ref().expect("kept grid");
+        assert_eq!(kept.columns, vec!["id".to_string()]);
+        assert_eq!(kept.original_rows, vec![vec!["1".to_string()]]);
+        assert!(ws
+            .last_result
+            .as_ref()
+            .map(|r| r.columns == ["quality"])
+            .unwrap_or(false));
     }
 }
 
