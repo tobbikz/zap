@@ -6762,7 +6762,7 @@ impl App {
                 self.ui.mode = Mode::BrainAsk;
                 self.set_status("rename tab · Enter", false);
             }
-            "close_tab" => {
+            "close_sql_tab" => {
                 if self.db.close_active_tab() {
                     self.set_status(
                         format!(
@@ -7554,7 +7554,7 @@ impl App {
                 self.ui.split.secondary = Some(next);
                 self.ui.split.enabled = !self.ui.split.enabled;
             }
-            "close_tab" => {
+            "close_editor_tab" => {
                 if let Err(e) = self.buffers.close_active() {
                     self.set_status(e.to_string(), true);
                 }
