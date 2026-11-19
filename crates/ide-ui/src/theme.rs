@@ -229,33 +229,33 @@ pub static PALETTES: &[Palette] = &[
         syn_function: rgb(40, 40, 40),
         syn_ident: rgb(30, 30, 30),
     },
-    // 2 — DataRig-like dark (subtle blue accent)
+    // 2 — DataRig dark (teal accent) — values from DokaDev/datarig `DARK`
     Palette {
         id: "dark",
         label: "Dark",
         light: false,
-        bg: rgb(16, 18, 22),
-        surface: rgb(24, 26, 32),
-        surface_2: rgb(32, 35, 42),
-        surface_3: rgb(40, 44, 52),
-        modal: rgb(28, 31, 38),
-        border_idle: rgb(48, 52, 62),
-        border_focus: rgb(137, 180, 250),
-        text: rgb(205, 214, 244),
-        muted: rgb(147, 153, 178),
-        faint: rgb(88, 91, 112),
-        accent: rgb(137, 180, 250),
-        accent_warm: rgb(249, 226, 175),
-        warn: rgb(249, 226, 175),
-        danger: rgb(243, 139, 168),
-        success: rgb(166, 227, 161),
-        info: rgb(137, 220, 235),
-        syn_keyword: rgb(203, 166, 247),
-        syn_string: rgb(166, 227, 161),
-        syn_number: rgb(250, 179, 135),
-        syn_comment: rgb(108, 112, 134),
-        syn_function: rgb(137, 180, 250),
-        syn_ident: rgb(205, 214, 244),
+        bg: rgb(0x14, 0x16, 0x1B),
+        surface: rgb(0x1B, 0x1E, 0x25),
+        surface_2: rgb(0x20, 0x24, 0x2C),
+        surface_3: rgb(0x2A, 0x3B, 0x4D), // selection / grid cursor cell
+        modal: rgb(0x1B, 0x1E, 0x25),
+        border_idle: rgb(0x2E, 0x34, 0x40),
+        border_focus: rgb(0x4F, 0xB3, 0xA9),
+        text: rgb(0xD8, 0xDE, 0xE9),
+        muted: rgb(0x8A, 0x93, 0xA6),
+        faint: rgb(0x5C, 0x65, 0x77),
+        accent: rgb(0x4F, 0xB3, 0xA9),
+        accent_warm: rgb(0xE0, 0xA9, 0x6D),
+        warn: rgb(0xE6, 0xC3, 0x5C),
+        danger: rgb(0xE0, 0x6C, 0x75),
+        success: rgb(0x8F, 0xC7, 0x7A),
+        info: rgb(0x61, 0xAF, 0xEF),
+        syn_keyword: rgb(0xC7, 0x92, 0xEA),
+        syn_string: rgb(0x9C, 0xCB, 0x85),
+        syn_number: rgb(0xE0, 0xA9, 0x6D),
+        syn_comment: rgb(0x5C, 0x65, 0x77),
+        syn_function: rgb(0x6F, 0xA8, 0xDC),
+        syn_ident: rgb(0xD8, 0xDE, 0xE9),
     },
     // 2 — Nord
     Palette {
@@ -634,6 +634,40 @@ pub fn style_selected() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Results grid: subtle tint for the whole cursor row (DataRig `grid_cursor_row`).
+pub fn style_grid_cursor_row() -> Style {
+    Style::default().bg(surface_2())
+}
+
+/// Results grid: cursor cell (DataRig `selection` on the focused cell).
+pub fn style_grid_cursor_cell() -> Style {
+    Style::default()
+        .fg(text())
+        .bg(surface_3())
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Active console / results tab fill (DataRig `tab_active` — accent blended into bg).
+pub fn style_tab_active() -> Style {
+    Style::default()
+        .fg(text())
+        .bg(surface_3())
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Quiet toolbar chip (db / schema / lim).
+pub fn style_chip() -> Style {
+    Style::default().fg(muted()).bg(surface_2())
+}
+
+/// Run / primary action chip.
+pub fn style_chip_run() -> Style {
+    Style::default()
+        .fg(contrast_on(accent()))
+        .bg(accent())
+        .add_modifier(Modifier::BOLD)
+}
+
 /// Strong inverted chip (badges / running) — not for list rows.
 pub fn style_selected_strong() -> Style {
     Style::default()
@@ -649,6 +683,18 @@ pub fn style_pill_on(bg_c: Color) -> Style {
 }
 pub fn style_pill_off() -> Style {
     Style::default().fg(muted()).bg(surface_2())
+}
+
+/// Studio pane block — DataRig quiet titles + focus border.
+pub fn pane_block(title: impl Into<String>, focused: bool) -> ratatui::widgets::Block<'static> {
+    use ratatui::widgets::{Block, Borders};
+    let title: String = title.into();
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type())
+        .title(ratatui::text::Span::styled(title, style_title(focused)))
+        .border_style(Style::default().fg(border(focused)))
+        .style(Style::default().bg(bg()))
 }
 pub fn border(focused: bool) -> Color {
     if focused {

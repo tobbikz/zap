@@ -1178,16 +1178,10 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
     };
     let title = if focused { " Explorer " } else { " explorer " };
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(theme::border_type())
-                .title(Span::styled(title, theme::style_title(focused)))
-                .border_style(Style::default().fg(border))
-                .style(Style::default().bg(theme::bg())),
-        ),
+        List::new(items).block(theme::pane_block(title, focused)),
         area,
     );
+    let _ = border;
 }
 
 fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focused: bool) {
@@ -1333,16 +1327,10 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
         ),
     };
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(theme::border_type())
-                .title(Span::styled(title, theme::style_title(focused)))
-                .border_style(Style::default().fg(border))
-                .style(Style::default().bg(theme::bg())),
-        ),
+        List::new(items).block(theme::pane_block(title, focused)),
         area,
     );
+    let _ = border;
     if let (Some(strip_area), Some(text)) = (strip_area, strip) {
         let shown = truncate_chars(&text, strip_area.width as usize);
         frame.render_widget(
@@ -1355,14 +1343,8 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
 
 fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let focused = ctx.ui.focus == Focus::Editor;
-    let border = theme::border(focused);
     let title = if focused { " Console " } else { " console " };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(theme::border_type())
-        .title(Span::styled(title, theme::style_title(focused)))
-        .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme::bg()));
+    let block = theme::pane_block(title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1392,19 +1374,14 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     format!(" {title} ")
                 };
                 if active {
-                    spans.push(Span::styled(
-                        label,
-                        Style::default()
-                            .fg(theme::text())
-                            .bg(theme::surface_2())
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                    // DataRig tab_active — accent-tinted fill, caret in connection accent.
+                    spans.push(Span::styled(label, theme::style_tab_active()));
                     spans.push(Span::styled(
                         theme::caret(),
-                        Style::default().fg(conn_accent).bg(theme::surface_2()),
+                        Style::default().fg(conn_accent).bg(theme::surface_3()),
                     ));
                 } else {
-                    spans.push(Span::styled(label, theme::style_muted()));
+                    spans.push(Span::styled(label, theme::Role::Muted.style()));
                 }
             }
             frame.render_widget(
@@ -2411,32 +2388,21 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let border = theme::border(focused);
     let Some(db) = ctx.db else {
         frame.render_widget(
-            Paragraph::new(Span::styled(" — ", theme::style_faint())).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(theme::border_type())
-                    .title(Span::styled(
-                        if focused { " Results " } else { " results " },
-                        theme::style_title(focused),
-                    ))
-                    .border_style(Style::default().fg(border))
-                    .style(Style::default().bg(theme::bg())),
-            ),
+            Paragraph::new(Span::styled(" — ", theme::style_faint())).block(theme::pane_block(
+                if focused { " Results " } else { " results " },
+                focused,
+            )),
             area,
         );
+        let _ = border;
         return;
     };
     let table_tab = db.active_is_table_tab();
     let Some(result) = &db.last_result else {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(theme::border_type())
-            .title(Span::styled(
-                if focused { " Results " } else { " results " },
-                theme::style_title(focused),
-            ))
-            .border_style(Style::default().fg(border))
-            .style(Style::default().bg(theme::bg()));
+        let block = theme::pane_block(
+            if focused { " Results " } else { " results " },
+            focused,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if table_tab && inner.height >= 2 {
@@ -2508,17 +2474,10 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     if !db.results_filter.trim().is_empty() {
         secondary.push(format!("/{}", db.results_filter.trim()));
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(theme::border_type())
-        .title(Span::styled(
-            title,
-            theme::style_title(focused),
-        ))
-        .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme::bg()));
+    let block = theme::pane_block(title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let _ = border;
 
     // One faint meta line — typography only, no surface chips.
     let inner = if inner.height >= 3 && !secondary.is_empty() {
@@ -2601,6 +2560,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         header_spans.push(Span::styled(format!("{t}"), style));
     }
+    // DataRig grid header sits on surface; cursor column stays underlined above.
     let header: Line = Line::from(header_spans).style(Style::default().bg(theme::surface()));
 
     let filter = db.results_filter.clone();
@@ -2664,14 +2624,12 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 || col_name.eq_ignore_ascii_case("kind")
                 || col_name.eq_ignore_ascii_case("state");
             let style = if is_cursor && editing {
-                Style::default()
-                    .fg(theme::bg())
-                    .bg(theme::accent())
-                    .add_modifier(Modifier::BOLD)
+                theme::style_chip_run()
             } else if is_cursor {
-                theme::style_selected()
+                // DataRig: selection sits on the cell; the row keeps a quieter tint.
+                theme::style_grid_cursor_cell()
             } else if row_dirty {
-                Style::default().fg(theme::accent())
+                Style::default().fg(theme::accent_warm()).add_modifier(Modifier::BOLD)
             } else if ci < pinned {
                 Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
             } else if is_null {
@@ -2685,8 +2643,9 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             spans.push(Span::styled(t, style));
         }
         let line = if ri == result.cursor_row {
-            Line::from(spans).style(Style::default().bg(theme::surface_3()))
+            Line::from(spans).style(theme::style_grid_cursor_row())
         } else if ri % 2 == 1 {
+            // DataRig surface_alt zebra — quieter than a full surface wash.
             Line::from(spans).style(Style::default().bg(theme::surface()))
         } else {
             Line::from(spans)
@@ -5674,22 +5633,15 @@ fn console_toolbar_spans(
     } else {
         Span::styled(
             format!(" {} F5 ", icons::run_glyph()),
-            Style::default()
-                .fg(theme::accent())
-                .add_modifier(Modifier::BOLD),
+            theme::style_chip_run(),
         )
     };
-    let sep = Span::styled(" · ", theme::style_faint());
+    let sep = Span::styled(" · ", theme::Role::Faint.style());
     let db_chip = format!("{db_label} {}", icons::chevron_down());
     let schema_chip = format!("{schema_label} {}", icons::chevron_down());
     let lim_chip = format!("lim {lim}");
 
-    let chip = |label: String| {
-        Span::styled(
-            format!(" {label} "),
-            Style::default().fg(theme::muted()).bg(theme::surface()),
-        )
-    };
+    let chip = |label: String| Span::styled(format!(" {label} "), theme::style_chip());
 
     let candidates: Vec<Vec<Span<'static>>> = vec![
         vec![
@@ -5723,7 +5675,7 @@ fn console_toolbar_spans(
     }
     vec![Span::styled(
         format!(" {} F5 ", icons::run_glyph()),
-        theme::style_accent(),
+        theme::style_chip_run(),
     )]
 }
 
