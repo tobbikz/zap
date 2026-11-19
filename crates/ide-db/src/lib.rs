@@ -9192,6 +9192,25 @@ impl DbWorkspace {
     pub fn set_queries_dir(&mut self, dir: PathBuf) {
         self.queries_dir = dir;
         let _ = std::fs::create_dir_all(&self.queries_dir);
+        self.refresh_saved_queries_folders();
+    }
+
+    /// Rebuild Admin → Saved queries leaves after `queries_dir` changes (#179).
+    pub fn refresh_saved_queries_folders(&mut self) {
+        fn walk(nodes: &mut [DbTreeNode], queries_dir: &Path) {
+            for n in nodes {
+                if n.kind == DbNodeKind::Admin && n.id.ends_with("::admin::saved") {
+                    let expanded = n.expanded;
+                    let source_id = n.source_id.clone();
+                    *n = saved_queries_folder(&source_id, queries_dir);
+                    n.expanded = expanded;
+                } else if !n.children.is_empty() {
+                    walk(&mut n.children, queries_dir);
+                }
+            }
+        }
+        walk(&mut self.tree, &self.queries_dir);
+        self.rebuild_flat();
     }
 
     pub fn bookmark_current_sql(&mut self) {

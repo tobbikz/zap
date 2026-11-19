@@ -409,6 +409,28 @@ impl IdeConfig {
         let _ = self.save();
     }
 
+    /// Drop a missing/moved path from recent projects (and matching string forms).
+    pub fn forget_project(&mut self, path: &Path) {
+        if self.load_corrupt {
+            return;
+        }
+        let display = path.display().to_string();
+        let canon = path.canonicalize().ok().map(|p| p.display().to_string());
+        let before = self.recent_projects.len();
+        self.recent_projects.retain(|p| {
+            if p == &display {
+                return false;
+            }
+            if canon.as_ref().is_some_and(|c| c == p) {
+                return false;
+            }
+            Path::new(p) != path
+        });
+        if self.recent_projects.len() != before && !cfg!(test) {
+            let _ = self.save();
+        }
+    }
+
     pub fn remember_file(&mut self, path: &Path) {
         if self.load_corrupt {
             return;
@@ -460,6 +482,17 @@ mod tests {
     fn parse_toml_rejects_garbage() {
         assert!(IdeConfig::parse_toml("not = [valid").is_err());
         assert!(IdeConfig::parse_toml("theme = {}\n").is_ok());
+    }
+
+    #[test]
+    fn forget_project_drops_stale_entry() {
+        let mut cfg = IdeConfig::default();
+        cfg.recent_projects = vec![
+            "/gone/project".into(),
+            "/keep/project".into(),
+        ];
+        cfg.forget_project(Path::new("/gone/project"));
+        assert_eq!(cfg.recent_projects, vec!["/keep/project".to_string()]);
     }
 
     #[test]
