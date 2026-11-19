@@ -1,6 +1,6 @@
 //! User config: languages, theme, keymaps.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
@@ -27,6 +27,12 @@ pub struct IdeConfig {
     pub recent_files: Vec<String>,
     #[serde(default)]
     pub database: DatabaseConfig,
+    /// True when `config.toml` failed to parse — refuse `save` so defaults cannot clobber it (#180).
+    #[serde(skip)]
+    pub load_corrupt: bool,
+    /// Parse error message when `load_corrupt` (for UI toast).
+    #[serde(skip)]
+    pub load_error: Option<String>,
 }
 
 impl Default for IdeConfig {
@@ -40,6 +46,8 @@ impl Default for IdeConfig {
             recent_projects: Vec::new(),
             recent_files: Vec::new(),
             database: DatabaseConfig::default(),
+            load_corrupt: false,
+            load_error: None,
         }
     }
 }
@@ -324,7 +332,16 @@ impl IdeConfig {
         let Some(path) = Self::config_path() else {
             return Self::default();
         };
-        Self::load_from(&path).unwrap_or_default()
+        match Self::load_from(&path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // Do not overwrite the broken file — keep defaults in memory only (#180).
+                let mut cfg = Self::default();
+                cfg.load_corrupt = true;
+                cfg.load_error = Some(format!("{e:#}"));
+                cfg
+            }
+        }
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
@@ -339,8 +356,20 @@ impl IdeConfig {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
-        let mut cfg: IdeConfig = toml::from_str(&text)?;
+        let mut cfg: IdeConfig = toml::from_str(&text)
+            .with_context(|| format!("parse config {}", path.display()))?;
         // Merge defaults for missing language servers
+        for (k, v) in default_languages() {
+            cfg.languages.entry(k).or_insert(v);
+        }
+        cfg.load_corrupt = false;
+        cfg.load_error = None;
+        Ok(cfg)
+    }
+
+    /// Parse TOML text without writing disk (Settings draft validation).
+    pub fn parse_toml(text: &str) -> Result<Self> {
+        let mut cfg: IdeConfig = toml::from_str(text).context("parse config.toml draft")?;
         for (k, v) in default_languages() {
             cfg.languages.entry(k).or_insert(v);
         }
@@ -367,6 +396,9 @@ impl IdeConfig {
     }
 
     pub fn remember_project(&mut self, path: &Path) {
+        if self.load_corrupt {
+            return;
+        }
         let Ok(canon) = path.canonicalize() else {
             return;
         };
@@ -378,6 +410,9 @@ impl IdeConfig {
     }
 
     pub fn remember_file(&mut self, path: &Path) {
+        if self.load_corrupt {
+            return;
+        }
         let Ok(canon) = path.canonicalize() else {
             return;
         };
@@ -392,11 +427,23 @@ impl IdeConfig {
     }
 
     pub fn save(&self) -> Result<()> {
+        if self.load_corrupt {
+            bail!(
+                "config.toml is corrupt — fix or restore {}.bak before saving",
+                Self::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "config.toml".into())
+            );
+        }
         let Some(path) = Self::config_path() else {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        if path.exists() {
+            let bak = path.with_extension("toml.bak");
+            let _ = std::fs::copy(&path, &bak);
         }
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&path, text)
@@ -408,6 +455,19 @@ impl IdeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_toml_rejects_garbage() {
+        assert!(IdeConfig::parse_toml("not = [valid").is_err());
+        assert!(IdeConfig::parse_toml("theme = {}\n").is_ok());
+    }
+
+    #[test]
+    fn corrupt_config_refuses_save() {
+        let mut cfg = IdeConfig::default();
+        cfg.load_corrupt = true;
+        assert!(cfg.save().is_err());
+    }
 
     #[test]
     fn icon_pref_accepts_bool_and_string() {

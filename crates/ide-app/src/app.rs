@@ -153,6 +153,17 @@ impl App {
         app.db.select_limit = app.config.database.select_limit;
         app.apply_studio_layout_from_config();
         app.refresh_queries_dir();
+        if app.config.load_corrupt {
+            let detail = app
+                .config
+                .load_error
+                .clone()
+                .unwrap_or_else(|| "parse error".into());
+            app.set_status(
+                format!("config.toml corrupt — not overwritten · {detail}"),
+                true,
+            );
+        }
         Ok(app)
     }
 
@@ -3209,15 +3220,26 @@ impl App {
     async fn confirm_settings(&mut self) -> Result<()> {
         let draft = self.ui.settings_draft.clone();
         self.ui.mode = Mode::Normal;
-        let Some(path) = IdeConfig::config_path() else {
-            return Ok(());
+        // Validate in memory first — never trash config.toml with a bad draft (#180).
+        let mut parsed = match IdeConfig::parse_toml(&draft) {
+            Ok(c) => c,
+            Err(e) => {
+                self.set_status(format!("settings not saved: {e:#}"), true);
+                return Ok(());
+            }
         };
-        std::fs::write(&path, draft)?;
-        self.config = IdeConfig::load_from(&path)?;
+        parsed.load_corrupt = false;
+        parsed.load_error = None;
+        if let Err(e) = parsed.save() {
+            self.set_status(format!("settings save failed: {e:#}"), true);
+            return Ok(());
+        }
+        self.config = parsed;
         crate::host::apply_icons(self.config.theme.icons);
         ide_ui::theme::set_mode_name(&self.config.theme.name);
         self.db.query_timeout_secs = self.config.database.query_timeout_secs;
         self.db.select_limit = self.config.database.select_limit;
+        self.apply_studio_layout_from_config();
         self.lsp = LspManager::new(self.workspace.root.clone(), self.config.clone());
         self.set_status("config saved and reloaded", false);
         Ok(())
