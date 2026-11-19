@@ -1217,6 +1217,21 @@ fn csv_escape(v: &str) -> String {
 
 /// Minimal RFC4180-ish CSV parser (header + rows).
 fn parse_csv(text: &str) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    let mut rows = parse_csv_rows(text);
+    if rows.is_empty() {
+        bail!("empty CSV");
+    }
+    let headers = rows.remove(0);
+    // Normalize row widths to header length.
+    for r in &mut rows {
+        r.resize(headers.len(), String::new());
+    }
+    Ok((headers, rows))
+}
+
+/// RFC4180-ish tokenizer: quoted fields, `""` escapes, commas/newlines inside quotes.
+/// Returns raw rows (no header handling, no width normalization).
+fn parse_csv_rows(text: &str) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut field = String::new();
     let mut row: Vec<String> = Vec::new();
@@ -1251,15 +1266,7 @@ fn parse_csv(text: &str) -> Result<(Vec<String>, Vec<Vec<String>>)> {
         row.push(std::mem::take(&mut field));
         rows.push(row);
     }
-    if rows.is_empty() {
-        bail!("empty CSV");
-    }
-    let headers = rows.remove(0);
-    // Normalize row widths to header length.
-    for r in &mut rows {
-        r.resize(headers.len(), String::new());
-    }
-    Ok((headers, rows))
+    rows
 }
 
 /// Parse a JSON array of objects (or NDJSON) into header + row cells.
@@ -7705,22 +7712,25 @@ fn format_wide_cell_body(cell: &str) -> String {
 }
 
 fn parse_paste_grid(text: &str) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let cols: Vec<String> = if line.contains('\t') {
-            line.split('\t').map(|s| s.to_string()).collect()
-        } else if line.contains(',') {
-            // light CSV: no quote nesting
-            line.split(',').map(|s| s.trim().to_string()).collect()
-        } else {
-            vec![line.to_string()]
-        };
-        out.push(cols);
+    // Tabs win (spreadsheet paste); otherwise reuse the RFC4180 CSV parser so quoted
+    // fields like `"a,b"` survive (#202).
+    if text.contains('\t') {
+        return text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('\t').map(|s| s.to_string()).collect())
+            .collect();
     }
-    out
+    if text.contains(',') {
+        return parse_csv_rows(text)
+            .into_iter()
+            .map(|r| r.into_iter().map(|c| c.trim().to_string()).collect())
+            .collect();
+    }
+    text.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| vec![l.to_string()])
+        .collect()
 }
 
 fn split_first_statement(sql: &str) -> &str {
@@ -11114,5 +11124,30 @@ mod sqlite_url_tests {
         assert_eq!(sqlite_url_from_path(r"D:/x.db"), "sqlite:///D:/x.db");
         assert_eq!(sqlite_url_from_path("/tmp/x.db"), "sqlite:///tmp/x.db");
         assert_eq!(sqlite_url_from_path("rel/x.db"), "sqlite://rel/x.db");
+    }
+}
+
+#[cfg(test)]
+mod paste_grid_tests {
+    use super::parse_paste_grid;
+
+    #[test]
+    fn paste_csv_keeps_quoted_commas() {
+        let rows = parse_paste_grid("\"a,b\",c\n1,\"say \"\"hi\"\"\"");
+        assert_eq!(
+            rows,
+            vec![
+                vec!["a,b".to_string(), "c".to_string()],
+                vec!["1".to_string(), "say \"hi\"".to_string()]
+            ]
+        );
+        assert_eq!(
+            parse_paste_grid("1\ty\n2\tz"),
+            vec![
+                vec!["1".to_string(), "y".to_string()],
+                vec!["2".to_string(), "z".to_string()]
+            ]
+        );
+        assert_eq!(parse_paste_grid("plain"), vec![vec!["plain".to_string()]]);
     }
 }
