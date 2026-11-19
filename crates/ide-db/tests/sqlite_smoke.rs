@@ -50,6 +50,12 @@ fn read_only_sql_detection() {
     assert!(is_read_only_sql("WITH x AS (SELECT 1) SELECT * FROM x"));
     assert!(!is_read_only_sql("INSERT INTO t VALUES (1)"));
     assert!(!is_read_only_sql("UPDATE t SET x=1"));
+    assert!(!is_read_only_sql("SELECT a INTO t FROM s"));
+    assert!(!is_read_only_sql("SELECT * FROM t FOR UPDATE"));
+    assert!(!is_read_only_sql("SELECT pg_terminate_backend(1)"));
+    assert!(!is_read_only_sql(
+        "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"
+    ));
 }
 
 #[test]

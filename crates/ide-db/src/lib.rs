@@ -11128,6 +11128,7 @@ pub fn row_matches_filter(row: &[String], filter: &str) -> bool {
 }
 
 /// True when SQL is safe on read-only connections (SELECT/SHOW/EXPLAIN/WITH…).
+/// Rejects `SELECT … INTO`, `FOR UPDATE`, admin functions, and CTE+DML (#190 / #170).
 pub fn is_read_only_sql(sql: &str) -> bool {
     let stripped = strip_sql_comments(sql);
     let s = stripped.trim();
@@ -11139,11 +11140,59 @@ pub fn is_read_only_sql(sql: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
+    let lower = s.to_ascii_lowercase();
     match head.as_str() {
-        "select" | "show" | "explain" | "describe" | "desc" | "with" | "values" => true,
-        "pragma" => !s.to_ascii_lowercase().contains('='),
+        "show" | "explain" | "describe" | "desc" => true,
+        "pragma" => !lower.contains('='),
+        "select" | "values" => !select_has_write_side_effects(&lower),
+        "with" => !cte_or_select_has_writes(&lower),
         _ => false,
     }
+}
+
+fn select_has_write_side_effects(lower: &str) -> bool {
+    let padded = format!(" {lower} ");
+    // SELECT … INTO table / @var / OUTFILE (not string-aware; fail closed).
+    if padded.contains(" into ") {
+        return true;
+    }
+    if padded.contains(" for update") || padded.contains(" for share") {
+        return true;
+    }
+    const ADMIN_FUNCS: &[&str] = &[
+        "pg_terminate_backend",
+        "pg_cancel_backend",
+        "pg_reload_conf",
+        "pg_rotate_logfile",
+        "lo_import",
+        "lo_export",
+        "dblink_exec",
+        "dbms_lock",
+    ];
+    ADMIN_FUNCS.iter().any(|f| lower.contains(f))
+}
+
+fn cte_or_select_has_writes(lower: &str) -> bool {
+    let padded = format!(" {lower} ");
+    const WRITE_KW: &[&str] = &[
+        " insert ",
+        " update ",
+        " delete ",
+        " merge ",
+        " truncate ",
+        " create ",
+        " drop ",
+        " alter ",
+        " call ",
+        " copy ",
+        " refresh ",
+        " grant ",
+        " revoke ",
+    ];
+    if WRITE_KW.iter().any(|w| padded.contains(w)) {
+        return true;
+    }
+    select_has_write_side_effects(lower)
 }
 
 fn strip_sql_comments(sql: &str) -> String {
