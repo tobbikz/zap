@@ -355,9 +355,7 @@ impl DbConnectForm {
                     | ConnField::ReadOnly
                     | ConnField::Role
             ),
-            DbDriver::Mongo
-            | DbDriver::Elasticsearch
-            | DbDriver::Trino => matches!(
+            DbDriver::Mongo => matches!(
                 field,
                 ConnField::Name
                     | ConnField::Group
@@ -372,13 +370,32 @@ impl DbConnectForm {
                     | ConnField::ReadOnly
                     | ConnField::Role
             ),
+            // HTTP TLS engines: Trust cert toggles danger_accept_invalid_certs (#205).
+            DbDriver::Elasticsearch | DbDriver::Trino => matches!(
+                field,
+                ConnField::Name
+                    | ConnField::Group
+                    | ConnField::Accent
+                    | ConnField::Driver
+                    | ConnField::Host
+                    | ConnField::Port
+                    | ConnField::User
+                    | ConnField::Password
+                    | ConnField::Database
+                    | ConnField::SslMode
+                    | ConnField::SslCa
+                    | ConnField::SslTrustCert
+                    | ConnField::ReadOnly
+                    | ConnField::Role
+            ),
             DbDriver::Mssql => !matches!(
                 field,
                 ConnField::File | ConnField::SslMode | ConnField::SslCa
             ),
+            // ClickHouse HTTPS uses the Trust toggle; PG/MySQL use sslmode instead.
+            DbDriver::Clickhouse => !matches!(field, ConnField::File),
             DbDriver::Postgres
             | DbDriver::Mysql
-            | DbDriver::Clickhouse
             | DbDriver::Snowflake
             | DbDriver::Bigquery => !matches!(field, ConnField::File | ConnField::SslTrustCert),
         }
@@ -773,4 +790,32 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
         ])),
         inner[foot_idx],
     );
+}
+
+#[cfg(test)]
+mod ssl_trust_field_tests {
+    use super::{ConnField, DbConnectForm};
+    use ide_db::DbDriver;
+
+    #[test]
+    fn trust_cert_shown_for_http_tls_engines_only() {
+        let mut f = DbConnectForm::default();
+        for (driver, shown) in [
+            (DbDriver::Clickhouse, true),
+            (DbDriver::Elasticsearch, true),
+            (DbDriver::Trino, true),
+            (DbDriver::Mssql, true),
+            (DbDriver::Postgres, false),
+            (DbDriver::Mysql, false),
+            (DbDriver::Sqlite, false),
+            (DbDriver::Redis, false),
+        ] {
+            f.driver = driver;
+            assert_eq!(
+                f.field_enabled(ConnField::SslTrustCert),
+                shown,
+                "{driver:?}"
+            );
+        }
+    }
 }

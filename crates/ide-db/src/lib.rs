@@ -249,6 +249,23 @@ impl DataSource {
         )
     }
 
+    /// True when sslmode requests CA / hostname verification.
+    pub fn verifies_tls_chain(&self) -> bool {
+        matches!(
+            self.ssl_mode.trim(),
+            "verify-full" | "verify_full" | "verify-ca" | "verify_ca"
+        )
+    }
+
+    /// HTTP engines (ClickHouse / Elasticsearch / Trino): skip cert validation?
+    /// Only for plain `require` with Trust cert on and no custom CA (#205).
+    pub fn accepts_invalid_certs(&self) -> bool {
+        self.tls_required()
+            && !self.verifies_tls_chain()
+            && self.ssl_trust_cert
+            && self.ssl_ca.trim().is_empty()
+    }
+
     /// Password for live connect (resolves `env:VAR` / secrets.toml).
     pub fn resolved_password(&self) -> String {
         secrets::resolve_password(&self.id, &self.password)
@@ -11191,5 +11208,33 @@ mod ssh_tunnel_port_tests {
         assert!(ssh_forward_port_busy(&busy));
         let other = anyhow::anyhow!("SSH tunnel failed (exit status: 255): Permission denied");
         assert!(!ssh_forward_port_busy(&other));
+    }
+}
+
+#[cfg(test)]
+mod ssl_trust_tests {
+    use super::DataSource;
+
+    #[test]
+    fn accepts_invalid_certs_only_for_require_plus_trust() {
+        let mut s = DataSource::postgres_local("t", "db");
+        s.ssl_mode = "require".into();
+        s.ssl_trust_cert = true;
+        assert!(s.accepts_invalid_certs());
+
+        s.ssl_trust_cert = false;
+        assert!(!s.accepts_invalid_certs());
+
+        s.ssl_trust_cert = true;
+        s.ssl_mode = "verify-full".into();
+        assert!(!s.accepts_invalid_certs());
+
+        s.ssl_mode = "require".into();
+        s.ssl_ca = "/tmp/ca.pem".into();
+        assert!(!s.accepts_invalid_certs());
+
+        s.ssl_ca.clear();
+        s.ssl_mode = "prefer".into();
+        assert!(!s.accepts_invalid_certs());
     }
 }
