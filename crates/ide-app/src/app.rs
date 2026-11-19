@@ -3657,6 +3657,25 @@ impl App {
         }
     }
 
+    /// Load a recipe into a new Console tab and focus the editor (#176).
+    fn apply_recipe(&mut self, id: &str) {
+        match self.db.insert_recipe(id) {
+            Ok(()) => {
+                self.ui.product = ProductMode::Database;
+                if self.ui.db_surface != DbSurface::Studio {
+                    self.ui.db_surface = DbSurface::Studio;
+                }
+                self.ui.focus = Focus::Editor;
+                self.ui.mode = Mode::Insert;
+                self.ui.db_cursor = Cursor::default();
+                self.ui.db_scroll_row = 0;
+                self.clear_db_sql_all_selected();
+                self.set_status(self.db.status.clone(), false);
+            }
+            Err(e) => self.set_status(format!("recipe: {e:#}"), true),
+        }
+    }
+
     fn start_add_connection(&mut self) {
         self.ui.mode = Mode::DbConnect;
         self.ui.db_connect_input.clear();
@@ -7046,29 +7065,9 @@ impl App {
                 self.db.show_text_result("recipes", &text);
                 self.ui.focus = Focus::Results;
             }
-            "recipe_top_customers" => {
-                let _ = self.db.insert_recipe("top_customers");
-                self.set_status(self.db.status.clone(), false);
-            }
-            "recipe_revenue_by_day" => {
-                let _ = self.db.insert_recipe("revenue_by_day");
-                self.set_status(self.db.status.clone(), false);
-            }
-            "recipe_stratified_sample" => {
-                let _ = self.db.insert_recipe("stratified_sample");
-                self.set_status(self.db.status.clone(), false);
-            }
-            "recipe_embedding_similarity" => {
-                let _ = self.db.insert_recipe("embedding_similarity");
-                self.set_status(self.db.status.clone(), false);
-            }
-            "recipe_feature_table" => {
-                let _ = self.db.insert_recipe("feature_table");
-                self.set_status(self.db.status.clone(), false);
-            }
-            "recipe_batch_score" => {
-                let _ = self.db.insert_recipe("batch_score");
-                self.set_status(self.db.status.clone(), false);
+            id if id.starts_with("recipe_") => {
+                let name = id.strip_prefix("recipe_").unwrap_or(id);
+                self.apply_recipe(name);
             }
             "chart_bar" | "chart_line" | "chart_pie" => {
                 let kind = item.id.strip_prefix("chart_").unwrap_or("bar");
