@@ -2804,6 +2804,7 @@ impl App {
     }
 
     fn start_oauth_paste(&mut self) {
+        self.ui.rename_tab_pending = false;
         self.ui.oauth_paste_pending = true;
         self.ui.import_csv_input.clear();
         self.ui.mode = Mode::BrainAsk;
@@ -2814,17 +2815,10 @@ impl App {
         let q = self.ui.import_csv_input.trim().to_string();
         self.ui.import_csv_input.clear();
         self.ui.mode = Mode::Normal;
-        if self.ui.rename_tab_pending {
-            self.ui.rename_tab_pending = false;
-            if self.db.rename_active_tab(&q) {
-                self.set_status(self.db.status.clone(), false);
-            } else {
-                self.set_status(self.db.status.clone(), true);
-            }
-            return Ok(());
-        }
+        // OAuth before rename so a leaked rename_tab_pending cannot title a tab with a token (#185).
         if self.ui.oauth_paste_pending {
             self.ui.oauth_paste_pending = false;
+            self.ui.rename_tab_pending = false;
             if q.is_empty() {
                 self.set_status("OAuth paste cancelled", false);
                 return Ok(());
@@ -2839,6 +2833,15 @@ impl App {
             match ide_db::apply_pasted_token(driver, &q) {
                 Ok(msg) => self.set_status(msg, false),
                 Err(e) => self.set_status(format!("oauth: {e:#}"), true),
+            }
+            return Ok(());
+        }
+        if self.ui.rename_tab_pending {
+            self.ui.rename_tab_pending = false;
+            if self.db.rename_active_tab(&q) {
+                self.set_status(self.db.status.clone(), false);
+            } else {
+                self.set_status(self.db.status.clone(), true);
             }
             return Ok(());
         }
@@ -4785,6 +4788,8 @@ impl App {
                         PaletteMode::ConsoleDatabase | PaletteMode::ConsoleSchema
                     );
                 if resume_console {
+                    self.ui.rename_tab_pending = false;
+                    self.ui.oauth_paste_pending = false;
                     self.resume_console_editing();
                     self.set_status("Console · INSERT · keep typing", false);
                 } else {
@@ -4811,6 +4816,7 @@ impl App {
                     self.ui.confirm_apply_pending = false;
                     self.ui.confirm_run_sql = None;
                     self.ui.rename_tab_pending = false;
+                    self.ui.oauth_paste_pending = false;
                     self.ui.show_completions = false;
                     self.ui.hover = None;
                     self.ui.pending_code_actions.clear();
