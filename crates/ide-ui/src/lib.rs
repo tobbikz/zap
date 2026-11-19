@@ -2875,7 +2875,7 @@ fn render_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         }
     };
     let mut spans = if ctx.ui.product == ProductMode::Database {
-        vec![
+        let mut v = vec![
             Span::styled(
                 " DB ",
                 Style::default()
@@ -2885,7 +2885,18 @@ fn render_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             ),
             Span::styled(format!(" {mode} "), theme::style_muted()),
             Span::styled(format!(" {cursor} "), theme::style_faint()),
-        ]
+        ];
+        // Studio TXN badge next to mode so an open transaction is always visible (#184).
+        if ctx.db.is_some_and(|d| d.in_txn) {
+            v.push(Span::styled(
+                " TXN ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        v
     } else {
         vec![
             Span::styled(
@@ -2907,15 +2918,6 @@ fn render_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     };
     if ctx.ui.product == ProductMode::Database {
         if let Some(db) = ctx.db {
-            if db.in_txn {
-                spans.push(Span::styled(
-                    " TXN ",
-                    Style::default()
-                        .fg(theme::bg())
-                        .bg(theme::text())
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
             if let Some(role) = db
                 .active_source
                 .as_ref()

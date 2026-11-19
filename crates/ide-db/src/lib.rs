@@ -6106,6 +6106,23 @@ impl DbWorkspace {
         if !self.in_txn {
             bail!("no open transaction");
         }
+        let result = self.commit_transaction_inner().await;
+        // Always drop local TXN state so a failed COMMIT cannot wedge Studio (#184).
+        self.clear_txn();
+        match result {
+            Ok(()) => {
+                self.audit_sql("COMMIT");
+                self.status = "transaction committed".into();
+                Ok(())
+            }
+            Err(e) => {
+                self.status = format!("commit failed — txn flag cleared: {e:#}");
+                Err(e)
+            }
+        }
+    }
+
+    async fn commit_transaction_inner(&mut self) -> Result<()> {
         match self.txn_conn.as_mut() {
             Some(TxnConnection::Pg(c)) => {
                 sqlx::query("COMMIT").execute(&mut **c).await?;
@@ -6129,9 +6146,6 @@ impl DbWorkspace {
             }
             None => bail!("transaction connection missing"),
         }
-        self.clear_txn();
-        self.audit_sql("COMMIT");
-        self.status = "transaction committed".into();
         Ok(())
     }
 
@@ -6139,6 +6153,22 @@ impl DbWorkspace {
         if !self.in_txn {
             bail!("no open transaction");
         }
+        let result = self.rollback_transaction_inner().await;
+        self.clear_txn();
+        match result {
+            Ok(()) => {
+                self.audit_sql("ROLLBACK");
+                self.status = "transaction rolled back".into();
+                Ok(())
+            }
+            Err(e) => {
+                self.status = format!("rollback failed — txn flag cleared: {e:#}");
+                Err(e)
+            }
+        }
+    }
+
+    async fn rollback_transaction_inner(&mut self) -> Result<()> {
         match self.txn_conn.as_mut() {
             Some(TxnConnection::Pg(c)) => {
                 sqlx::query("ROLLBACK").execute(&mut **c).await?;
@@ -6162,9 +6192,6 @@ impl DbWorkspace {
             }
             None => bail!("transaction connection missing"),
         }
-        self.clear_txn();
-        self.audit_sql("ROLLBACK");
-        self.status = "transaction rolled back".into();
         Ok(())
     }
 
