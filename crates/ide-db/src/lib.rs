@@ -1720,9 +1720,14 @@ impl DbWorkspace {
             self.last_result = None;
         }
         self.tabs.retain(|t| t.source_id.as_deref() != Some(source_id));
-        if self.active_tab >= self.tabs.len() {
+        if self.tabs.is_empty() {
+            self.tabs.push(SqlTab::query(1));
+            self.active_tab = 0;
+        } else if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
+        // Reload so `self.sql` is not the deleted connection's buffer (#187).
+        self.load_active_tab();
         self.save_sources()?;
         self.rebuild_tree_roots();
         self.rebuild_flat();
@@ -11344,6 +11349,45 @@ mod migration_txn_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction is open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod remove_source_tab_tests {
+    use super::{DataSource, DbWorkspace, SqlTab};
+
+    #[test]
+    fn remove_source_reloads_sql_from_surviving_tab() {
+        let mut ws = DbWorkspace::default();
+        let a = DataSource::postgres_local("a", "db");
+        let b = DataSource::postgres_local("b", "db");
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        ws.add_source(a);
+        ws.add_source(b);
+
+        ws.tabs = vec![
+            {
+                let mut t = SqlTab::query(1);
+                t.source_id = Some(a_id.clone());
+                t.sql = "SELECT 'gone';".into();
+                t
+            },
+            {
+                let mut t = SqlTab::query(2);
+                t.source_id = Some(b_id);
+                t.sql = "SELECT 'keep';".into();
+                t
+            },
+        ];
+        ws.active_tab = 0;
+        ws.sql = "SELECT 'gone';".into();
+        ws.active_source = Some(a_id.clone());
+
+        ws.remove_source(&a_id).unwrap();
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.sql.trim(), "SELECT 'keep';");
+        assert_ne!(ws.sql.trim(), "SELECT 'gone';");
     }
 }
 
