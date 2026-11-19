@@ -697,9 +697,10 @@ pub fn style_grid_cursor_cell() -> Style {
 /// Results header cell for the cursor column (DataRig `grid_cursor_header`).
 pub fn style_grid_cursor_header() -> Style {
     if is_mono() {
+        // Bold only — the shared rule under the header is enough (no double underline).
         Style::default()
             .fg(text())
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
             .fg(accent())

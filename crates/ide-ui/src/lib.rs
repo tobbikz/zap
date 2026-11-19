@@ -2307,32 +2307,52 @@ fn render_bottom(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 }
 
 fn filter_field_span(label: &str, value: &str, focused: bool, field_w: usize) -> Vec<Span<'static>> {
+    // "where [ … ]" — label + brackets stay visible even on AMOLED (no grey wash needed).
+    let chrome = 4usize; // " [ ]"
     let label_w = label.chars().count() + 1;
-    let well_w = field_w.saturating_sub(label_w).max(4);
+    let well_w = field_w.saturating_sub(label_w + chrome).max(4);
     let empty = value.trim().is_empty() || value == theme::caret();
-    let shown = if empty && !focused {
+    let inner = if empty && !focused {
         truncate_chars("—", well_w)
     } else if value.chars().count() > well_w {
         truncate_chars(value, well_w)
     } else {
-        format!("{value}{}", " ".repeat(well_w.saturating_sub(value.chars().count())))
+        format!(
+            "{value}{}",
+            " ".repeat(well_w.saturating_sub(value.chars().count()))
+        )
     };
-    let well = if focused {
-        Style::default()
-            .fg(theme::bg())
-            .bg(theme::text())
-            .add_modifier(Modifier::BOLD)
+    let (bracket, well) = if focused {
+        (
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        )
     } else if empty {
-        Style::default().fg(theme::faint()).bg(theme::surface_2())
+        (
+            Style::default().fg(theme::muted()),
+            Style::default().fg(theme::muted()),
+        )
     } else {
-        Style::default().fg(theme::text()).bg(theme::surface_2())
+        (
+            Style::default().fg(theme::accent()),
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        )
     };
     vec![
         Span::styled(
             format!("{label} "),
-            theme::style_faint(),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(shown, well),
+        Span::styled("[", bracket),
+        Span::styled(inner, well),
+        Span::styled("]", bracket),
     ]
 }
 
@@ -2525,8 +2545,9 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 
     // compact = scan density; comfort = readable text (body/json) without leaving the grid.
     let row_stride = if compact { 1usize } else { 2usize };
-    let gutter_w = nrows.max(1).to_string().len().max(2);
-    let grid_w = (grid_area.width as usize).saturating_sub(gutter_w + 1);
+    // No row-index gutter — the table's own id/PK column already identifies rows.
+    let gutter_w = 0usize;
+    let grid_w = grid_area.width as usize;
     // Rough first pass so we know how many columns fit, then size them by content.
     let avg = if compact { 12usize } else { 18usize };
     let vis_cols = (grid_w / (avg + 3)).max(1);
@@ -2549,11 +2570,8 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let col_indices: Vec<usize> = (0..pinned).chain(col_start..col_end).collect();
     let col_widths = results_col_widths(result, &col_indices, grid_w, compact);
 
-    // Soft columns: space gutters only — no │ pipe lattice.
-    let mut header_spans = vec![Span::styled(
-        format!("{:>gutter_w$}  ", ""),
-        theme::style_faint(),
-    )];
+    // Soft columns: space gutters only — no │ pipe lattice, no row-index gutter.
+    let mut header_spans: Vec<Span<'static>> = Vec::new();
     for (pos, &ci) in col_indices.iter().enumerate() {
         if pos > 0 {
             header_spans.push(Span::raw("  "));
@@ -2568,14 +2586,12 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         let t = pad_display(&label, w);
         let style = if ci == result.cursor_col {
-            // Active column: soft header fill + accent ink (rule below reinforces).
             theme::style_grid_cursor_header()
         } else {
             theme::style_muted().add_modifier(Modifier::BOLD)
         };
         header_spans.push(Span::styled(format!("{t}"), style));
     }
-    // Header strip on pane fill; active column uses grid_cursor_header cue.
     let header: Line = Line::from(header_spans).style(Style::default().bg(theme::pane_fill()));
 
     let filter = db.results_filter.clone();
@@ -2599,17 +2615,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         let row = &result.rows[ri];
         let row_dirty = dirty.contains(&ri);
         let on_cursor_row = ri == result.cursor_row;
-        let mut spans = vec![Span::styled(
-            format!("{:>gutter_w$}  ", ri + 1),
-            if on_cursor_row && theme::is_mono() {
-                // Inherit AMOLED invert from the line (don't re-assert body ink).
-                Style::default().add_modifier(Modifier::BOLD)
-            } else if on_cursor_row {
-                theme::style_text().add_modifier(Modifier::BOLD)
-            } else {
-                theme::style_faint()
-            },
-        )];
+        let mut spans: Vec<Span<'static>> = Vec::new();
         for (pos, &ci) in col_indices.iter().enumerate() {
             let Some(cell) = row.get(ci) else {
                 continue;
@@ -2645,11 +2651,12 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             let style = if is_cursor && editing {
                 theme::style_chip_run()
             } else if is_cursor {
-                // Loud cell (accent fill / mono invert+underline).
-                theme::style_grid_cursor_cell()
-            } else if on_cursor_row && theme::is_mono() {
-                // Keep invert readable — body `text` ink would wash on the light bar.
+                // Clean caret: bold + underline only — no full-row wash.
                 Style::default()
+                    .fg(theme::text())
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if on_cursor_row {
+                theme::style_text().add_modifier(Modifier::BOLD)
             } else if row_dirty {
                 Style::default().fg(theme::accent_warm()).add_modifier(Modifier::BOLD)
             } else if ci < pinned {
@@ -2657,17 +2664,14 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             } else if is_null {
                 theme::style_faint().add_modifier(Modifier::ITALIC)
             } else if is_statusish && !is_null && display_width(t.trim()) <= 12 {
-                // Quiet status emphasis — no cell box, just weight.
                 theme::style_text().add_modifier(Modifier::BOLD)
             } else {
                 theme::style_text()
             };
             spans.push(Span::styled(t, style));
         }
-        let line = if ri == result.cursor_row {
-            Line::from(spans).style(theme::style_grid_cursor_row())
-        } else if ri % 2 == 1 {
-            // DataRig surface_alt zebra — quieter than a full surface wash.
+        // No row wash / invert bar — cursor is the bold+underline cell only.
+        let line = if !theme::is_mono() && ri % 2 == 1 {
             Line::from(spans).style(Style::default().bg(theme::surface()))
         } else {
             Line::from(spans)
@@ -2691,23 +2695,17 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     };
     // Column rule: AMOLED keeps one quiet continuous rule; DataRig accents the active col.
     let rule = if theme::is_mono() {
-        let rule_w = (grid_area.width as usize).saturating_sub(gutter_w + 2);
-        let mut rule_spans = vec![
-            Span::styled(format!("{:>gutter_w$}  ", ""), theme::style_faint()),
-            Span::styled(
-                "─".repeat(rule_w.min(120).max(8)),
-                theme::style_faint(),
-            ),
-        ];
+        let rule_w = grid_area.width as usize;
+        let mut rule_spans = vec![Span::styled(
+            "─".repeat(rule_w.min(160).max(8)),
+            theme::style_faint(),
+        )];
         if !h_hint.is_empty() {
             rule_spans.push(Span::styled(h_hint, theme::style_faint()));
         }
         Line::from(rule_spans).style(Style::default().bg(theme::pane_fill()))
     } else {
-        let mut rule_spans = vec![Span::styled(
-            format!("{:>gutter_w$}  ", ""),
-            theme::style_faint(),
-        )];
+        let mut rule_spans: Vec<Span<'static>> = Vec::new();
         for (pos, &ci) in col_indices.iter().enumerate() {
             if pos > 0 {
                 rule_spans.push(Span::styled("  ", theme::style_faint()));
