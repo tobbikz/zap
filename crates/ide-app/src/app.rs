@@ -2452,8 +2452,32 @@ impl App {
             self.set_status("query params — key=value,… · Enter run · Esc cancel", false);
             return Ok(());
         }
+        if self.maybe_confirm_destructive_sql(self.db.sql.clone()) {
+            return Ok(());
+        }
         self.queue_db_query();
         Ok(())
+    }
+
+    /// If persona wants a gate and SQL looks destructive, open confirm modal (#173).
+    fn maybe_confirm_destructive_sql(&mut self, sql: String) -> bool {
+        if !self.db.should_confirm_destructive(&sql) {
+            return false;
+        }
+        let preview: String = sql
+            .lines()
+            .next()
+            .unwrap_or("SQL")
+            .chars()
+            .take(100)
+            .collect();
+        self.ui.confirm_apply_pending = false;
+        self.ui.confirm_delete_source_id = None;
+        self.ui.confirm_run_sql = Some(sql);
+        self.ui.confirm_delete_label = format!("Destructive SQL — Enter run · Esc cancel\n{preview}");
+        self.ui.mode = Mode::ConfirmDeleteSource;
+        self.set_status("confirm destructive SQL — Enter run · Esc cancel", true);
+        true
     }
 
     fn queue_db_query(&mut self) {
@@ -3085,6 +3109,10 @@ impl App {
                 return Ok(());
             }
         };
+        if !for_explain && self.maybe_confirm_destructive_sql(sql.clone()) {
+            // confirm_destructive_sql will assign db.sql and queue the run.
+            return Ok(());
+        }
         let result = if for_explain {
             self.db.explain_sql_text(&sql).await
         } else {
