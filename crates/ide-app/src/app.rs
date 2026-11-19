@@ -1148,6 +1148,8 @@ impl App {
         if self.ui.product != ProductMode::Database || self.ui.db_surface != DbSurface::Studio {
             return;
         }
+        self.ui.show_completions = false;
+        self.ui.completions.clear();
         self.ui.focus = match self.ui.focus {
             Focus::Database => Focus::Structure,
             Focus::Structure => Focus::Editor,
@@ -1296,6 +1298,8 @@ impl App {
         self.ui.product = ProductMode::Database;
         self.ui.db_surface = DbSurface::Home;
         self.ui.mode = Mode::Normal;
+        self.ui.show_completions = false;
+        self.ui.completions.clear();
         if let Some(id) = self.db.active_source.clone() {
             if let Some(i) = self.db.sources.iter().position(|s| s.id == id) {
                 self.ui.home_selected = i.min(8);
@@ -4199,11 +4203,11 @@ impl App {
     }
 
     async fn request_db_completion(&mut self) {
+        // Completions use schema_cache only — avoid load_structure_for storm per keystroke (#183).
         if let Err(e) = self.db.refresh_schema_cache().await {
             self.set_status(format!("schema cache: {e:#}"), true);
             return;
         }
-        let _ = self.db.refresh_structure_from_console_query().await;
         let row = self.ui.db_cursor.row;
         let col = self.ui.db_cursor.col;
         let line = self.db_line(row);
@@ -9179,6 +9183,9 @@ async fn event_loop(
                                 }
                                 KeyCode::Esc if app.ui.mode == Mode::Insert => {
                                     app.ui.mode = Mode::Normal;
+                                    // Do not leave the SQL completion popup stuck across panes (#183).
+                                    app.ui.show_completions = false;
+                                    app.ui.completions.clear();
                                     continue;
                                 }
                                 KeyCode::Esc
