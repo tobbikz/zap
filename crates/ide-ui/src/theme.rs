@@ -181,7 +181,8 @@ pub static PALETTES: &[Palette] = &[
         bg: rgb(0, 0, 0),
         surface: rgb(10, 10, 10),
         surface_2: rgb(18, 18, 18),
-        surface_3: rgb(26, 26, 26),
+        // Selection step must clear body text — was #1a1a1a (too close to bg).
+        surface_3: rgb(48, 48, 48),
         modal: rgb(22, 22, 22),
         border_idle: rgb(42, 42, 42),
         border_focus: rgb(200, 200, 200),
@@ -209,7 +210,7 @@ pub static PALETTES: &[Palette] = &[
         bg: rgb(255, 255, 255),
         surface: rgb(250, 250, 250),
         surface_2: rgb(242, 242, 242),
-        surface_3: rgb(230, 230, 230),
+        surface_3: rgb(210, 210, 210),
         modal: rgb(255, 255, 255),
         border_idle: rgb(210, 210, 210),
         border_focus: rgb(40, 40, 40),
@@ -635,21 +636,30 @@ pub fn style_selected() -> Style {
 
 /// Results grid: whole cursor row — selection tint so the row is obvious.
 pub fn style_grid_cursor_row() -> Style {
-    Style::default().bg(surface_3())
+    Style::default().bg(surface_3()).fg(text())
 }
 
-/// Results grid: focused cell — accent fill so the caret cell pops (DataRig-loud).
+/// Results grid: focused cell.
+/// Chromatic accents (DataRig teal) get a filled chip; mono accents (AMOLED
+/// black/white) must NOT fill with near-white/near-black — that washes text out.
 pub fn style_grid_cursor_cell() -> Style {
-    Style::default()
-        .fg(contrast_on(accent()))
-        .bg(accent())
-        .add_modifier(Modifier::BOLD)
+    if accent_fill_safe() {
+        Style::default()
+            .fg(contrast_on(accent()))
+            .bg(accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(text())
+            .bg(surface_3())
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    }
 }
 
 /// Results header cell for the cursor column (DataRig `grid_cursor_header`).
 pub fn style_grid_cursor_header() -> Style {
     Style::default()
-        .fg(accent())
+        .fg(if accent_fill_safe() { accent() } else { text() })
         .bg(surface_2())
         .add_modifier(Modifier::BOLD)
 }
@@ -667,18 +677,26 @@ pub fn style_chip() -> Style {
     Style::default().fg(muted()).bg(surface_2())
 }
 
-/// Run chip when Console is focused — filled accent (teal on DataRig dark).
+/// Run chip when Console is focused — filled accent when safe; mono uses inverted chip.
 pub fn style_chip_run() -> Style {
-    Style::default()
-        .fg(contrast_on(accent()))
-        .bg(accent())
-        .add_modifier(Modifier::BOLD)
+    if accent_fill_safe() {
+        Style::default()
+            .fg(contrast_on(accent()))
+            .bg(accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        // AMOLED: solid light chip on dark / dark chip on light — always readable.
+        Style::default()
+            .fg(bg())
+            .bg(text())
+            .add_modifier(Modifier::BOLD)
+    }
 }
 
 /// Run chip when Console is idle — accent ink on surface (quiet “off” state).
 pub fn style_chip_run_idle() -> Style {
     Style::default()
-        .fg(accent())
+        .fg(if accent_fill_safe() { accent() } else { text() })
         .bg(surface_2())
         .add_modifier(Modifier::BOLD)
 }
@@ -725,24 +743,41 @@ pub fn border(focused: bool) -> Color {
     }
 }
 
-/// Pick readable fg for a filled chip (light/dark heuristic).
-fn contrast_on(bg_c: Color) -> Color {
-    match bg_c {
+/// True when `accent` is chromatic enough to use as a solid fill (not near-grey mono).
+fn accent_fill_safe() -> bool {
+    match accent() {
         Color::Rgb(r, g, b) => {
-            let lum = (u16::from(r) * 299 + u16::from(g) * 587 + u16::from(b) * 114) / 1000;
-            if lum > 140 {
-                Color::Rgb(16, 16, 16)
-            } else {
-                Color::Rgb(245, 245, 245)
-            }
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            // Chroma: teal/blue/etc. have spread; AMOLED mono accents are near-grey.
+            max.saturating_sub(min) >= 28
+        }
+        _ => true,
+    }
+}
+
+fn luminance(c: Color) -> u16 {
+    match c {
+        Color::Rgb(r, g, b) => {
+            (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000
         }
         _ => {
             if light() {
-                Color::White
+                240
             } else {
-                Color::Black
+                20
             }
         }
+    }
+    .min(255) as u16
+}
+
+/// Pick readable fg for a filled chip (light/dark heuristic).
+fn contrast_on(bg_c: Color) -> Color {
+    if luminance(bg_c) > 140 {
+        Color::Rgb(16, 16, 16)
+    } else {
+        Color::Rgb(245, 245, 245)
     }
 }
 
@@ -847,5 +882,21 @@ mod tests {
         set_mode_name("dark");
         let s = Role::Selection.style();
         assert_eq!(s.bg, Some(surface_3()));
+    }
+
+    #[test]
+    fn grid_cursor_cell_readable_on_amoled_black() {
+        set_mode_name("black");
+        let s = style_grid_cursor_cell();
+        // Never fill with near-white accent — that washed the Results row.
+        assert_ne!(s.bg, Some(accent()));
+        assert_eq!(s.bg, Some(surface_3()));
+    }
+
+    #[test]
+    fn grid_cursor_cell_accent_fill_on_datarig_dark() {
+        set_mode_name("dark");
+        let s = style_grid_cursor_cell();
+        assert_eq!(s.bg, Some(accent()));
     }
 }
