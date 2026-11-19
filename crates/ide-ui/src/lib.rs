@@ -4368,7 +4368,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             .borders(Borders::ALL)
             .border_type(theme::border_type())
             .border_style(Style::default().fg(border))
-            .style(Style::default().bg(theme::surface())),
+            .style(Style::default().bg(theme::pane_fill())),
         area,
     );
 
@@ -4379,30 +4379,30 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         height: area.height.saturating_sub(2),
     };
 
-    // Title plate
+    // Quiet title — wordmark + crumb, no grey wash plate.
     let crumb = if drill {
         if table.is_empty() {
-            format!(" cell  ·  row {}  ·  {col_name} ", row_i + 1)
+            format!("cell · row {} · {col_name}", row_i + 1)
         } else {
-            format!(" {table}  ·  cell  ·  row {}  ·  {col_name} ", row_i + 1)
+            format!("{table} · cell · row {} · {col_name}", row_i + 1)
         }
     } else if table.is_empty() {
-        format!(" row {}  ·  {col_name} ", row_i + 1)
+        format!("row {} · {col_name}", row_i + 1)
     } else {
-        format!(" {table}  ·  row {}  ·  {col_name} ", row_i + 1)
+        format!("{table} · row {} · {col_name}", row_i + 1)
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " INSPECT ",
+                "Inspect",
                 Style::default()
-                    .fg(theme::bg())
-                    .bg(theme::text())
+                    .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(" · ", theme::style_faint()),
             Span::styled(
-                truncate_chars(&crumb, inner.width.saturating_sub(10) as usize),
-                Style::default().fg(theme::text()).bg(theme::surface_2()),
+                truncate_chars(&crumb, inner.width.saturating_sub(12) as usize),
+                theme::style_muted(),
             ),
         ])),
         Rect {
@@ -4413,42 +4413,36 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         },
     );
 
-    // Tab pills — Row | Plan | Chart | JSON (Cell is drill-in only).
+    // Tabs — typography only (active bold; no invert pills / surface chips).
     let mut tab_spans: Vec<Span> = Vec::new();
     if drill {
         tab_spans.push(Span::styled(
-            " Cell ",
+            "Cell",
             Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
-                .add_modifier(Modifier::BOLD),
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ));
-        tab_spans.push(Span::styled("  Esc → Row ", theme::style_faint()));
+        tab_spans.push(Span::styled("  Esc → Row", theme::style_faint()));
     } else {
         let tabs = ["Row", "Plan", "Chart", "JSON"];
         for (i, name) in tabs.iter().enumerate() {
             if i > 0 {
-                tab_spans.push(Span::styled(" ", theme::style_faint()));
+                tab_spans.push(Span::styled(" · ", theme::style_faint()));
             }
-            let label = format!(" {name} ");
             if i == tab {
                 tab_spans.push(Span::styled(
-                    label,
+                    (*name).to_string(),
                     Style::default()
-                        .fg(theme::bg())
-                        .bg(theme::text())
-                        .add_modifier(Modifier::BOLD),
+                        .fg(theme::text())
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 ));
             } else {
-                tab_spans.push(Span::styled(
-                    label,
-                    Style::default().fg(theme::muted()).bg(theme::surface_2()),
-                ));
+                tab_spans.push(Span::styled((*name).to_string(), theme::style_muted()));
             }
         }
     }
     tab_spans.push(Span::styled(
-        format!("  col {}/{} ", col_i + 1, result.columns.len()),
+        format!("  col {}/{}", col_i + 1, result.columns.len()),
         theme::style_faint(),
     ));
     frame.render_widget(
@@ -4552,7 +4546,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             truncate_chars(&hint, inner.width as usize),
-            Style::default().fg(theme::faint()).bg(theme::surface_2()),
+            theme::style_faint(),
         )),
         Rect {
             x: inner.x,
@@ -5025,27 +5019,35 @@ fn modal_row_lines(
             name.clone()
         };
         let label = pad_display(&label, name_w);
-        let base_style = if is_sel && editing {
+        // Clean row: accent rail + bold field; invert “cuadrado” only on the value
+        // text (not padded to full modal width — that was the heavy white bar).
+        let mark = if is_sel {
+            theme::select_mark()
+        } else {
+            " "
+        };
+        let name_style = if is_sel {
             Style::default()
-                .fg(theme::bg())
-                .bg(theme::accent())
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD)
+        } else {
+            theme::style_muted()
+        };
+        let val_style = if is_sel && editing {
+            theme::style_chip_run()
         } else if is_sel {
-            theme::style_selected()
+            theme::style_grid_cursor_cell()
         } else if cell == "NULL" {
-            theme::style_faint()
+            theme::style_faint().add_modifier(Modifier::ITALIC)
         } else {
             theme::style_text()
         };
-        let prefix_style = if is_sel {
-            base_style
-        } else {
-            theme::style_faint()
-        };
-        let val = pad_display(&value, value_w);
+        let val_pad = value_w.saturating_sub(display_width(&value));
         lines.push(Line::from(vec![
-            Span::styled(format!(" {label} │ "), prefix_style),
-            Span::styled(val, base_style),
+            Span::styled(format!("{mark}{label}"), name_style),
+            Span::styled(" │ ", theme::style_faint()),
+            Span::styled(value, val_style),
+            Span::raw(" ".repeat(val_pad)),
         ]));
     }
     if lines.is_empty() {
@@ -5056,7 +5058,7 @@ fn modal_row_lines(
     } else {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            " Enter on a field → full Cell view ",
+            " Enter → cell",
             theme::style_faint(),
         )));
     }
