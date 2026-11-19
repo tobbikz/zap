@@ -84,19 +84,28 @@ pub fn audit_append(source: &str, driver: &str, sql: &str) -> Result<()> {
     Ok(())
 }
 
+fn audit_csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 pub fn audit_export_csv(out: &Path) -> Result<()> {
     let path = audit_log_path();
-    let text = fs::read_to_string(&path).unwrap_or_default();
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("read audit log {}", path.display()))?;
     let mut csv = String::from("ts,driver,source,sql\n");
     for line in text.lines() {
         let parts: Vec<&str> = line.splitn(4, '\t').collect();
         if parts.len() == 4 {
             csv.push_str(&format!(
-                "{},{},{},\"{}\"\n",
-                parts[0],
-                parts[1],
-                parts[2],
-                parts[3].replace('"', "\"\"")
+                "{},{},{},{}\n",
+                audit_csv_field(parts[0]),
+                audit_csv_field(parts[1]),
+                audit_csv_field(parts[2]),
+                audit_csv_field(parts[3])
             ));
         }
     }
@@ -839,5 +848,12 @@ mod tests {
         assert!(s.contains("PASS"));
         let f = fanout_rowcount_assert(&[("a".into(), 3), ("b".into(), 4)]);
         assert!(f.contains("FAIL"));
+    }
+
+    #[test]
+    fn audit_csv_quotes_all_fields() {
+        assert_eq!(audit_csv_field("plain"), "plain");
+        assert_eq!(audit_csv_field("a,b"), "\"a,b\"");
+        assert_eq!(audit_csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 }

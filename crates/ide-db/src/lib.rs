@@ -6088,6 +6088,7 @@ impl DbWorkspace {
         }
         self.in_txn = true;
         self.txn_pool_key = Some(key);
+        self.audit_sql("BEGIN");
         self.status = "transaction started".into();
         Ok(())
     }
@@ -6120,6 +6121,7 @@ impl DbWorkspace {
             None => bail!("transaction connection missing"),
         }
         self.clear_txn();
+        self.audit_sql("COMMIT");
         self.status = "transaction committed".into();
         Ok(())
     }
@@ -6152,6 +6154,7 @@ impl DbWorkspace {
             None => bail!("transaction connection missing"),
         }
         self.clear_txn();
+        self.audit_sql("ROLLBACK");
         self.status = "transaction rolled back".into();
         Ok(())
     }
@@ -6160,6 +6163,20 @@ impl DbWorkspace {
         self.in_txn = false;
         self.txn_pool_key = None;
         self.txn_conn = None;
+    }
+
+    /// Best-effort audit line for mutating paths that bypass `execute_sql_text` (#191).
+    fn audit_sql(&self, sql: &str) {
+        let Some(source_id) = self.active_source.as_deref() else {
+            return;
+        };
+        let driver = self
+            .sources
+            .iter()
+            .find(|s| s.id == source_id)
+            .map(|s| s.driver.label())
+            .unwrap_or("?");
+        let _ = audit_append(source_id, driver, sql);
     }
 
     /// Select a table row in the explorer flat list (does not expand tree parents).
@@ -6602,6 +6619,7 @@ impl DbWorkspace {
                 }
                 LivePool::Http(_) => bail!("row apply not supported for HTTP engines"),
             }
+            self.audit_sql(stmt);
         }
         if let Some(res) = self.last_result.as_mut() {
             res.original_rows = res.rows.clone();
@@ -7292,6 +7310,10 @@ impl DbWorkspace {
             }
             inserted += 1;
         }
+        self.audit_sql(&format!(
+            "-- CSV import {} → {qual} ({inserted} rows)",
+            path.display()
+        ));
         self.status = format!("imported {inserted} row(s) → {qual}");
         Ok(inserted)
     }
@@ -7371,6 +7393,10 @@ impl DbWorkspace {
             }
             inserted += 1;
         }
+        self.audit_sql(&format!(
+            "-- JSON import {} → {qual} ({inserted} rows)",
+            path.display()
+        ));
         self.status = format!("imported {inserted} JSON row(s) → {qual}");
         Ok(inserted)
     }
@@ -9615,7 +9641,7 @@ impl DbWorkspace {
             .find(|s| &s.id == source_id)
             .context("missing source")?;
         self.guard_writable_op(source_id, "restore dump")?;
-        match src.driver {
+        let restored: Result<()> = match src.driver {
             DbDriver::Postgres => {
                 let db = self
                     .active_database
@@ -9748,9 +9774,15 @@ impl DbWorkspace {
                 bail!("restore not supported for {}", src.driver.label());
             }
             DbDriver::Snowflake | DbDriver::Bigquery => {
-                bail!("{}", alt_engines::cloud_not_configured_message(src.driver));
+                Err(anyhow::anyhow!(
+                    "{}",
+                    alt_engines::cloud_not_configured_message(src.driver)
+                ))
             }
-        }
+        };
+        restored?;
+        self.audit_sql(&format!("-- restore {}", dump_path.display()));
+        Ok(())
     }
 
     /// Kill the session/process identified by the current results cursor row.
@@ -9804,22 +9836,26 @@ impl DbWorkspace {
                 if !ok {
                     bail!("pg_terminate_backend returned false for pid {pid}");
                 }
+                self.audit_sql(&format!("SELECT pg_terminate_backend({pid})"));
                 self.status = format!("terminated pid {pid}");
             }
             (DbDriver::Mysql, LivePool::Mysql(p)) => {
                 let sql = format!("KILL {pid}");
                 sqlx::query(&sql).execute(p).await?;
+                self.audit_sql(&sql);
                 self.status = format!("killed connection {pid}");
             }
             (DbDriver::Sqlite, _) => bail!("SQLite has no server sessions to kill"),
             (DbDriver::Mssql, LivePool::Mssql(c)) => {
                 let sql = format!("KILL {pid}");
                 let _ = engines::exec_mssql(c, &sql).await?;
+                self.audit_sql(&sql);
                 self.status = format!("killed session {pid}");
             }
             (DbDriver::Clickhouse, LivePool::Clickhouse(c)) => {
                 let sql = format!("KILL QUERY WHERE query_id = '{pid}'");
                 let _ = engines::exec_clickhouse(c, &sql).await?;
+                self.audit_sql(&sql);
                 self.status = format!("killed query {pid}");
             }
             _ => bail!("driver/pool mismatch"),
