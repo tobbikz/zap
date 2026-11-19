@@ -3165,26 +3165,24 @@ fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
     );
 }
 
-/// Results cell full-value card — peek without leaving the grid.
+/// Results cell peek card — quiet nubecita (column + value only).
 fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &str) {
-    if grid_area.width < 16 || grid_area.height < 5 {
+    if grid_area.width < 16 || grid_area.height < 4 {
         return;
     }
-    let width = grid_area.width.saturating_sub(6).min(64).max(32);
-    let inner_w = (width as usize).saturating_sub(4).max(12);
-    let ty = guess_cell_type(raw);
+    let width = grid_area.width.saturating_sub(8).min(48).max(24);
+    let inner_w = (width as usize).saturating_sub(4).max(10);
     let pretty = display_cell_value(raw);
     let mut body_lines = hover_wrap_lines(&pretty, inner_w);
-    // Cap peek height so the grid stays readable.
-    if body_lines.len() > 6 {
-        body_lines.truncate(6);
+    if body_lines.len() > 5 {
+        body_lines.truncate(5);
         body_lines.push("…".into());
     }
+    // Title + body (+ optional hairline) — no meta dump.
     let height = (body_lines.len() as u16)
         .saturating_add(3)
-        .min(12)
+        .min(10)
         .min(grid_area.height.saturating_sub(1));
-    // Bottom-right of Results — keeps header + cursor row visible.
     let x = grid_area
         .x
         .saturating_add(grid_area.width.saturating_sub(width).saturating_sub(1));
@@ -3202,8 +3200,8 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
         Block::default()
             .borders(Borders::ALL)
             .border_type(theme::border_type())
-            .border_style(Style::default().fg(theme::text()))
-            .style(Style::default().bg(theme::surface_2())),
+            .border_style(Style::default().fg(theme::border_idle()))
+            .style(Style::default().bg(theme::pane_fill())),
         area,
     );
     let inner = Rect {
@@ -3212,18 +3210,11 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    let meta = format!(
-        " {}  ·  {}  ·  {}c ",
-        truncate_chars(col_name, 20),
-        ty,
-        raw.chars().count()
-    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_chars(&meta, inner.width as usize),
+            truncate_chars(col_name, inner.width as usize),
             Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ))),
         Rect {
@@ -3233,11 +3224,23 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
             height: 1,
         },
     );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(inner.width as usize),
+            theme::style_faint(),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        },
+    );
     let value_area = Rect {
         x: inner.x,
-        y: inner.y + 1,
+        y: inner.y + 2,
         width: inner.width,
-        height: inner.height.saturating_sub(1),
+        height: inner.height.saturating_sub(2),
     };
     let body: Vec<Line> = body_lines
         .into_iter()
@@ -3247,7 +3250,7 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
             } else {
                 theme::style_text()
             };
-            Line::from(Span::styled(format!(" {l}"), style))
+            Line::from(Span::styled(l, style))
         })
         .collect();
     frame.render_widget(Paragraph::new(body), value_area);
