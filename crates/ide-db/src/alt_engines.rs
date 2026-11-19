@@ -222,6 +222,8 @@ async fn exec_bigquery_rest(project: &str, sql: &str) -> Result<QueryResult> {
         bail!("BigQuery HTTP {status}: {text}");
     }
     let v: serde_json::Value = serde_json::from_str(&text).context("BigQuery JSON")?;
+    // HTTP 200 can still carry a non-empty `errors[]` (partial/failed job). Fail closed (#203).
+    bail_bigquery_errors(&v)?;
     let schema_fields = v
         .pointer("/schema/fields")
         .and_then(|f| f.as_array())
@@ -1094,6 +1096,26 @@ pub async fn duckdb_columns(
         .collect())
 }
 
+/// Fail closed when BigQuery returns HTTP 200 with a non-empty `errors` array.
+fn bail_bigquery_errors(v: &serde_json::Value) -> Result<()> {
+    let Some(errs) = v.get("errors").and_then(|e| e.as_array()) else {
+        return Ok(());
+    };
+    if errs.is_empty() {
+        return Ok(());
+    }
+    let msgs: Vec<&str> = errs
+        .iter()
+        .map(|e| {
+            e.get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| e.get("reason").and_then(|r| r.as_str()))
+                .unwrap_or("unknown error")
+        })
+        .collect();
+    bail!("BigQuery errors: {}", msgs.join("; "));
+}
+
 fn urlencoding_lite(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -1101,4 +1123,31 @@ fn urlencoding_lite(s: &str) -> String {
             _ => format!("%{:02X}", c as u8),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod bigquery_errors_tests {
+    use super::bail_bigquery_errors;
+
+    #[test]
+    fn empty_or_missing_errors_ok() {
+        assert!(bail_bigquery_errors(&serde_json::json!({})).is_ok());
+        assert!(bail_bigquery_errors(&serde_json::json!({"errors": []})).is_ok());
+    }
+
+    #[test]
+    fn non_empty_errors_fail_closed() {
+        let err = bail_bigquery_errors(&serde_json::json!({
+            "jobComplete": true,
+            "errors": [
+                {"reason": "invalidQuery", "message": "Syntax error: Unexpected keyword"},
+                {"reason": "stopped"}
+            ],
+            "rows": []
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Syntax error"), "{err}");
+        assert!(err.contains("stopped"), "{err}");
+    }
 }
