@@ -577,13 +577,6 @@ impl DbConnectForm {
 }
 
 pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectForm) {
-    // Same AMOLED black as Home — plate is border-only elevation, not a gray card.
-    frame.render_widget(Clear, screen);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme::bg())),
-        screen,
-    );
-
     let width = screen.width.min(64).max(52);
     let height = screen.height.min(26).max(18);
     let x = screen.x + (screen.width.saturating_sub(width)) / 2;
@@ -594,6 +587,8 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
         width,
         height,
     };
+    // Opaque Hop-style scrim — plate is border-only elevation, not a gray card.
+    crate::widgets::paint_scrim(frame, screen);
 
     let title = if form.is_edit {
         " Edit connection "

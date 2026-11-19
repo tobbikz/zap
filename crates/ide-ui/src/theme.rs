@@ -6,6 +6,7 @@ mod theme_custom;
 pub use theme_custom::{create_custom_theme, customs, reload_customs, themes_dir, OwnedPalette};
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use theme_custom::{active, find_custom, set_active};
 
@@ -697,6 +698,60 @@ pub fn syn_ident() -> Color {
     active().syn_ident
 }
 
+/// tuile-style semantic roles mapped onto the active palette.
+/// Zap keeps multi-theme DataRig palettes; roles stay theme-relative (unlike Hop's locked mono).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Text,
+    Muted,
+    Faint,
+    Panel,
+    Boost,
+    Border,
+    BorderFocus,
+    Selection,
+    Accent,
+    FooterKey,
+    Success,
+    Danger,
+    Warning,
+}
+
+impl Role {
+    pub fn style(self) -> Style {
+        match self {
+            Role::Text => style_text(),
+            Role::Muted => style_muted(),
+            Role::Faint => style_faint(),
+            Role::Panel => Style::default().bg(surface()),
+            Role::Boost => Style::default().bg(surface_2()),
+            Role::Border => Style::default().fg(border_idle()),
+            Role::BorderFocus => Style::default().fg(border_focus()),
+            Role::Selection => style_selected(),
+            Role::Accent => style_accent().add_modifier(Modifier::BOLD),
+            Role::FooterKey => Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            Role::Success => style_ok(),
+            Role::Danger => style_err(),
+            Role::Warning => style_warn(),
+        }
+    }
+}
+
+/// Charm/tuile footer chip: accent key + faint label.
+pub fn footer_key(key: &str, label: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(format!(" {key} "), Role::FooterKey.style()),
+        Span::styled(format!("{label} "), Role::Faint.style()),
+    ]
+}
+
+/// Append several footer chips into `out`.
+pub fn extend_footer_keys(out: &mut Vec<Span<'static>>, keys: &[(&str, &str)]) {
+    for (k, l) in keys {
+        out.extend(footer_key(k, l));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,5 +764,21 @@ mod tests {
         assert_eq!(classify_font("Cascadia Mono"), FontClass::Modern);
         assert_eq!(classify_font("JetBrainsMono Nerd Font"), FontClass::Nerd);
         assert_eq!(classify_font("FiraCode NF"), FontClass::Nerd);
+    }
+
+    #[test]
+    fn footer_key_has_key_and_label() {
+        let spans = footer_key("Ctrl-P", "palette");
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].content.contains("Ctrl-P"));
+        assert!(spans[1].content.contains("palette"));
+    }
+
+    #[test]
+    fn role_selection_is_soft_not_reverse_default() {
+        // Soft selection uses surface_3 + bold text (DataRig), not Hop reverse wash.
+        set_mode_name("dark");
+        let s = Role::Selection.style();
+        assert_eq!(s.bg, Some(surface_3()));
     }
 }

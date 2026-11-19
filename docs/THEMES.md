@@ -69,3 +69,7 @@ icons = "auto"
 | Windows PowerShell (Consolas) | Consolas-safe | square `┌┐` | vertical bar |
 
 Override with `icons` or the `ZAP_ICONS` environment variable (`nerd`, `safe`, `ascii`).
+
+Motion (busy spinner / pulse) can be disabled with `ZAP_ANIMATIONS=0`.
+
+Design language (surfaces, footer chips, L0, modals): **[TUI-DESIGN.md](./TUI-DESIGN.md)**.
