@@ -6948,6 +6948,10 @@ impl DbWorkspace {
 
     /// Apply a migration SQL file and append a journal line under `queries/.migrate_journal.jsonl`.
     pub async fn apply_migration_file(&mut self, path: &Path) -> Result<()> {
+        // Migrations must not ride an open user TXN — journal would lie after ROLLBACK (#194).
+        if self.in_txn {
+            bail!("cannot apply migration while a transaction is open — COMMIT or ROLLBACK first");
+        }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;
         let Some(source_id) = self.active_source.clone() else {
@@ -11223,6 +11227,24 @@ mod paste_grid_tests {
             ]
         );
         assert_eq!(parse_paste_grid("plain"), vec![vec!["plain".to_string()]]);
+    }
+}
+
+#[cfg(test)]
+mod migration_txn_tests {
+    use super::DbWorkspace;
+    use std::path::Path;
+
+    #[tokio::test]
+    async fn apply_migration_refuses_open_txn() {
+        let mut ws = DbWorkspace::default();
+        ws.in_txn = true;
+        let err = ws
+            .apply_migration_file(Path::new("/tmp/does-not-matter.sql"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("transaction is open"), "{err}");
     }
 }
 
