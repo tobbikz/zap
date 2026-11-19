@@ -7060,6 +7060,16 @@ impl App {
                 self.db.show_text_result("tips", ide_db::onboarding_tips());
                 self.ui.focus = Focus::Results;
             }
+            "reload_persona" => {
+                self.db.reload_persona_config();
+                self.set_status(
+                    format!(
+                        "persona reloaded · mask_pii={} · confirm_ddl={}",
+                        self.db.persona.mask_pii, self.db.persona.confirm_destructive_ddl
+                    ),
+                    false,
+                );
+            }
             "recipe_gallery" => {
                 let text = self.db.list_recipes_text();
                 self.db.show_text_result("recipes", &text);
