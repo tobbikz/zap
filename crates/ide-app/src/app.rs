@@ -8895,6 +8895,37 @@ async fn event_loop(
                                         app.ui.db_monitor = !app.ui.db_monitor;
                                         continue;
                                     }
+                                    // Inspect Chart controls: cycle kind / row depth.
+                                    KeyCode::Char('c')
+                                        if !app.ui.cell_modal_drill && app.ui.cell_modal_tab == 2 =>
+                                    {
+                                        let n = ide_db::CHART_KINDS.len();
+                                        app.ui.chart_kind = (app.ui.chart_kind + 1) % n;
+                                        let kind = ide_db::CHART_KINDS[app.ui.chart_kind];
+                                        app.set_status(format!("chart · {kind}"), false);
+                                        continue;
+                                    }
+                                    KeyCode::Char('[')
+                                        if !app.ui.cell_modal_drill && app.ui.cell_modal_tab == 2 =>
+                                    {
+                                        app.ui.chart_limit =
+                                            app.ui.chart_limit.saturating_sub(2).max(4);
+                                        app.set_status(
+                                            format!("chart · rows {}", app.ui.chart_limit),
+                                            false,
+                                        );
+                                        continue;
+                                    }
+                                    KeyCode::Char(']')
+                                        if !app.ui.cell_modal_drill && app.ui.cell_modal_tab == 2 =>
+                                    {
+                                        app.ui.chart_limit = (app.ui.chart_limit + 2).min(40);
+                                        app.set_status(
+                                            format!("chart · rows {}", app.ui.chart_limit),
+                                            false,
+                                        );
+                                        continue;
+                                    }
                                     _ => {}
                                 }
                             }

@@ -41,7 +41,10 @@ pub use persona::{
 };
 pub use draw_glyphs::set_rich_blocks;
 pub use explain_format::{explain_visual_ascii, postgres_explain_grid};
-pub use result_chart::{chart_kind, chart_result, latency_sparkline, selection_stats};
+pub use result_chart::{
+    chart_kind, chart_kind_n, chart_result, chart_result_n, latency_sparkline, selection_stats,
+    CHART_KINDS,
+};
 pub use schema_cache::{expecting_relation, SchemaNameCache, SqlCompletionItem};
 
 use anyhow::{Context, Result, bail};

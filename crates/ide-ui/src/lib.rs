@@ -117,6 +117,10 @@ pub struct UiState {
     pub cell_modal_tab: usize,
     /// Enter on a Row field → full Cell view; Esc returns to the active tab.
     pub cell_modal_drill: bool,
+    /// Inspect Chart: 0 bar · 1 line · 2 pie (`c` cycles).
+    pub chart_kind: usize,
+    /// Inspect Chart: how many bar/pie rows to show (`[` `]`).
+    pub chart_limit: usize,
     /// Sticky H-scroll start for unpinned Results columns (updated on ←/→).
     pub results_col_window: usize,
     /// Sparkline/latency monitor overlay.
@@ -245,6 +249,8 @@ impl Default for UiState {
             cell_modal: false,
             cell_modal_tab: 0,
             cell_modal_drill: false,
+            chart_kind: 0,
+            chart_limit: 12,
             results_col_window: 0,
             db_monitor: false,
             admin_modal: false,
@@ -4468,7 +4474,14 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     } else {
         match tab {
             1 => modal_plan_lines(db, body.width as usize),
-            2 => modal_chart_lines(result, col_i, row_i, body.width as usize),
+            2 => modal_chart_lines(
+                result,
+                col_i,
+                row_i,
+                body.width as usize,
+                ctx.ui.chart_kind,
+                ctx.ui.chart_limit,
+            ),
             3 => modal_json_lines(result, cells, body.width as usize),
             _ => modal_row_lines(
                 result,
@@ -4518,7 +4531,14 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     } else if tab == 1 {
         " Tab Chart|JSON|Row   Ctrl-E for EXPLAIN   Esc ".into()
     } else if tab == 2 {
-        " ←→ numeric col   cursor row highlighted   Tab JSON   Esc ".into()
+        let kind = ide_db::CHART_KINDS
+            .get(ctx.ui.chart_kind % ide_db::CHART_KINDS.len())
+            .copied()
+            .unwrap_or("bar");
+        format!(
+            " c {kind}   [ ] rows·{}   ←→ col   Tab JSON   Esc ",
+            ctx.ui.chart_limit
+        )
     } else {
         " Tab Row   y yank JSON   Esc ".into()
     };
@@ -5079,10 +5099,29 @@ fn modal_chart_lines(
     col_i: usize,
     cursor_row: usize,
     width: usize,
+    kind_idx: usize,
+    limit: usize,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
-    // One clean bar view — no stacked Line/Pie dumps under it.
-    let Some(text) = ide_db::chart_kind(result, "bar", Some(col_i)) else {
+    let kinds = ide_db::CHART_KINDS;
+    let kind = kinds.get(kind_idx % kinds.len()).copied().unwrap_or("bar");
+    // Control strip — kind is editable with `c`, depth with `[` `]`.
+    lines.push(Line::from(vec![
+        Span::styled("chart ", theme::style_faint()),
+        Span::styled(
+            kind.to_string(),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", theme::style_faint()),
+        Span::styled(format!("rows {limit}"), theme::style_muted()),
+        Span::styled(" · ", theme::style_faint()),
+        Span::styled("c type  [ ] depth  ←→ col", theme::style_faint()),
+    ]));
+    lines.push(Line::from(""));
+
+    let Some(text) = ide_db::chart_kind_n(result, kind, Some(col_i), limit) else {
         lines.push(Line::from(Span::styled(
             "no numeric column — ←→ pick one",
             theme::style_faint(),
@@ -5094,13 +5133,12 @@ fn modal_chart_lines(
         let shown = truncate_chars(l, width.saturating_sub(1));
         let is_cursor = l.starts_with(&cursor_tag);
         let style = if is_cursor {
-            // Quiet caret — bold + accent ink, not a full invert wash.
             Style::default()
                 .fg(theme::accent())
                 .add_modifier(Modifier::BOLD)
         } else if i == 0 {
             theme::style_muted()
-        } else if i == 1 {
+        } else if i == 1 && kind != "pie" {
             theme::style_accent()
         } else {
             theme::style_text()
