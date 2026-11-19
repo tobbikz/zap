@@ -2097,6 +2097,105 @@ impl App {
         }
     }
 
+    /// Append clipboard/bracketed-paste text into the active modal field (#178).
+    fn paste_into_modal_input(&mut self, text: &str) -> bool {
+        match self.ui.mode {
+            Mode::Find => {
+                self.ui.find_query.push_str(text);
+                true
+            }
+            Mode::Replace => {
+                self.ui.replace_query.push_str(text);
+                true
+            }
+            Mode::Search => {
+                self.ui.search_input.push_str(text);
+                true
+            }
+            Mode::Rename => {
+                self.ui.rename_input.push_str(text);
+                true
+            }
+            Mode::Command => {
+                self.ui.command.push_str(text);
+                true
+            }
+            Mode::Commit => {
+                self.ui.commit_input.push_str(text);
+                true
+            }
+            Mode::EditCell => {
+                self.ui.cell_edit_input.push_str(text);
+                true
+            }
+            Mode::EditTableFilter => {
+                self.ui.table_filter_draft.push_str(text);
+                self.refresh_table_filter_completions();
+                true
+            }
+            Mode::Settings => {
+                self.ui.settings_draft.push_str(text);
+                true
+            }
+            Mode::OpenFolder => {
+                self.ui.open_folder_input.push_str(text);
+                true
+            }
+            Mode::ImportCsv
+            | Mode::RestoreDump
+            | Mode::SchemaDiff
+            | Mode::DataCompare
+            | Mode::QueryParams
+            | Mode::SaveMaterialize
+            | Mode::BrainAsk => {
+                self.ui.import_csv_input.push_str(text);
+                true
+            }
+            Mode::DbConnect => {
+                for c in text.chars() {
+                    if c != '\n' && c != '\r' {
+                        self.ui.db_connect_form.push_char(c);
+                    }
+                }
+                true
+            }
+            Mode::CreateObject => {
+                for c in text.chars() {
+                    if c != '\n' && c != '\r' {
+                        self.ui.create_object_form.push_char(c);
+                    }
+                }
+                true
+            }
+            Mode::Palette => {
+                for c in text.chars() {
+                    if c != '\n' && c != '\r' {
+                        self.ui.palette.push_char(c);
+                    }
+                }
+                self.preview_palette_theme();
+                true
+            }
+            Mode::SessionForm => {
+                for c in text.chars() {
+                    if c != '\n' && c != '\r' {
+                        self.session_form_push_char(c);
+                    }
+                }
+                true
+            }
+            Mode::AgentForm => {
+                for c in text.chars() {
+                    if c != '\n' && c != '\r' {
+                        self.agent_form_push_char(c);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn clipboard_paste_sql_or_editor(&mut self) {
         let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(t) => t,
@@ -2107,6 +2206,10 @@ impl App {
         };
         if text.is_empty() {
             self.set_status("clipboard empty", true);
+            return;
+        }
+        if self.paste_into_modal_input(&text) {
+            self.set_status(format!("pasted {} chars", text.chars().count()), false);
             return;
         }
         if self.editing_db_sql() {
@@ -8336,15 +8439,12 @@ async fn event_loop(
                 let Some(Ok(ev)) = maybe_ev else { continue };
                 match ev {
                     Event::Paste(text) => {
-                        if app.ui.mode == Mode::ImportCsv
-                            && app.ui.confirm_run_sql.as_deref() == Some("__paste_tsv__")
-                        {
-                            app.ui.import_csv_input.push_str(&text);
-                        } else if app.ui.mode == Mode::EditCell {
-                            app.ui.cell_edit_input.push_str(&text);
-                        } else if app.ui.mode == Mode::EditTableFilter {
-                            app.ui.table_filter_draft.push_str(&text);
-                            app.refresh_table_filter_completions();
+                        // Modal fields first — Find must not fall into Import CSV (#178).
+                        if app.paste_into_modal_input(&text) {
+                            app.set_status(
+                                format!("pasted {} chars", text.chars().count()),
+                                false,
+                            );
                         } else if app.editing_db_sql()
                             && matches!(app.ui.mode, Mode::Insert | Mode::Normal)
                         {
@@ -8378,19 +8478,11 @@ async fn event_loop(
                                     app.set_status(format!("nvim paste: {e:#}"), true);
                                 }
                             }
-                        } else if matches!(
-                            app.ui.mode,
-                            Mode::Insert | Mode::BrainAsk | Mode::QueryParams | Mode::Find
-                        ) {
-                            // fall through: append into common text inputs when focused editor
-                            if app.ui.mode == Mode::Insert {
-                                if let Some(buf) = app.buffers.active_mut() {
-                                    for ch in text.chars() {
-                                        buf.insert_char(ch);
-                                    }
+                        } else if app.ui.mode == Mode::Insert {
+                            if let Some(buf) = app.buffers.active_mut() {
+                                for ch in text.chars() {
+                                    buf.insert_char(ch);
                                 }
-                            } else {
-                                app.ui.import_csv_input.push_str(&text);
                             }
                         }
                     }
@@ -9441,38 +9533,66 @@ async fn event_loop(
                             }
                             Mode::Command => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.command.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.command.push(c);
+                                    }
                                 }
                             }
                             Mode::Rename => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.rename_input.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.rename_input.push(c);
+                                    }
                                 }
                             }
                             Mode::Search => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.search_input.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.search_input.push(c);
+                                    }
                                 }
                             }
                             Mode::Find => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.find_query.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.find_query.push(c);
+                                    }
                                 }
                             }
                             Mode::EditTableFilter => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.table_filter_draft.push(c);
-                                    app.refresh_table_filter_completions();
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.table_filter_draft.push(c);
+                                        app.refresh_table_filter_completions();
+                                    }
                                 }
                             }
                             Mode::Replace => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.replace_query.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.replace_query.push(c);
+                                    }
                                 }
                             }
                             Mode::Commit => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.commit_input.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.commit_input.push(c);
+                                    }
                                 }
                             }
                             Mode::DbConnect => {
@@ -9539,7 +9659,11 @@ async fn event_loop(
                             }
                             Mode::OpenFolder => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.open_folder_input.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.open_folder_input.push(c);
+                                    }
                                 }
                             }
                             Mode::ImportCsv
@@ -9550,18 +9674,30 @@ async fn event_loop(
                             | Mode::SaveMaterialize
                             | Mode::BrainAsk => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.import_csv_input.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.import_csv_input.push(c);
+                                    }
                                 }
                             }
                             Mode::ConfirmDeleteSource | Mode::ConfirmQuit => {}
                             Mode::EditCell => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.cell_edit_input.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.cell_edit_input.push(c);
+                                    }
                                 }
                             }
                             Mode::Settings => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.settings_draft.push(c);
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.settings_draft.push(c);
+                                    }
                                 }
                             }
                             Mode::SessionForm => {
@@ -9580,8 +9716,12 @@ async fn event_loop(
                             }
                             Mode::Palette => {
                                 if let KeyCode::Char(c) = key.code {
-                                    app.ui.palette.push_char(c);
-                                    app.preview_palette_theme();
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SUPER)
+                                    {
+                                        app.ui.palette.push_char(c);
+                                        app.preview_palette_theme();
+                                    }
                                 }
                             }
                             Mode::Normal => {}
