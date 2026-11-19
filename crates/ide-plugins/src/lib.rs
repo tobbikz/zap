@@ -1,10 +1,14 @@
 //! Lightweight command plugins loaded from TOML (no WASM marketplace — local scripts/commands).
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::time::timeout;
 use tracing::warn;
+
+const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -86,44 +90,109 @@ impl PluginHost {
         out
     }
 
-    pub fn run(
+    /// Run a plugin command asynchronously (does not block the TUI runtime thread).
+    pub async fn run(
         &self,
         command_id: &str,
-        root: &std::path::Path,
-        file: Option<&std::path::Path>,
+        root: &Path,
+        file: Option<&Path>,
         line: usize,
     ) -> Result<String> {
         for p in &self.plugins {
             if let Some(cmd) = p.commands.iter().find(|c| c.id == command_id) {
                 let mut script = cmd.run.clone();
-                script = script.replace("{root}", &root.display().to_string());
+                script = script.replace("{root}", &shell_quote(&root.display().to_string()));
                 script = script.replace(
                     "{file}",
                     &file
-                        .map(|f| f.display().to_string())
-                        .unwrap_or_default(),
+                        .map(|f| shell_quote(&f.display().to_string()))
+                        .unwrap_or_else(|| shell_quote("")),
                 );
                 script = script.replace("{line}", &line.to_string());
-                let out = Command::new("sh")
-                    .arg("-c")
-                    .arg(&script)
-                    .current_dir(root)
-                    .output()
+
+                let mut child = shell_command(&script);
+                child.current_dir(root).kill_on_drop(true);
+                let out = timeout(PLUGIN_TIMEOUT, child.output())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "plugin {} timed out after {}s",
+                            cmd.id,
+                            PLUGIN_TIMEOUT.as_secs()
+                        )
+                    })?
                     .with_context(|| format!("run plugin {}", cmd.id))?;
                 let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
                 if !out.stderr.is_empty() {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
                     text.push_str(&String::from_utf8_lossy(&out.stderr));
                 }
                 if !out.status.success() {
-                    anyhow::bail!("plugin exited {:?}: {text}", out.status.code());
+                    bail!("plugin exited {:?}: {text}", out.status.code());
                 }
                 return Ok(text);
             }
         }
-        anyhow::bail!("unknown plugin command {command_id}")
+        bail!("unknown plugin command {command_id}")
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+fn shell_command(script: &str) -> Command {
+    if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(script);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(script);
+        c
     }
 }
 
 fn plugins_dir() -> Option<PathBuf> {
     Some(ide_core::config_dir()?.join("plugins"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_wraps_spaces() {
+        let q = shell_quote("/tmp/my project");
+        assert!(q.contains("my project") || q.contains("my project"));
+        assert!(q.starts_with('\'') || q.starts_with('"'));
+    }
+
+    #[tokio::test]
+    async fn run_echo_plugin_async() {
+        let host = PluginHost {
+            plugins: vec![PluginManifest {
+                name: "t".into(),
+                description: String::new(),
+                commands: vec![PluginCommand {
+                    id: "t.echo".into(),
+                    title: "echo".into(),
+                    run: if cfg!(windows) {
+                        "echo hello-plugin".into()
+                    } else {
+                        "echo hello-plugin".into()
+                    },
+                }],
+            }],
+        };
+        let root = std::env::temp_dir();
+        let out = host.run("t.echo", &root, None, 1).await.expect("run");
+        assert!(out.contains("hello-plugin"), "{out}");
+    }
 }

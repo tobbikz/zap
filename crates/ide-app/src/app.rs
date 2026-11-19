@@ -93,6 +93,8 @@ pub struct App {
     nvim_esc_armed: bool,
     /// Run SQL concurrently with the event loop (Esc cancel).
     pending_db_query: bool,
+    /// Background plugin command (Esc aborts).
+    pending_plugin: Option<tokio::task::JoinHandle<anyhow::Result<String>>>,
     /// Ticks since last connection-health sweep (~33ms each).
     health_tick_counter: u32,
     /// Ticks since last Health · Activity auto-refresh (~33ms each).
@@ -143,6 +145,7 @@ impl App {
             pending_nvim_blank: false,
             nvim_esc_armed: false,
             pending_db_query: false,
+            pending_plugin: None,
             health_tick_counter: 0,
             health_activity_tick: 0,
             theme_before_preview: None,
@@ -3612,6 +3615,10 @@ impl App {
     }
 
     async fn run_plugin_command(&mut self, command_id: &str) -> Result<()> {
+        if self.pending_plugin.is_some() {
+            self.set_status("plugin already running — Esc to cancel", true);
+            return Ok(());
+        }
         let file = self
             .active_buffer()
             .and_then(|b| b.path.clone())
@@ -3624,19 +3631,30 @@ impl App {
             .active_buffer()
             .map(|b| b.cursor.row + 1)
             .unwrap_or(1);
-        match self.plugins.run(
-            command_id,
-            &self.workspace.root,
-            file.as_deref(),
-            line,
-        ) {
+        let host = self.plugins.clone();
+        let root = self.workspace.root.clone();
+        let id = command_id.to_string();
+        self.pending_plugin = Some(tokio::spawn(async move {
+            host.run(&id, &root, file.as_deref(), line).await
+        }));
+        self.ui.busy_label = Some("plugin…".into());
+        self.set_status(format!("plugin {command_id}… Esc cancel"), false);
+        Ok(())
+    }
+
+    fn finish_plugin_result(&mut self, res: anyhow::Result<String>) {
+        self.ui.busy_label = None;
+        match res {
             Ok(out) => {
-                let text = out.trim().lines().next().unwrap_or("ok").to_string();
-                self.set_status(format!("plugin: {text}"), false);
+                let preview = out.trim().lines().next().unwrap_or("ok").to_string();
+                self.db.show_text_result("plugin", &out);
+                if self.ui.product == ProductMode::Database {
+                    self.ui.focus = Focus::Results;
+                }
+                self.set_status(format!("plugin: {preview}"), false);
             }
             Err(e) => self.set_status(format!("plugin: {e:#}"), true),
         }
-        Ok(())
     }
 
     fn start_add_connection(&mut self) {
@@ -8384,6 +8402,39 @@ async fn event_loop(
                 },
             );
         })?;
+
+        if let Some(mut handle) = app.pending_plugin.take() {
+            tokio::select! {
+                joined = &mut handle => {
+                    match joined {
+                        Ok(res) => app.finish_plugin_result(res),
+                        Err(e) if e.is_cancelled() => {
+                            app.ui.busy_label = None;
+                            app.set_status("plugin cancelled", false);
+                        }
+                        Err(e) => {
+                            app.ui.busy_label = None;
+                            app.set_status(format!("plugin task: {e}"), true);
+                        }
+                    }
+                }
+                maybe_ev = events.next() => {
+                    if let Some(Ok(Event::Key(key))) = maybe_ev {
+                        if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                            handle.abort();
+                            app.ui.busy_label = None;
+                            app.set_status("plugin cancelled", false);
+                        } else {
+                            // Keep waiting; ignore non-Esc while plugin runs (query parity).
+                            app.pending_plugin = Some(handle);
+                        }
+                    } else {
+                        app.pending_plugin = Some(handle);
+                    }
+                }
+            }
+            continue;
+        }
 
         if app.pending_db_query {
             tokio::select! {
