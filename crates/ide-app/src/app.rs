@@ -433,6 +433,15 @@ impl App {
     }
 
     async fn switch_workspace_force(&mut self, path: PathBuf, write_first: bool) -> Result<()> {
+        let path = expand_user_path(&path.to_string_lossy());
+        if !path.is_dir() {
+            self.config.forget_project(&path);
+            self.set_status(
+                format!("missing project — removed from recent: {}", path.display()),
+                true,
+            );
+            return Ok(());
+        }
         if let Some(nvim) = self.nvim.as_ref() {
             if write_first {
                 let _ = nvim.write_all().await;
@@ -441,15 +450,31 @@ impl App {
         if let Some(nvim) = self.nvim.take() {
             nvim.quit().await;
         }
-        let ws = Workspace::open(&path).context("open folder")?;
+        let ws = match Workspace::open(&path) {
+            Ok(ws) => ws,
+            Err(e) => {
+                self.config.forget_project(&path);
+                self.set_status(
+                    format!("open folder failed — pruned from recent: {e:#}"),
+                    true,
+                );
+                return Ok(());
+            }
+        };
         let root = ws.root.clone();
+        let keep_product = self.ui.product;
         self.workspace = ws;
         self.buffers = BufferSet::new();
         self.ui.split = Default::default();
-        self.ui.code_surface = CodeSurface::Home;
-        self.last_code_surface = CodeSurface::Home;
         self.ui.mode = Mode::Normal;
-        self.ui.product = ProductMode::Code;
+        // Zap stays in Database; only Code product resets to Home (#179).
+        if keep_product == ProductMode::Code {
+            self.ui.code_surface = CodeSurface::Home;
+            self.last_code_surface = CodeSurface::Home;
+            self.ui.product = ProductMode::Code;
+        } else {
+            self.ui.product = keep_product;
+        }
         self.ui.confirm_quit_label.clear();
         self.pending_workspace_path = None;
         self.nvim_bufs.clear();
@@ -9623,17 +9648,35 @@ fn is_run_query_key(key: KeyEvent) -> bool {
 }
 
 fn expand_user_path(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
+    let raw = raw.trim();
     if raw == "~" {
         if let Some(home) = dirs::home_dir() {
             return home;
         }
     }
+    // Unix ~/… and Windows ~\… (#179).
+    if let Some(rest) = raw
+        .strip_prefix("~/")
+        .or_else(|| raw.strip_prefix("~\\"))
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
     PathBuf::from(raw)
+}
+
+#[cfg(test)]
+mod expand_path_tests {
+    use super::expand_user_path;
+
+    #[test]
+    fn expands_tilde_slash_and_backslash() {
+        let home = dirs::home_dir().expect("home");
+        assert_eq!(expand_user_path("~/zap"), home.join("zap"));
+        assert_eq!(expand_user_path("~\\zap"), home.join("zap"));
+        assert_eq!(expand_user_path("~"), home);
+    }
 }
 
 #[cfg(test)]
