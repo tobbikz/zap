@@ -135,11 +135,12 @@ pub fn reload_customs() {
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
+        // Normalize stems to lowercase so Solarized.toml matches resolve_theme_id (#181).
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("")
-            .to_string();
+            .to_ascii_lowercase();
         if stem.is_empty() || !valid_theme_name(&stem) {
             continue;
         }
@@ -148,7 +149,7 @@ pub fn reload_customs() {
         }
         match load_theme_file(&path, &stem) {
             Ok(p) => out.push(p),
-            Err(e) => eprintln!("Zap theme {}: {e:#}", path.display()),
+            Err(e) => tracing::warn!("Zap theme {}: {e:#}", path.display()),
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -160,7 +161,11 @@ pub fn customs() -> Vec<OwnedPalette> {
 }
 
 pub fn find_custom(id: &str) -> Option<OwnedPalette> {
-    CUSTOMS.lock().iter().find(|p| p.id == id).cloned()
+    CUSTOMS
+        .lock()
+        .iter()
+        .find(|p| p.id.eq_ignore_ascii_case(id))
+        .cloned()
 }
 
 pub fn set_active(p: OwnedPalette) {
@@ -180,19 +185,19 @@ pub fn active() -> OwnedPalette {
 }
 
 pub fn valid_theme_name(name: &str) -> bool {
-    let n = name.trim();
+    let n = name.trim().to_ascii_lowercase();
     !n.is_empty()
         && n.len() <= 64
         && n
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        && super::builtin_by_id(n).is_none()
+        && super::builtin_by_id(&n).is_none()
 }
 
 /// Write `themes/<name>.toml` extending `extends` (built-in id). Does not overwrite.
 pub fn create_custom_theme(name: &str, extends: &str) -> Result<PathBuf> {
-    let name = name.trim();
-    if !valid_theme_name(name) {
+    let name = name.trim().to_ascii_lowercase();
+    if !valid_theme_name(&name) {
         bail!("invalid theme name (letters/digits/-/_ , not a built-in)");
     }
     let base = super::builtin_by_id(extends).or_else(|| super::builtin_by_id("dark"));

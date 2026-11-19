@@ -958,4 +958,11 @@ mod tests {
         let s = style_grid_cursor_cell();
         assert_eq!(s.bg, Some(accent()));
     }
+
+    #[test]
+    fn theme_ids_normalize_case() {
+        assert_eq!(resolve_theme_id("Solarized"), "solarized");
+        assert!(theme_custom::valid_theme_name("MyTheme"));
+        assert!(!theme_custom::valid_theme_name("dark")); // built-in
+    }
 }
