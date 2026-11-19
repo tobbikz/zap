@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -686,7 +686,7 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
                     .fg(theme::text())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("▌", theme::style_muted()),
+            Span::styled(theme::caret(), theme::style_muted()),
         ])
     };
     frame.render_widget(
@@ -1015,7 +1015,7 @@ fn render_path_prompt(
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
-            format!("  {input}▌"),
+            format!("  {input}{}", theme::caret()),
             theme::style_text().add_modifier(Modifier::BOLD),
         )),
         inner[3],
@@ -1085,7 +1085,7 @@ pub fn render_open_folder(frame: &mut Frame, screen: Rect, input: &str) {
                     .fg(theme::text())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("▌", theme::style_muted()),
+            Span::styled(theme::caret(), theme::style_muted()),
         ]))
         .style(Style::default().bg(theme::surface_2())),
         inner[2],
@@ -1326,7 +1326,7 @@ pub fn render_changes_preview(frame: &mut Frame, screen: Rect, preview: &str) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(theme::border_type())
             .border_style(Style::default().fg(theme::text()))
             .style(Style::default().bg(theme::bg()))
             .title(Span::styled(" Changes · SQL preview ", title_style)),
@@ -1378,7 +1378,7 @@ pub fn render_changes_preview(frame: &mut Frame, screen: Rect, preview: &str) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(theme::border_type())
                     .border_style(Style::default().fg(theme::border_idle()))
                     .style(Style::default().bg(theme::surface())),
             )
@@ -1436,7 +1436,7 @@ pub fn render_confirm_dialog(
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(theme::border_type())
             .border_style(Style::default().fg(theme::text()))
             .style(Style::default().bg(theme::bg()))
             .title(Span::styled(format!(" {title} "), title_style)),

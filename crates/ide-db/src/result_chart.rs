@@ -2,8 +2,6 @@
 
 use crate::QueryResult;
 
-const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
 pub fn chart_result(result: &QueryResult, col_idx: Option<usize>) -> Option<String> {
     if result.rows.is_empty() || result.columns.is_empty() {
         return None;
@@ -21,8 +19,7 @@ pub fn chart_result(result: &QueryResult, col_idx: Option<usize>) -> Option<Stri
         .iter()
         .map(|v| {
             let t = ((v - min) / span).clamp(0.0, 1.0);
-            let idx = (t * (SPARK.len() - 1) as f64).round() as usize;
-            SPARK[idx]
+            crate::draw_glyphs::spark_at(t)
         })
         .collect();
     let bar_w = 24usize;
@@ -30,7 +27,7 @@ pub fn chart_result(result: &QueryResult, col_idx: Option<usize>) -> Option<Stri
     for (i, v) in values.iter().take(12).enumerate() {
         let t = ((v - min) / span).clamp(0.0, 1.0);
         let n = (t * bar_w as f64).round() as usize;
-        let bar: String = std::iter::repeat('█').take(n).collect();
+        let bar: String = std::iter::repeat(crate::draw_glyphs::bar()).take(n).collect();
         bars.push_str(&format!(" {:>2} │{:<width$} {:.4}\n", i + 1, bar, v, width = bar_w));
     }
     Some(format!(
@@ -68,7 +65,7 @@ fn parse_numeric_column(result: &QueryResult, ci: usize) -> Option<Vec<f64>> {
 /// Sparkline from latency history (ms).
 pub fn latency_sparkline(ms: &[u128], width: usize) -> String {
     if ms.is_empty() {
-        return "▁".repeat(width.max(1));
+        return crate::draw_glyphs::spark_floor().to_string().repeat(width.max(1));
     }
     let slice = if ms.len() > width {
         &ms[ms.len() - width..]
@@ -82,7 +79,7 @@ pub fn latency_sparkline(ms: &[u128], width: usize) -> String {
         .iter()
         .map(|v| {
             let t = ((*v as f64 - min) / span).clamp(0.0, 1.0);
-            SPARK[(t * (SPARK.len() - 1) as f64).round() as usize]
+            crate::draw_glyphs::spark_at(t)
         })
         .collect()
 }
@@ -128,7 +125,7 @@ pub fn chart_kind(result: &QueryResult, kind: &str, col_idx: Option<usize>) -> O
                 .iter()
                 .map(|v| {
                     let t = ((v - min) / span).clamp(0.0, 1.0);
-                    SPARK[(t * (SPARK.len() - 1) as f64).round() as usize]
+                    crate::draw_glyphs::spark_at(t)
                 })
                 .collect();
             Some(format!(

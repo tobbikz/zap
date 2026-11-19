@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: target/release/zap
+            asset: zap-linux-x86_64
+          - os: windows-latest
+            bin: target/release/zap.exe
+            asset: zap-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build -p ide-app --release
+      - name: Stage asset
+        shell: bash
+        run: cp "${{ matrix.bin }}" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum zap-linux-x86_64 zap-windows-x86_64.exe > SHA256SUMS
+          ls -lh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/zap-linux-x86_64
+            dist/zap-windows-x86_64.exe
+            dist/SHA256SUMS
+          generate_release_notes: true
+          body: |
+            Binaries — no Rust toolchain required.
+
+            | OS | Asset |
+            |----|--------|
+            | Linux x86_64 | `zap-linux-x86_64` |
+            | Windows x86_64 | `zap-windows-x86_64.exe` |
+
+            Windows PowerShell uses Consolas-safe glyphs and a UTF-8 console automatically.
+            For Nerd Font icons, install a Nerd Font (the face name must contain "Nerd") or set `[theme] icons = "nerd"`.
+
+            ```bash
+            curl -fL -o zap https://github.com/tobbikz/zap/releases/download/${{ github.ref_name }}/zap-linux-x86_64
+            chmod +x zap
+            ```
+
+            ```powershell
+            Invoke-WebRequest https://github.com/tobbikz/zap/releases/download/${{ github.ref_name }}/zap-windows-x86_64.exe -OutFile zap.exe
+            ```

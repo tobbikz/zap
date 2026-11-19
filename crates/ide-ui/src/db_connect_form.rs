@@ -680,7 +680,7 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
             } else {
                 form.accent_label()
             };
-            let swatch = if empty { "·" } else { "██" };
+            let swatch = if empty { "·" } else { theme::swatch() };
             let shown = if focused {
                 format!("‹ {swatch} {label} ›")
             } else {
@@ -714,7 +714,7 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
         } else if empty {
             field.hint(form.driver).to_string()
         } else if focused {
-            format!("{value}▌")
+            format!("{value}{}", theme::caret())
         } else {
             value
         };

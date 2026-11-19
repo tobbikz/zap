@@ -103,6 +103,7 @@ pub struct App {
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         let config = IdeConfig::load();
+        crate::host::apply_icons(config.theme.icons);
         ide_ui::theme::reload_customs();
         ide_ui::theme::set_mode_name(&config.theme.name);
         let workspace = Workspace::open(&root).context("open workspace")?;
@@ -3186,6 +3187,7 @@ impl App {
         };
         std::fs::write(&path, draft)?;
         self.config = IdeConfig::load_from(&path)?;
+        crate::host::apply_icons(self.config.theme.icons);
         ide_ui::theme::set_mode_name(&self.config.theme.name);
         self.db.query_timeout_secs = self.config.database.query_timeout_secs;
         self.db.select_limit = self.config.database.select_limit;
@@ -7882,6 +7884,7 @@ fn map_mouse_to_nvim(
 }
 
 pub async fn run(root: PathBuf) -> Result<()> {
+    let _console = crate::host::install_console();
     let mut app = App::new(root)?;
     match GitState::discover(&app.workspace.root).await {
         Ok(git) => {
@@ -7914,15 +7917,19 @@ pub async fn run(root: PathBuf) -> Result<()> {
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
-    // Kitty/foot/wezterm: make Ctrl-Enter distinct from Enter (otherwise many TTYs
-    // collapse it to Ctrl-J / plain Enter and Run never fires).
-    let _ = execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        )
-    );
+    // Kitty/foot/wezterm/Windows Terminal: make Ctrl-Enter distinct from Enter.
+    // Conhost (Windows PowerShell) does not speak this protocol — sending it
+    // garbles the next keys — so it stays off unless WT_SESSION is set.
+    let keyboard_proto = crate::host::keyboard_protocol();
+    if keyboard_proto {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        );
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -7937,7 +7944,9 @@ pub async fn run(root: PathBuf) -> Result<()> {
     }
 
     disable_raw_mode()?;
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    if keyboard_proto {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,

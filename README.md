@@ -6,7 +6,7 @@ A truecolor terminal studio — Explorer · Structure · Console · Results — 
 [![Release](https://img.shields.io/github/v/release/tobbikz/zap)](https://github.com/tobbikz/zap/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-**v0.6.0** · Linux & Windows · Postgres · MySQL · MSSQL · SQLite · DuckDB · ClickHouse · Redis · Mongo · Snowflake · BigQuery · Elasticsearch · Trino
+**v0.6.1** · Linux & Windows · Postgres · MySQL · MSSQL · SQLite · DuckDB · ClickHouse · Redis · Mongo · Snowflake · BigQuery · Elasticsearch · Trino
 
 ---
 
@@ -119,25 +119,27 @@ Full inventory: **[docs/FEATURES.md](docs/FEATURES.md)** · Themes: **[docs/THEM
 
 ## Install
 
-| OS | Install | Update |
-|----|---------|--------|
-| **Linux** | `./scripts/install.sh` → `~/.local/bin/zap` | `./scripts/update.sh` |
-| **Windows** | `.\scripts\install.ps1` → `%LOCALAPPDATA%\zap\` | `.\scripts\update.ps1` |
+Release binaries — no Rust toolchain. Details: **[docs/INSTALL.md](docs/INSTALL.md)**.
 
-Needs [Rust](https://rustup.rs/) 1.75+. Details: **[docs/INSTALL.md](docs/INSTALL.md)**.
+| OS | Install |
+|----|---------|
+| **Linux x86_64** | `curl -fL -o ~/.local/bin/zap https://github.com/tobbikz/zap/releases/latest/download/zap-linux-x86_64 && chmod +x ~/.local/bin/zap` |
+| **Windows** | `.\scripts\install.ps1` → `%LOCALAPPDATA%\zap\zap.exe` |
 
 ```bash
-git clone https://github.com/tobbikz/zap.git && cd zap
-./scripts/install.sh
+curl -fL -o ~/.local/bin/zap https://github.com/tobbikz/zap/releases/latest/download/zap-linux-x86_64
+chmod +x ~/.local/bin/zap
 zap
 ```
 
 ```powershell
-git clone https://github.com/tobbikz/zap.git
-cd zap
-.\scripts\install.ps1
+irm https://raw.githubusercontent.com/tobbikz/zap/v0.6.1/scripts/install.ps1 | iex
 zap
 ```
+
+From a git checkout, `./scripts/install.sh` and `.\scripts\install.ps1` download the release binary and fall back to `cargo build` if it is missing. Building from source needs [Rust](https://rustup.rs/) 1.75+.
+
+Windows PowerShell uses square borders and Consolas-safe icons automatically. Install a [Nerd Font](https://www.nerdfonts.com/) (face name must contain "Nerd") or set `[theme] icons = "nerd"` for the full icon set. Windows Terminal with Cascadia Mono is the best default host.
 
 ---
 

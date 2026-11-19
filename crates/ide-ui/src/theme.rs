@@ -6,18 +6,135 @@ mod theme_custom;
 pub use theme_custom::{create_custom_theme, customs, reload_customs, themes_dir, OwnedPalette};
 
 use ratatui::style::{Color, Modifier, Style};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use theme_custom::{active, find_custom, set_active};
 
-/// Nerd Font glyphs in the Database studio (default on; ASCII fallback when off).
-static ICONS: AtomicBool = AtomicBool::new(true);
+/// Which icon repertoire the host font can draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GlyphSet {
+    /// Nerd Font private-use glyphs (JetBrainsMono Nerd Font, etc.).
+    Nerd = 0,
+    /// Symbols that ship in Consolas / Cascadia (no private-use area).
+    Safe = 1,
+    /// Plain ASCII.
+    Ascii = 2,
+}
 
+/// What the active console font can actually render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontClass {
+    /// Face name looks like a Nerd Font.
+    Nerd,
+    /// Modern monospace with box-drawing, blocks, and rounded corners (Cascadia, JetBrains, …).
+    Modern,
+    /// Consolas, Lucida Console, raster — WGL4 only.
+    Legacy,
+    /// No face reported (not a Windows console, or the query failed).
+    Unknown,
+}
+
+static GLYPHS: AtomicU8 = AtomicU8::new(GlyphSet::Nerd as u8);
+static ROUNDED: AtomicBool = AtomicBool::new(true);
+static BLOCKS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_glyph_set(set: GlyphSet) {
+    GLYPHS.store(set as u8, Ordering::Relaxed);
+}
+
+pub fn glyph_set() -> GlyphSet {
+    match GLYPHS.load(Ordering::Relaxed) {
+        x if x == GlyphSet::Safe as u8 => GlyphSet::Safe,
+        x if x == GlyphSet::Ascii as u8 => GlyphSet::Ascii,
+        _ => GlyphSet::Nerd,
+    }
+}
+
+/// `true` keeps Nerd Font glyphs; `false` forces ASCII.
 pub fn set_icons(on: bool) {
-    ICONS.store(on, Ordering::Relaxed);
+    set_glyph_set(if on {
+        GlyphSet::Nerd
+    } else {
+        GlyphSet::Ascii
+    });
 }
 
 pub fn icons_on() -> bool {
-    ICONS.load(Ordering::Relaxed)
+    glyph_set() != GlyphSet::Ascii
+}
+
+pub fn set_rounded_borders(on: bool) {
+    ROUNDED.store(on, Ordering::Relaxed);
+}
+
+pub fn set_block_glyphs(on: bool) {
+    BLOCKS.store(on, Ordering::Relaxed);
+}
+
+pub fn block_glyphs() -> bool {
+    BLOCKS.load(Ordering::Relaxed)
+}
+
+/// Rounded corners need Cascadia / a Nerd Font. Consolas only has square box-drawing.
+pub fn border_type() -> ratatui::widgets::BorderType {
+    if ROUNDED.load(Ordering::Relaxed) {
+        ratatui::widgets::BorderType::Rounded
+    } else {
+        ratatui::widgets::BorderType::Plain
+    }
+}
+
+pub fn caret() -> &'static str {
+    if block_glyphs() { "▌" } else { "|" }
+}
+
+pub fn caret_char() -> char {
+    if block_glyphs() { '▌' } else { '|' }
+}
+
+/// Explorer / gutter selection bar. `▎` is missing from Consolas and becomes a wide tofu box.
+pub fn select_mark() -> &'static str {
+    if block_glyphs() { "▎" } else { "│" }
+}
+
+pub fn swatch() -> &'static str {
+    if block_glyphs() { "██" } else { "■■" }
+}
+
+/// Classify a Windows console face name. Empty means we could not read a face.
+pub fn classify_font(face: &str) -> FontClass {
+    let f = face.trim().to_lowercase();
+    if f.is_empty() {
+        return FontClass::Unknown;
+    }
+    if f.contains("nerd") || f.contains(" nf") || f.ends_with("nf") {
+        return FontClass::Nerd;
+    }
+    const MODERN: &[&str] = &[
+        "cascadia",
+        "jetbrains",
+        "fira",
+        "iosevka",
+        "hack",
+        "dejavu",
+        "source code",
+        "meslo",
+        "victor",
+        "intel one",
+        "recursive",
+        "monaspace",
+        "commit mono",
+        "geist mono",
+        "ibm plex mono",
+        "ubuntu mono",
+        "noto sans mono",
+        "sarasa",
+    ];
+    if MODERN.iter().any(|name| f.contains(name)) {
+        FontClass::Modern
+    } else {
+        FontClass::Legacy
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,4 +695,19 @@ pub fn syn_function() -> Color {
 }
 pub fn syn_ident() -> Color {
     active().syn_ident
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_class_matches_windows_faces() {
+        assert_eq!(classify_font(""), FontClass::Unknown);
+        assert_eq!(classify_font("Consolas"), FontClass::Legacy);
+        assert_eq!(classify_font("Lucida Console"), FontClass::Legacy);
+        assert_eq!(classify_font("Cascadia Mono"), FontClass::Modern);
+        assert_eq!(classify_font("JetBrainsMono Nerd Font"), FontClass::Nerd);
+        assert_eq!(classify_font("FiraCode NF"), FontClass::Nerd);
+    }
 }

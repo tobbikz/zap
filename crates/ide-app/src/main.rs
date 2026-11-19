@@ -1,6 +1,7 @@
 //! Zap — keyboard-first Database IDE for the terminal (explorer · SQL · results).
 
 mod app;
+mod host;
 
 use anyhow::Result;
 use std::path::PathBuf;

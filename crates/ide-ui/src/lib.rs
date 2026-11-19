@@ -33,7 +33,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTone {
@@ -1064,7 +1064,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                         .iter()
                         .find(|s| s.id == e.source_id)
                         .map(|s| icons::driver(s.driver))
-                        .unwrap_or(icons::DATABASE)
+                        .unwrap_or(icons::database())
                 } else {
                     icons::node(&e.kind)
                 };
@@ -1102,7 +1102,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 };
                 let inner_w = area.width.saturating_sub(2) as usize;
                 // Selection cue: accent bar ▎ (DataRig-like) instead of reverse-video wash.
-                let mark = if selected { "▎" } else { " " };
+                let mark = if selected { theme::select_mark() } else { " " };
                 let glyph_part = if matches!(e.kind, DbNodeKind::Source) {
                     format!("● {glyph} ")
                 } else {
@@ -1174,7 +1174,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(theme::border_type())
                 .title(Span::styled(title, theme::style_title(focused)))
                 .border_style(Style::default().fg(border))
                 .style(Style::default().bg(theme::bg())),
@@ -1329,7 +1329,7 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(theme::border_type())
                 .title(Span::styled(title, theme::style_title(focused)))
                 .border_style(Style::default().fg(border))
                 .style(Style::default().bg(theme::bg())),
@@ -1352,7 +1352,7 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let title = if focused { " Console " } else { " console " };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(theme::border_type())
         .title(Span::styled(title, theme::style_title(focused)))
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(theme::bg()));
@@ -1393,7 +1393,7 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                             .add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
-                        "▌",
+                        theme::caret(),
                         Style::default().fg(conn_accent).bg(theme::surface_2()),
                     ));
                 } else {
@@ -1498,7 +1498,7 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         } else {
             theme::faint()
         };
-        let bar = if on_cursor { "▎" } else { " " };
+        let bar = if on_cursor { theme::select_mark() } else { " " };
         let mut spans = vec![
             Span::styled(bar.to_string(), Style::default().fg(theme::accent())),
             Span::styled(
@@ -1590,42 +1590,23 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
 }
 
-/// File/folder glyphs (Nerd Font / Unicode). Needs a Nerd Font in the host terminal
-/// (e.g. JetBrainsMono Nerd Font). ASCII twist stays single-width.
+/// File/folder glyph plus a tint. The glyph itself follows the host font (Nerd / safe / ASCII).
 fn file_tree_icon(name: &str, is_dir: bool, expanded: bool) -> (&'static str, Color) {
-    // Devicon / Nerd Font PUA — host terminal needs a Nerd Font (JetBrainsMono NF, etc.).
+    let icon = icons::file(name, is_dir, expanded);
     if is_dir {
-        let icon = if expanded { "\u{e5fe}" } else { "\u{e5ff}" }; // folder-open / folder
         return (icon, theme::muted());
     }
     let lower = name.to_ascii_lowercase();
-    let (icon, color) = match lower.as_str() {
-        "cargo.toml" | "cargo.lock" => ("\u{e7a8}", theme::text()),
-        "readme.md" | "license" | "license.md" => ("\u{f48a}", theme::muted()),
-        ".gitignore" | ".gitattributes" => ("\u{f1d3}", theme::faint()),
+    let color = match lower.as_str() {
+        "cargo.toml" | "cargo.lock" => theme::text(),
+        "readme.md" | "license" | "license.md" => theme::muted(),
+        ".gitignore" | ".gitattributes" => theme::faint(),
         _ => {
-            if let Some(ext) = lower.rsplit_once('.').map(|(_, e)| e) {
-                match ext {
-                    "rs" => ("\u{e7a8}", theme::text()),
-                    "toml" => ("\u{e6b2}", theme::muted()),
-                    "md" | "markdown" => ("\u{f48a}", theme::muted()),
-                    "json" | "jsonc" => ("\u{e60b}", theme::muted()),
-                    "yml" | "yaml" => ("\u{f481}", theme::muted()),
-                    "ts" | "tsx" => ("\u{e628}", theme::muted()),
-                    "js" | "jsx" | "mjs" => ("\u{e74e}", theme::muted()),
-                    "py" => ("\u{e73c}", theme::muted()),
-                    "go" => ("\u{e724}", theme::muted()),
-                    "lua" => ("\u{e620}", theme::muted()),
-                    "sh" | "bash" | "zsh" => ("\u{f489}", theme::muted()),
-                    "sql" => ("\u{e706}", theme::muted()),
-                    "html" | "htm" => ("\u{e736}", theme::muted()),
-                    "css" | "scss" => ("\u{e749}", theme::muted()),
-                    "svg" | "png" | "jpg" | "jpeg" | "webp" | "gif" => ("\u{f1c5}", theme::faint()),
-                    "lock" => ("\u{f023}", theme::faint()),
-                    _ => ("\u{f016}", theme::faint()),
-                }
-            } else {
-                ("\u{f016}", theme::faint())
+            let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            match ext {
+                "rs" => theme::text(),
+                "svg" | "png" | "jpg" | "jpeg" | "webp" | "gif" | "lock" => theme::faint(),
+                _ => theme::muted(),
             }
         }
     };
@@ -1641,9 +1622,9 @@ fn render_tree(frame: &mut Frame, area: Rect, ws: &Workspace, focused: bool) {
         .map(|(i, e)| {
             let twist = if e.is_dir {
                 if e.expanded {
-                    "▾"
+                    icons::chevron_down()
                 } else {
-                    "▸"
+                    icons::chevron_right()
                 }
             } else {
                 " "
@@ -1783,7 +1764,7 @@ fn render_git(frame: &mut Frame, area: Rect, git: Option<&GitState>, focused: bo
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(theme::border_type())
                 .title(Span::styled(title, theme::style_title(focused)))
                 .border_style(Style::default().fg(border))
                 .style(Style::default().bg(theme::bg())),
@@ -1870,7 +1851,11 @@ fn render_agents(
                 } else {
                     Style::default().fg(Color::Gray).bg(Color::Black)
                 };
-                let mark = if live { "▸" } else { " " };
+                let mark = if live {
+                    icons::chevron_right()
+                } else {
+                    " "
+                };
                 items.push(ListItem::new(Span::styled(
                     format!("{mark} {}", p.list_label()),
                     style,
@@ -2326,7 +2311,7 @@ fn render_bottom(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 fn filter_field_span(label: &str, value: &str, focused: bool, field_w: usize) -> Vec<Span<'static>> {
     let label_w = label.chars().count() + 1;
     let well_w = field_w.saturating_sub(label_w).max(4);
-    let empty = value.trim().is_empty() || value == "▌";
+    let empty = value.trim().is_empty() || value == theme::caret();
     let shown = if empty && !focused {
         truncate_chars("—", well_w)
     } else if value.chars().count() > well_w {
@@ -2361,12 +2346,12 @@ fn render_table_filter_bars(
 ) {
     let editing = ctx.ui.mode == Mode::EditTableFilter && ctx.ui.focus == Focus::Results;
     let where_val = if editing && ctx.ui.table_filter_field == TableFilterField::Where {
-        format!("{}▌", ctx.ui.table_filter_draft)
+        format!("{}{}", ctx.ui.table_filter_draft, theme::caret())
     } else {
         db.active_table_where().to_string()
     };
     let order_val = if editing && ctx.ui.table_filter_field == TableFilterField::OrderBy {
-        format!("{}▌", ctx.ui.table_filter_draft)
+        format!("{}{}", ctx.ui.table_filter_draft, theme::caret())
     } else {
         db.active_table_order_by().to_string()
     };
@@ -2422,7 +2407,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             Paragraph::new(Span::styled(" — ", theme::style_faint())).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(theme::border_type())
                     .title(Span::styled(
                         if focused { " Results " } else { " results " },
                         theme::style_title(focused),
@@ -2438,7 +2423,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let Some(result) = &db.last_result else {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(theme::border_type())
             .title(Span::styled(
                 if focused { " Results " } else { " results " },
                 theme::style_title(focused),
@@ -2518,7 +2503,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(theme::border_type())
         .title(Span::styled(
             title,
             theme::style_title(focused),
@@ -2652,7 +2637,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             let col_name = result.columns.get(ci).map(|s| s.as_str()).unwrap_or("");
             let mut t = if is_cursor && editing {
                 let mut draft = ctx.ui.cell_edit_input.clone();
-                draft.push('▌');
+                draft.push(theme::caret_char());
                 // Keep the end of the draft visible while editing long values.
                 while display_width(&draft) > w && !draft.is_empty() {
                     draft = draft.chars().skip(1).collect();
@@ -2707,7 +2692,11 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
     let h_hint = if ncols > col_indices.len() || h_scrolled {
         let left = if col_start > pinned { "◀ " } else { "" };
-        let right = if col_end < ncols { " ▶" } else { "" };
+        let right = if col_end < ncols {
+            format!(" {}", icons::chevron_right())
+        } else {
+            String::new()
+        };
         format!("  {left}{}–{}/{ncols}{right}", col_start + 1, col_end.max(1))
     } else {
         String::new()
@@ -2995,7 +2984,7 @@ fn render_filter_column_popup(frame: &mut Frame, screen: Rect, ui: &UiState) {
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(theme::border_type())
                 .border_style(Style::default().fg(theme::border_idle()))
                 .style(Style::default().bg(theme::surface()))
                 .title(Span::styled(
@@ -3201,7 +3190,7 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(theme::border_type())
             .border_style(Style::default().fg(theme::text()))
             .style(Style::default().bg(theme::surface_2())),
         area,
@@ -3436,7 +3425,7 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(theme::border_type())
         .border_style(Style::default().fg(theme::accent()))
         .style(Style::default().bg(theme::modal()))
         .title(Span::styled(
@@ -3569,7 +3558,7 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(theme::border_type())
                     .title(Span::styled(title, theme::style_title(true)))
                     .border_style(Style::default().fg(theme::border_idle()))
                     .style(Style::default().bg(theme::surface())),
@@ -4305,7 +4294,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(theme::border_type())
             .border_style(Style::default().fg(border))
             .style(Style::default().bg(theme::surface())),
         area,
@@ -4602,7 +4591,7 @@ fn modal_cell_lines(
         .unwrap_or_else(|| "?".into());
     let source = cells.get(col_i).map(|s| s.as_str()).unwrap_or("");
     let raw = if editing {
-        format!("{draft}▌")
+        format!("{draft}{}", theme::caret())
     } else {
         source.to_string()
     };
@@ -4937,7 +4926,7 @@ fn modal_row_lines(
         let cell = cells.get(ci).map(|s| s.as_str()).unwrap_or("");
         // One-line preview — Enter opens Cell for the full body.
         let value = if is_sel && editing {
-            format!("{draft}▌")
+            format!("{draft}{}", theme::caret())
         } else {
             let one = cell.lines().next().unwrap_or(cell);
             let preview = truncate_display(one, value_w.saturating_sub(1).max(4));
@@ -5012,7 +5001,7 @@ fn modal_plan_lines(db: &DbWorkspace, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     for l in visual.lines() {
         let shown = truncate_chars(l, width.saturating_sub(2));
-        let style = if l.contains('█') || l.contains('▓') {
+        let style = if l.contains('█') || l.contains('▓') || l.contains('■') {
             theme::style_accent()
         } else if l.starts_with('═') || l.contains("Timeline") || l.contains("Icicle") || l.contains("Funnel") {
             theme::style_text().add_modifier(Modifier::BOLD)
@@ -5059,7 +5048,7 @@ fn modal_chart_lines(
             let is_cursor = l.contains(&cursor_tag);
             let style = if is_cursor {
                 theme::style_selected()
-            } else if l.contains('█') || l.contains('▁') || l.contains("Spark") {
+            } else if l.contains('█') || l.contains('■') || l.contains('▁') || l.contains("Spark") {
                 theme::style_accent()
             } else {
                 theme::style_text()
@@ -5128,7 +5117,7 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(theme::border_type())
             .border_style(Style::default().fg(theme::border_focus()))
             .style(Style::default().bg(theme::surface())),
         area,
@@ -5486,7 +5475,7 @@ fn render_db_monitor(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(theme::border_type())
             .title(Line::from(Span::styled(
                 " monitor · latency ",
                 theme::style_title(true),
@@ -5613,18 +5602,21 @@ fn console_toolbar_spans(
     width: u16,
 ) -> Vec<Span<'static>> {
     let run = if running {
-        Span::styled(" ● running  Esc ", theme::style_warn())
+        Span::styled(
+            format!(" {} running  Esc ", icons::busy_glyph()),
+            theme::style_warn(),
+        )
     } else {
         Span::styled(
-            " ▶ F5 ",
+            format!(" {} F5 ", icons::run_glyph()),
             Style::default()
                 .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         )
     };
     let sep = Span::styled(" · ", theme::style_faint());
-    let db_chip = format!("{db_label} ▾");
-    let schema_chip = format!("{schema_label} ▾");
+    let db_chip = format!("{db_label} {}", icons::chevron_down());
+    let schema_chip = format!("{schema_label} {}", icons::chevron_down());
     let lim_chip = format!("lim {lim}");
 
     let chip = |label: String| {
@@ -5664,7 +5656,10 @@ fn console_toolbar_spans(
             return c;
         }
     }
-    vec![Span::styled(" ▶ F5 ", theme::style_accent())]
+    vec![Span::styled(
+        format!(" {} F5 ", icons::run_glyph()),
+        theme::style_accent(),
+    )]
 }
 
 /// Drop whole ` · `-separated tokens from the right before mid-glyph ellipsis.

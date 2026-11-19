@@ -53,4 +53,19 @@ Config:
 ```toml
 [theme]
 name = "mytheme"
+# auto | nerd | safe | ascii   (true/false still work)
+icons = "auto"
 ```
+
+## Icons
+
+`auto` picks a repertoire the host font can draw:
+
+| Host | Icons | Borders | Caret |
+|------|--------|---------|--------|
+| Linux / macOS | Nerd Font | rounded | block `▌` |
+| Windows + Nerd Font face | Nerd Font | rounded | block |
+| Windows Terminal (Cascadia) | Consolas-safe (`● ▪ ▶`) | rounded | block |
+| Windows PowerShell (Consolas) | Consolas-safe | square `┌┐` | vertical bar |
+
+Override with `icons` or the `ZAP_ICONS` environment variable (`nerd`, `safe`, `ascii`).

@@ -251,7 +251,7 @@ fn render_bar(col: &str, labels: &[String], values: &[f64]) -> String {
     let mut out = format!("Bar chart · {col}\n");
     for (i, v) in values.iter().take(16).enumerate() {
         let n = (((v - min) / span) * 28.0).round() as usize;
-        let bar: String = std::iter::repeat('█').take(n).collect();
+        let bar: String = std::iter::repeat(crate::draw_glyphs::bar()).take(n).collect();
         let lab = labels.get(i).map(|s| s.as_str()).unwrap_or("?");
         out.push_str(&format!(" {lab:>12} │{bar:<28} {v:.4}\n"));
     }
@@ -259,7 +259,7 @@ fn render_bar(col: &str, labels: &[String], values: &[f64]) -> String {
 }
 
 fn render_line(col: &str, labels: &[String], values: &[f64]) -> String {
-    let spark = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let spark = crate::draw_glyphs::spark();
     let min = values.iter().copied().fold(f64::INFINITY, f64::min);
     let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let span = (max - min).abs().max(f64::EPSILON);

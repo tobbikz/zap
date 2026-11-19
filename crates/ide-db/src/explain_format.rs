@@ -110,7 +110,7 @@ pub fn explain_visual_ascii(text: &str) -> String {
     out.push_str("Timeline (relative actual/cost):\n");
     for (depth, node, t) in &timed {
         let bar_n = ((*t / max_t) * 28.0).round() as usize;
-        let bar: String = std::iter::repeat('█').take(bar_n).collect();
+        let bar: String = std::iter::repeat(crate::draw_glyphs::bar()).take(bar_n).collect();
         let pad = "│ ".repeat(*depth);
         out.push_str(&format!(" {pad}├─ {node:<32} {bar:<28} {t:.3}\n"));
     }
@@ -134,7 +134,7 @@ pub fn explain_visual_ascii(text: &str) -> String {
     let max_c = by_depth.values().copied().max().unwrap_or(1).max(1);
     for (d, c) in by_depth {
         let n = ((c as f64 / max_c as f64) * 24.0).round() as usize;
-        let wedge: String = std::iter::repeat('▓').take(n.max(1)).collect();
+        let wedge: String = std::iter::repeat(crate::draw_glyphs::shade()).take(n.max(1)).collect();
         out.push_str(&format!("  d{d}: {wedge} ({c})\n"));
     }
     out

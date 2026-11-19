@@ -3,6 +3,7 @@
 //! Drivers: PostgreSQL (primary), MySQL, SQLite, MSSQL, ClickHouse, DuckDB, Redis, MongoDB, …
 
 mod alt_engines;
+mod draw_glyphs;
 mod brain_ask;
 mod engines;
 mod er_canvas;
@@ -38,6 +39,7 @@ pub use persona::{
     post_health_webhook, privilege_audit_sql, quality_strip, recipe_gallery, signed_pack_export,
     studio_help_personas, bi_deep_link, airflow_deep_link, model_registry_link, PersonaConfig,
 };
+pub use draw_glyphs::set_rich_blocks;
 pub use explain_format::{explain_visual_ascii, postgres_explain_grid};
 pub use result_chart::{chart_kind, chart_result, latency_sparkline, selection_stats};
 pub use schema_cache::{expecting_relation, SchemaNameCache, SqlCompletionItem};

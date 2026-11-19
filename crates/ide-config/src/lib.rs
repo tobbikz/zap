@@ -1,7 +1,8 @@
 //! User config: languages, theme, keymaps.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::Deserializer;
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -111,6 +112,54 @@ impl Default for DatabaseConfig {
     }
 }
 
+/// Icon repertoire. `auto` follows the host font (Consolas-safe on Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IconPref {
+    #[default]
+    Auto,
+    Nerd,
+    Safe,
+    Ascii,
+}
+
+impl IconPref {
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "nerd" | "nf" | "on" | "true" => Self::Nerd,
+            "safe" | "windows" | "unicode" => Self::Safe,
+            "ascii" | "off" | "false" | "none" => Self::Ascii,
+            _ => Self::Auto,
+        }
+    }
+}
+
+impl Serialize for IconPref {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Auto => "auto",
+            Self::Nerd => "nerd",
+            Self::Safe => "safe",
+            Self::Ascii => "ascii",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for IconPref {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Str(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(true) => Ok(Self::Nerd),
+            Raw::Bool(false) => Ok(Self::Ascii),
+            Raw::Str(s) => Ok(Self::parse(&s)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeConfig {
     #[serde(default = "default_theme_name")]
@@ -119,6 +168,10 @@ pub struct ThemeConfig {
     pub status_bg: String,
     #[serde(default)]
     pub accent: String,
+    /// `auto` (default), `nerd`, `safe`, or `ascii`. `true`/`false` still work.
+    /// On Windows, `auto` uses Consolas-safe glyphs unless the console font is a Nerd Font.
+    #[serde(default)]
+    pub icons: IconPref,
 }
 
 fn default_theme_name() -> String {
@@ -132,6 +185,7 @@ impl Default for ThemeConfig {
             name: default_theme_name(),
             status_bg: "#000000".into(),
             accent: "mono".into(),
+            icons: IconPref::Auto,
         }
     }
 }
@@ -348,5 +402,27 @@ impl IdeConfig {
         std::fs::write(&path, text)
             .with_context(|| format!("write config {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_pref_accepts_bool_and_string() {
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default)]
+            icons: IconPref,
+        }
+        let off: Wrap = toml::from_str("icons = false").unwrap();
+        assert_eq!(off.icons, IconPref::Ascii);
+        let on: Wrap = toml::from_str("icons = true").unwrap();
+        assert_eq!(on.icons, IconPref::Nerd);
+        let safe: Wrap = toml::from_str("icons = \"safe\"").unwrap();
+        assert_eq!(safe.icons, IconPref::Safe);
+        let missing: Wrap = toml::from_str("").unwrap();
+        assert_eq!(missing.icons, IconPref::Auto);
     }
 }
