@@ -10,7 +10,7 @@ Built-ins (palette: `Ctrl-P` → type `theme`):
 |----|--------|
 | `black` | AMOLED mono |
 | `white` | AMOLED light mono |
-| `dark` | Dark (default) |
+| `dark` | Dark (default — DataRig teal accent) |
 | `nord` | Nord |
 | `catppuccin-mocha` | Catppuccin Mocha |
 | `tokyo-night` | Tokyo Night |

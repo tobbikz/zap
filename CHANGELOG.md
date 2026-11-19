@@ -2,9 +2,25 @@
 
 ## Unreleased
 
+## [0.6.2] - 2026-11-19
+
 ### Added
 
 - TUI design language port from Hop: tuile `Role` tokens, footer key chips, jackin L0 fill, opaque modal scrim, restrained busy spinner (`ZAP_ANIMATIONS=0` to disable). Multi-theme DataRig palettes stay unlocked. See [docs/TUI-DESIGN.md](docs/TUI-DESIGN.md).
+- Inspect Chart keyboard controls: `c` cycles bar/line/pie, `[` `]` adjusts visible rows.
+
+### Changed
+
+- Default `dark` theme retuned to DataRig’s teal accent / quiet borders / selection tints; Studio panes, Console Run chip, active tabs, and Results cursor follow that chrome.
+- Console F5 chip: filled accent when Console is focused, accent-ink when idle.
+- Results: no row-index gutter; caret is a solid cell block; `where` / `order` use accent labels with brackets; cell peek shows value only.
+- Inspect modal: quieter chrome, rail + value-only selection (no full-width wash).
+- Charts: cleaner spark/bars; kind and depth are controllable from Inspect → Chart.
+
+### Fixed
+
+- AMOLED `black`/`white` restored to a pure canvas (no grey pane/toolbar wash); invert selection stays readable. DataRig surface hierarchy applies to chromatic themes only.
+- Results/F5 accent fills only when the accent is chromatic — mono no longer washes to white-on-white.
 
 ## [0.6.1] - 2026-11-18
 

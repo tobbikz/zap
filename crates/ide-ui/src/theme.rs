@@ -173,18 +173,18 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color {
 
 /// Built-ins (DataRig-inspired names + AMOLED mono).
 pub static PALETTES: &[Palette] = &[
-    // 0 — AMOLED mono (legacy default)
+    // 0 — AMOLED mono: pure black canvas; no grey panel wash (DataRig surfaces stay on `dark`+)
     Palette {
         id: "black",
         label: "AMOLED mono",
         light: false,
         bg: rgb(0, 0, 0),
-        surface: rgb(10, 10, 10),
-        surface_2: rgb(18, 18, 18),
-        surface_3: rgb(26, 26, 26),
-        modal: rgb(22, 22, 22),
+        surface: rgb(0, 0, 0),
+        surface_2: rgb(0, 0, 0),
+        surface_3: rgb(0, 0, 0), // selection uses invert — not a grey step
+        modal: rgb(0, 0, 0),
         border_idle: rgb(42, 42, 42),
-        border_focus: rgb(200, 200, 200),
+        border_focus: rgb(220, 220, 220),
         text: rgb(230, 230, 230),
         muted: rgb(140, 140, 140),
         faint: rgb(90, 90, 90),
@@ -207,9 +207,9 @@ pub static PALETTES: &[Palette] = &[
         label: "AMOLED light mono",
         light: true,
         bg: rgb(255, 255, 255),
-        surface: rgb(250, 250, 250),
-        surface_2: rgb(242, 242, 242),
-        surface_3: rgb(230, 230, 230),
+        surface: rgb(255, 255, 255),
+        surface_2: rgb(255, 255, 255),
+        surface_3: rgb(255, 255, 255),
         modal: rgb(255, 255, 255),
         border_idle: rgb(210, 210, 210),
         border_focus: rgb(40, 40, 40),
@@ -229,33 +229,33 @@ pub static PALETTES: &[Palette] = &[
         syn_function: rgb(40, 40, 40),
         syn_ident: rgb(30, 30, 30),
     },
-    // 2 — DataRig-like dark (subtle blue accent)
+    // 2 — DataRig dark (teal accent) — values from DokaDev/datarig `DARK`
     Palette {
         id: "dark",
         label: "Dark",
         light: false,
-        bg: rgb(16, 18, 22),
-        surface: rgb(24, 26, 32),
-        surface_2: rgb(32, 35, 42),
-        surface_3: rgb(40, 44, 52),
-        modal: rgb(28, 31, 38),
-        border_idle: rgb(48, 52, 62),
-        border_focus: rgb(137, 180, 250),
-        text: rgb(205, 214, 244),
-        muted: rgb(147, 153, 178),
-        faint: rgb(88, 91, 112),
-        accent: rgb(137, 180, 250),
-        accent_warm: rgb(249, 226, 175),
-        warn: rgb(249, 226, 175),
-        danger: rgb(243, 139, 168),
-        success: rgb(166, 227, 161),
-        info: rgb(137, 220, 235),
-        syn_keyword: rgb(203, 166, 247),
-        syn_string: rgb(166, 227, 161),
-        syn_number: rgb(250, 179, 135),
-        syn_comment: rgb(108, 112, 134),
-        syn_function: rgb(137, 180, 250),
-        syn_ident: rgb(205, 214, 244),
+        bg: rgb(0x14, 0x16, 0x1B),
+        surface: rgb(0x1B, 0x1E, 0x25),
+        surface_2: rgb(0x20, 0x24, 0x2C),
+        surface_3: rgb(0x2A, 0x3B, 0x4D), // selection / grid cursor cell
+        modal: rgb(0x1B, 0x1E, 0x25),
+        border_idle: rgb(0x2E, 0x34, 0x40),
+        border_focus: rgb(0x4F, 0xB3, 0xA9),
+        text: rgb(0xD8, 0xDE, 0xE9),
+        muted: rgb(0x8A, 0x93, 0xA6),
+        faint: rgb(0x5C, 0x65, 0x77),
+        accent: rgb(0x4F, 0xB3, 0xA9),
+        accent_warm: rgb(0xE0, 0xA9, 0x6D),
+        warn: rgb(0xE6, 0xC3, 0x5C),
+        danger: rgb(0xE0, 0x6C, 0x75),
+        success: rgb(0x8F, 0xC7, 0x7A),
+        info: rgb(0x61, 0xAF, 0xEF),
+        syn_keyword: rgb(0xC7, 0x92, 0xEA),
+        syn_string: rgb(0x9C, 0xCB, 0x85),
+        syn_number: rgb(0xE0, 0xA9, 0x6D),
+        syn_comment: rgb(0x5C, 0x65, 0x77),
+        syn_function: rgb(0x6F, 0xA8, 0xDC),
+        syn_ident: rgb(0xD8, 0xDE, 0xE9),
     },
     // 2 — Nord
     Palette {
@@ -514,6 +514,37 @@ fn light() -> bool {
     active().light
 }
 
+/// AMOLED black/white — pure canvas, invert selection; no DataRig grey hierarchy.
+pub fn is_mono() -> bool {
+    matches!(active().id.as_str(), "black" | "white")
+}
+
+/// Pane / toolbar fill: pure `bg` on mono, L1 `surface` on chromatic themes.
+pub fn pane_fill() -> Color {
+    if is_mono() {
+        bg()
+    } else {
+        surface()
+    }
+}
+
+/// Soft wash behind chips/tabs — skipped on mono so the bar stays true black/white.
+pub fn chrome_wash() -> Color {
+    if is_mono() {
+        bg()
+    } else {
+        surface_2()
+    }
+}
+
+/// Classic AMOLED selection: invert body ink onto the canvas (never a grey slab).
+fn style_mono_invert() -> Style {
+    Style::default()
+        .fg(bg())
+        .bg(text())
+        .add_modifier(Modifier::BOLD)
+}
+
 pub fn bg() -> Color {
     active().bg
 }
@@ -622,15 +653,95 @@ pub fn style_title(focused: bool) -> Style {
         Style::default()
             .fg(accent())
             .add_modifier(Modifier::BOLD)
-    } else {
+    } else if is_mono() {
         Style::default().fg(muted())
+    } else {
+        // DataRig chromatic: quieter idle titles.
+        Style::default().fg(faint())
     }
 }
 pub fn style_selected() -> Style {
-    // Soft row selection (Explorer / lists) — never a full reverse-video wash.
+    if is_mono() {
+        style_mono_invert()
+    } else {
+        // Soft row selection (Explorer / lists) — never a full reverse-video wash.
+        Style::default()
+            .fg(text())
+            .bg(surface_3())
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Results grid: whole cursor row — selection tint so the row is obvious.
+pub fn style_grid_cursor_row() -> Style {
+    if is_mono() {
+        style_mono_invert()
+    } else {
+        Style::default().bg(surface_3()).fg(text())
+    }
+}
+
+/// Results grid: focused cell — solid “cuadrado” (accent fill or AMOLED invert).
+pub fn style_grid_cursor_cell() -> Style {
+    if accent_fill_safe() {
+        Style::default()
+            .fg(contrast_on(accent()))
+            .bg(accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        style_mono_invert()
+    }
+}
+
+/// Results header cell for the cursor column (DataRig `grid_cursor_header`).
+pub fn style_grid_cursor_header() -> Style {
+    if is_mono() {
+        // Bold only — the shared rule under the header is enough (no double underline).
+        Style::default()
+            .fg(text())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(accent())
+            .bg(surface_2())
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Active console / results tab fill (DataRig `tab_active` — accent blended into bg).
+pub fn style_tab_active() -> Style {
+    if is_mono() {
+        style_mono_invert()
+    } else {
+        Style::default()
+            .fg(text())
+            .bg(surface_3())
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Quiet toolbar chip (db / schema / lim).
+pub fn style_chip() -> Style {
+    Style::default().fg(muted()).bg(chrome_wash())
+}
+
+/// Run chip when Console is focused — filled accent when safe; mono uses inverted chip.
+pub fn style_chip_run() -> Style {
+    if accent_fill_safe() {
+        Style::default()
+            .fg(contrast_on(accent()))
+            .bg(accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        style_mono_invert()
+    }
+}
+
+/// Run chip when Console is idle — accent ink on surface (quiet “off” state).
+pub fn style_chip_run_idle() -> Style {
     Style::default()
-        .fg(text())
-        .bg(surface_3())
+        .fg(if accent_fill_safe() { accent() } else { muted() })
+        .bg(chrome_wash())
         .add_modifier(Modifier::BOLD)
 }
 
@@ -650,6 +761,24 @@ pub fn style_pill_on(bg_c: Color) -> Style {
 pub fn style_pill_off() -> Style {
     Style::default().fg(muted()).bg(surface_2())
 }
+
+/// Studio pane block — L1 surface on chromatic themes; pure `bg` on AMOLED mono.
+pub fn pane_block(title: impl Into<String>, focused: bool) -> ratatui::widgets::Block<'static> {
+    use ratatui::widgets::{Block, Borders};
+    let raw: String = title.into();
+    // Breath around the title label (DataRig-style air).
+    let title = if raw.starts_with(' ') || raw.is_empty() {
+        raw
+    } else {
+        format!(" {raw} ")
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type())
+        .title(ratatui::text::Span::styled(title, style_title(focused)))
+        .border_style(Style::default().fg(border(focused)))
+        .style(Style::default().bg(pane_fill()))
+}
 pub fn border(focused: bool) -> Color {
     if focused {
         border_focus()
@@ -658,24 +787,41 @@ pub fn border(focused: bool) -> Color {
     }
 }
 
-/// Pick readable fg for a filled chip (light/dark heuristic).
-fn contrast_on(bg_c: Color) -> Color {
-    match bg_c {
+/// True when `accent` is chromatic enough to use as a solid fill (not near-grey mono).
+fn accent_fill_safe() -> bool {
+    match accent() {
         Color::Rgb(r, g, b) => {
-            let lum = (u16::from(r) * 299 + u16::from(g) * 587 + u16::from(b) * 114) / 1000;
-            if lum > 140 {
-                Color::Rgb(16, 16, 16)
-            } else {
-                Color::Rgb(245, 245, 245)
-            }
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            // Chroma: teal/blue/etc. have spread; AMOLED mono accents are near-grey.
+            max.saturating_sub(min) >= 28
+        }
+        _ => true,
+    }
+}
+
+fn luminance(c: Color) -> u16 {
+    match c {
+        Color::Rgb(r, g, b) => {
+            (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000
         }
         _ => {
             if light() {
-                Color::White
+                240
             } else {
-                Color::Black
+                20
             }
         }
+    }
+    .min(255) as u16
+}
+
+/// Pick readable fg for a filled chip (light/dark heuristic).
+fn contrast_on(bg_c: Color) -> Color {
+    if luminance(bg_c) > 140 {
+        Color::Rgb(16, 16, 16)
+    } else {
+        Color::Rgb(245, 245, 245)
     }
 }
 
@@ -780,5 +926,36 @@ mod tests {
         set_mode_name("dark");
         let s = Role::Selection.style();
         assert_eq!(s.bg, Some(surface_3()));
+    }
+
+    #[test]
+    fn amoled_black_is_pure_canvas() {
+        set_mode_name("black");
+        assert!(is_mono());
+        assert_eq!(bg(), surface());
+        assert_eq!(pane_fill(), bg());
+        assert_eq!(chrome_wash(), bg());
+        // Selection inverts — no grey slab.
+        let s = style_selected();
+        assert_eq!(s.bg, Some(text()));
+        assert_eq!(s.fg, Some(bg()));
+    }
+
+    #[test]
+    fn grid_cursor_cell_readable_on_amoled_black() {
+        set_mode_name("black");
+        let s = style_grid_cursor_cell();
+        // Invert: dark ink on light bar (accent==text on mono — that's fine).
+        assert_eq!(s.bg, Some(text()));
+        assert_eq!(s.fg, Some(bg()));
+        assert_ne!(s.fg, s.bg);
+    }
+
+    #[test]
+    fn grid_cursor_cell_accent_fill_on_datarig_dark() {
+        set_mode_name("dark");
+        assert!(!is_mono());
+        let s = style_grid_cursor_cell();
+        assert_eq!(s.bg, Some(accent()));
     }
 }

@@ -117,6 +117,10 @@ pub struct UiState {
     pub cell_modal_tab: usize,
     /// Enter on a Row field → full Cell view; Esc returns to the active tab.
     pub cell_modal_drill: bool,
+    /// Inspect Chart: 0 bar · 1 line · 2 pie (`c` cycles).
+    pub chart_kind: usize,
+    /// Inspect Chart: how many bar/pie rows to show (`[` `]`).
+    pub chart_limit: usize,
     /// Sticky H-scroll start for unpinned Results columns (updated on ←/→).
     pub results_col_window: usize,
     /// Sparkline/latency monitor overlay.
@@ -245,6 +249,8 @@ impl Default for UiState {
             cell_modal: false,
             cell_modal_tab: 0,
             cell_modal_drill: false,
+            chart_kind: 0,
+            chart_limit: 12,
             results_col_window: 0,
             db_monitor: false,
             admin_modal: false,
@@ -1082,14 +1088,17 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 let accent = src
                     .map(|s| parse_accent_color(&s.accent))
                     .unwrap_or(color);
-                let row_bg = if selected {
-                    theme::surface_3()
+                let (row_fg, row_bg) = if selected && theme::is_mono() {
+                    // AMOLED: invert — grey slab on pure black reads as “dirty”, not mono.
+                    (theme::bg(), theme::text())
+                } else if selected {
+                    (theme::text(), theme::surface_3())
                 } else {
-                    theme::bg()
+                    (theme::text(), theme::bg())
                 };
                 let glyph_style = if selected {
                     Style::default()
-                        .fg(accent)
+                        .fg(if theme::is_mono() { row_fg } else { accent })
                         .bg(row_bg)
                         .add_modifier(Modifier::BOLD)
                 } else if matches!(e.kind, DbNodeKind::Source) {
@@ -1099,7 +1108,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 };
                 let label_style = if selected {
                     Style::default()
-                        .fg(theme::text())
+                        .fg(row_fg)
                         .bg(row_bg)
                         .add_modifier(Modifier::BOLD)
                 } else if matches!(e.kind, DbNodeKind::Source) {
@@ -1108,8 +1117,12 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     Style::default().fg(theme::text())
                 };
                 let inner_w = area.width.saturating_sub(2) as usize;
-                // Selection cue: accent bar ▎ (DataRig-like) instead of reverse-video wash.
-                let mark = if selected { theme::select_mark() } else { " " };
+                // Chromatic: accent bar ▎. AMOLED: invert row (no grey wash).
+                let mark = if selected && !theme::is_mono() {
+                    theme::select_mark()
+                } else {
+                    " "
+                };
                 let glyph_part = if matches!(e.kind, DbNodeKind::Source) {
                     format!("● {glyph} ")
                 } else {
@@ -1178,16 +1191,10 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
     };
     let title = if focused { " Explorer " } else { " explorer " };
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(theme::border_type())
-                .title(Span::styled(title, theme::style_title(focused)))
-                .border_style(Style::default().fg(border))
-                .style(Style::default().bg(theme::bg())),
-        ),
+        List::new(items).block(theme::pane_block(title, focused)),
         area,
     );
+    let _ = border;
 }
 
 fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focused: bool) {
@@ -1333,16 +1340,10 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
         ),
     };
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(theme::border_type())
-                .title(Span::styled(title, theme::style_title(focused)))
-                .border_style(Style::default().fg(border))
-                .style(Style::default().bg(theme::bg())),
-        ),
+        List::new(items).block(theme::pane_block(title, focused)),
         area,
     );
+    let _ = border;
     if let (Some(strip_area), Some(text)) = (strip_area, strip) {
         let shown = truncate_chars(&text, strip_area.width as usize);
         frame.render_widget(
@@ -1355,14 +1356,8 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
 
 fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let focused = ctx.ui.focus == Focus::Editor;
-    let border = theme::border(focused);
     let title = if focused { " Console " } else { " console " };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(theme::border_type())
-        .title(Span::styled(title, theme::style_title(focused)))
-        .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme::bg()));
+    let block = theme::pane_block(title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1392,19 +1387,14 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     format!(" {title} ")
                 };
                 if active {
-                    spans.push(Span::styled(
-                        label,
-                        Style::default()
-                            .fg(theme::text())
-                            .bg(theme::surface_2())
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                    // DataRig tab_active — accent-tinted fill, caret in connection accent.
+                    spans.push(Span::styled(label, theme::style_tab_active()));
                     spans.push(Span::styled(
                         theme::caret(),
-                        Style::default().fg(conn_accent).bg(theme::surface_2()),
+                        Style::default().fg(conn_accent).bg(theme::surface_3()),
                     ));
                 } else {
-                    spans.push(Span::styled(label, theme::style_muted()));
+                    spans.push(Span::styled(label, theme::Role::Muted.style()));
                 }
             }
             frame.render_widget(
@@ -1456,9 +1446,16 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             0 => "off".into(),
             n => n.to_string(),
         };
-        let spans = console_toolbar_spans(running, &db_label, &schema_label, &lim, inner.width);
+        let spans = console_toolbar_spans(
+            running,
+            focused,
+            &db_label,
+            &schema_label,
+            &lim,
+            inner.width,
+        );
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::surface_2())),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::chrome_wash())),
             Rect {
                 x: inner.x,
                 y,
@@ -2316,32 +2313,52 @@ fn render_bottom(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 }
 
 fn filter_field_span(label: &str, value: &str, focused: bool, field_w: usize) -> Vec<Span<'static>> {
+    // "where [ … ]" — label + brackets stay visible even on AMOLED (no grey wash needed).
+    let chrome = 4usize; // " [ ]"
     let label_w = label.chars().count() + 1;
-    let well_w = field_w.saturating_sub(label_w).max(4);
+    let well_w = field_w.saturating_sub(label_w + chrome).max(4);
     let empty = value.trim().is_empty() || value == theme::caret();
-    let shown = if empty && !focused {
+    let inner = if empty && !focused {
         truncate_chars("—", well_w)
     } else if value.chars().count() > well_w {
         truncate_chars(value, well_w)
     } else {
-        format!("{value}{}", " ".repeat(well_w.saturating_sub(value.chars().count())))
+        format!(
+            "{value}{}",
+            " ".repeat(well_w.saturating_sub(value.chars().count()))
+        )
     };
-    let well = if focused {
-        Style::default()
-            .fg(theme::bg())
-            .bg(theme::text())
-            .add_modifier(Modifier::BOLD)
+    let (bracket, well) = if focused {
+        (
+            Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        )
     } else if empty {
-        Style::default().fg(theme::faint()).bg(theme::surface_2())
+        (
+            Style::default().fg(theme::muted()),
+            Style::default().fg(theme::muted()),
+        )
     } else {
-        Style::default().fg(theme::text()).bg(theme::surface_2())
+        (
+            Style::default().fg(theme::accent()),
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        )
     };
     vec![
         Span::styled(
             format!("{label} "),
-            theme::style_faint(),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(shown, well),
+        Span::styled("[", bracket),
+        Span::styled(inner, well),
+        Span::styled("]", bracket),
     ]
 }
 
@@ -2411,32 +2428,21 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let border = theme::border(focused);
     let Some(db) = ctx.db else {
         frame.render_widget(
-            Paragraph::new(Span::styled(" — ", theme::style_faint())).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(theme::border_type())
-                    .title(Span::styled(
-                        if focused { " Results " } else { " results " },
-                        theme::style_title(focused),
-                    ))
-                    .border_style(Style::default().fg(border))
-                    .style(Style::default().bg(theme::bg())),
-            ),
+            Paragraph::new(Span::styled(" — ", theme::style_faint())).block(theme::pane_block(
+                if focused { " Results " } else { " results " },
+                focused,
+            )),
             area,
         );
+        let _ = border;
         return;
     };
     let table_tab = db.active_is_table_tab();
     let Some(result) = &db.last_result else {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(theme::border_type())
-            .title(Span::styled(
-                if focused { " Results " } else { " results " },
-                theme::style_title(focused),
-            ))
-            .border_style(Style::default().fg(border))
-            .style(Style::default().bg(theme::bg()));
+        let block = theme::pane_block(
+            if focused { " Results " } else { " results " },
+            focused,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if table_tab && inner.height >= 2 {
@@ -2508,17 +2514,10 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     if !db.results_filter.trim().is_empty() {
         secondary.push(format!("/{}", db.results_filter.trim()));
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(theme::border_type())
-        .title(Span::styled(
-            title,
-            theme::style_title(focused),
-        ))
-        .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme::bg()));
+    let block = theme::pane_block(title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let _ = border;
 
     // One faint meta line — typography only, no surface chips.
     let inner = if inner.height >= 3 && !secondary.is_empty() {
@@ -2552,8 +2551,9 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 
     // compact = scan density; comfort = readable text (body/json) without leaving the grid.
     let row_stride = if compact { 1usize } else { 2usize };
-    let gutter_w = nrows.max(1).to_string().len().max(2);
-    let grid_w = (grid_area.width as usize).saturating_sub(gutter_w + 1);
+    // No row-index gutter — the table's own id/PK column already identifies rows.
+    let gutter_w = 0usize;
+    let grid_w = grid_area.width as usize;
     // Rough first pass so we know how many columns fit, then size them by content.
     let avg = if compact { 12usize } else { 18usize };
     let vis_cols = (grid_w / (avg + 3)).max(1);
@@ -2576,11 +2576,8 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let col_indices: Vec<usize> = (0..pinned).chain(col_start..col_end).collect();
     let col_widths = results_col_widths(result, &col_indices, grid_w, compact);
 
-    // Soft columns: space gutters only — no │ pipe lattice.
-    let mut header_spans = vec![Span::styled(
-        format!("{:>gutter_w$}  ", ""),
-        theme::style_faint(),
-    )];
+    // Soft columns: space gutters only — no │ pipe lattice, no row-index gutter.
+    let mut header_spans: Vec<Span<'static>> = Vec::new();
     for (pos, &ci) in col_indices.iter().enumerate() {
         if pos > 0 {
             header_spans.push(Span::raw("  "));
@@ -2595,13 +2592,13 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         let t = pad_display(&label, w);
         let style = if ci == result.cursor_col {
-            theme::style_text().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            theme::style_grid_cursor_header()
         } else {
             theme::style_muted().add_modifier(Modifier::BOLD)
         };
         header_spans.push(Span::styled(format!("{t}"), style));
     }
-    let header: Line = Line::from(header_spans).style(Style::default().bg(theme::surface()));
+    let header: Line = Line::from(header_spans).style(Style::default().bg(theme::pane_fill()));
 
     let filter = db.results_filter.clone();
     let filtered_idx: Vec<usize> = result
@@ -2623,14 +2620,8 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     for &ri in filtered_idx.iter().skip(scroll).take(visible_rows) {
         let row = &result.rows[ri];
         let row_dirty = dirty.contains(&ri);
-        let mut spans = vec![Span::styled(
-            format!("{:>gutter_w$}  ", ri + 1),
-            if ri == result.cursor_row {
-                theme::style_text().add_modifier(Modifier::BOLD)
-            } else {
-                theme::style_faint()
-            },
-        )];
+        let on_cursor_row = ri == result.cursor_row;
+        let mut spans: Vec<Span<'static>> = Vec::new();
         for (pos, &ci) in col_indices.iter().enumerate() {
             let Some(cell) = row.get(ci) else {
                 continue;
@@ -2639,7 +2630,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 spans.push(Span::raw("  "));
             }
             let w = col_widths[pos];
-            let is_cursor = ri == result.cursor_row && ci == result.cursor_col;
+            let is_cursor = on_cursor_row && ci == result.cursor_col;
             let is_null = cell == "NULL";
             let col_name = result.columns.get(ci).map(|s| s.as_str()).unwrap_or("");
             let mut t = if is_cursor && editing {
@@ -2664,29 +2655,27 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 || col_name.eq_ignore_ascii_case("kind")
                 || col_name.eq_ignore_ascii_case("state");
             let style = if is_cursor && editing {
-                Style::default()
-                    .fg(theme::bg())
-                    .bg(theme::accent())
-                    .add_modifier(Modifier::BOLD)
+                theme::style_chip_run()
             } else if is_cursor {
-                theme::style_selected()
+                // Caret cell = solid invert “cuadrado” (Explorer-style), not underline / row wash.
+                theme::style_grid_cursor_cell()
+            } else if on_cursor_row {
+                theme::style_text().add_modifier(Modifier::BOLD)
             } else if row_dirty {
-                Style::default().fg(theme::accent())
+                Style::default().fg(theme::accent_warm()).add_modifier(Modifier::BOLD)
             } else if ci < pinned {
                 Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
             } else if is_null {
                 theme::style_faint().add_modifier(Modifier::ITALIC)
             } else if is_statusish && !is_null && display_width(t.trim()) <= 12 {
-                // Quiet status emphasis — no cell box, just weight.
                 theme::style_text().add_modifier(Modifier::BOLD)
             } else {
                 theme::style_text()
             };
             spans.push(Span::styled(t, style));
         }
-        let line = if ri == result.cursor_row {
-            Line::from(spans).style(Style::default().bg(theme::surface_3()))
-        } else if ri % 2 == 1 {
+        // No row wash / invert bar — cursor is the bold+underline cell only.
+        let line = if !theme::is_mono() && ri % 2 == 1 {
             Line::from(spans).style(Style::default().bg(theme::surface()))
         } else {
             Line::from(spans)
@@ -2708,16 +2697,37 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     } else {
         String::new()
     };
-    // One quiet rule under the header — continuous, no ┼ junctions.
-    let rule_w = (grid_area.width as usize).saturating_sub(gutter_w + 2);
-    let mut rule_spans = vec![
-        Span::styled(format!("{:>gutter_w$}  ", ""), theme::style_faint()),
-        Span::styled("─".repeat(rule_w.min(120).max(8)), theme::style_faint()),
-    ];
-    if !h_hint.is_empty() {
-        rule_spans.push(Span::styled(h_hint, theme::style_faint()));
-    }
-    let rule = Line::from(rule_spans);
+    // Column rule: AMOLED keeps one quiet continuous rule; DataRig accents the active col.
+    let rule = if theme::is_mono() {
+        let rule_w = grid_area.width as usize;
+        let mut rule_spans = vec![Span::styled(
+            "─".repeat(rule_w.min(160).max(8)),
+            theme::style_faint(),
+        )];
+        if !h_hint.is_empty() {
+            rule_spans.push(Span::styled(h_hint, theme::style_faint()));
+        }
+        Line::from(rule_spans).style(Style::default().bg(theme::pane_fill()))
+    } else {
+        let mut rule_spans: Vec<Span<'static>> = Vec::new();
+        for (pos, &ci) in col_indices.iter().enumerate() {
+            if pos > 0 {
+                rule_spans.push(Span::styled("  ", theme::style_faint()));
+            }
+            let w = col_widths[pos];
+            let seg = "─".repeat(w.max(1));
+            let style = if ci == result.cursor_col {
+                Style::default().fg(theme::accent())
+            } else {
+                Style::default().fg(theme::border_idle())
+            };
+            rule_spans.push(Span::styled(seg, style));
+        }
+        if !h_hint.is_empty() {
+            rule_spans.push(Span::styled(h_hint, theme::style_faint()));
+        }
+        Line::from(rule_spans).style(Style::default().bg(theme::pane_fill()))
+    };
     let mut lines = vec![header, rule];
     if nrows == 0 {
         lines.push(Line::from(Span::styled(
@@ -3161,26 +3171,32 @@ fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
     );
 }
 
-/// Results cell full-value card — peek without leaving the grid.
-fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &str) {
-    if grid_area.width < 16 || grid_area.height < 5 {
+/// Results cell peek — value only (no column/meta chrome).
+fn render_cell_hover(frame: &mut Frame, grid_area: Rect, _col_name: &str, raw: &str) {
+    if grid_area.width < 12 || grid_area.height < 3 {
         return;
     }
-    let width = grid_area.width.saturating_sub(6).min(64).max(32);
-    let inner_w = (width as usize).saturating_sub(4).max(12);
-    let ty = guess_cell_type(raw);
+    let width = grid_area.width.saturating_sub(8).min(44).max(20);
+    let inner_w = (width as usize).saturating_sub(4).max(8);
     let pretty = display_cell_value(raw);
     let mut body_lines = hover_wrap_lines(&pretty, inner_w);
-    // Cap peek height so the grid stays readable.
+    if body_lines.is_empty() {
+        body_lines.push(if raw.is_empty() {
+            "∅".into()
+        } else {
+            pretty
+        });
+    }
     if body_lines.len() > 6 {
         body_lines.truncate(6);
         body_lines.push("…".into());
     }
+    // borders(2) + body — previous +3 left value_area height 0 for short values.
     let height = (body_lines.len() as u16)
-        .saturating_add(3)
-        .min(12)
+        .saturating_add(2)
+        .max(3)
+        .min(10)
         .min(grid_area.height.saturating_sub(1));
-    // Bottom-right of Results — keeps header + cursor row visible.
     let x = grid_area
         .x
         .saturating_add(grid_area.width.saturating_sub(width).saturating_sub(1));
@@ -3198,8 +3214,8 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
         Block::default()
             .borders(Borders::ALL)
             .border_type(theme::border_type())
-            .border_style(Style::default().fg(theme::text()))
-            .style(Style::default().bg(theme::surface_2())),
+            .border_style(Style::default().fg(theme::border_idle()))
+            .style(Style::default().bg(theme::pane_fill())),
         area,
     );
     let inner = Rect {
@@ -3207,33 +3223,6 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
         y: area.y + 1,
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
-    };
-    let meta = format!(
-        " {}  ·  {}  ·  {}c ",
-        truncate_chars(col_name, 20),
-        ty,
-        raw.chars().count()
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_chars(&meta, inner.width as usize),
-            Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
-                .add_modifier(Modifier::BOLD),
-        ))),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
-    let value_area = Rect {
-        x: inner.x,
-        y: inner.y + 1,
-        width: inner.width,
-        height: inner.height.saturating_sub(1),
     };
     let body: Vec<Line> = body_lines
         .into_iter()
@@ -3243,10 +3232,10 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
             } else {
                 theme::style_text()
             };
-            Line::from(Span::styled(format!(" {l}"), style))
+            Line::from(Span::styled(l, style))
         })
         .collect();
-    frame.render_widget(Paragraph::new(body), value_area);
+    frame.render_widget(Paragraph::new(body), inner);
 }
 
 fn hover_wrap_lines(s: &str, width: usize) -> Vec<String> {
@@ -4364,7 +4353,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             .borders(Borders::ALL)
             .border_type(theme::border_type())
             .border_style(Style::default().fg(border))
-            .style(Style::default().bg(theme::surface())),
+            .style(Style::default().bg(theme::pane_fill())),
         area,
     );
 
@@ -4375,30 +4364,30 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         height: area.height.saturating_sub(2),
     };
 
-    // Title plate
+    // Quiet title — wordmark + crumb, no grey wash plate.
     let crumb = if drill {
         if table.is_empty() {
-            format!(" cell  ·  row {}  ·  {col_name} ", row_i + 1)
+            format!("cell · row {} · {col_name}", row_i + 1)
         } else {
-            format!(" {table}  ·  cell  ·  row {}  ·  {col_name} ", row_i + 1)
+            format!("{table} · cell · row {} · {col_name}", row_i + 1)
         }
     } else if table.is_empty() {
-        format!(" row {}  ·  {col_name} ", row_i + 1)
+        format!("row {} · {col_name}", row_i + 1)
     } else {
-        format!(" {table}  ·  row {}  ·  {col_name} ", row_i + 1)
+        format!("{table} · row {} · {col_name}", row_i + 1)
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " INSPECT ",
+                "Inspect",
                 Style::default()
-                    .fg(theme::bg())
-                    .bg(theme::text())
+                    .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(" · ", theme::style_faint()),
             Span::styled(
-                truncate_chars(&crumb, inner.width.saturating_sub(10) as usize),
-                Style::default().fg(theme::text()).bg(theme::surface_2()),
+                truncate_chars(&crumb, inner.width.saturating_sub(12) as usize),
+                theme::style_muted(),
             ),
         ])),
         Rect {
@@ -4409,42 +4398,36 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         },
     );
 
-    // Tab pills — Row | Plan | Chart | JSON (Cell is drill-in only).
+    // Tabs — typography only (active bold; no invert pills / surface chips).
     let mut tab_spans: Vec<Span> = Vec::new();
     if drill {
         tab_spans.push(Span::styled(
-            " Cell ",
+            "Cell",
             Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
-                .add_modifier(Modifier::BOLD),
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ));
-        tab_spans.push(Span::styled("  Esc → Row ", theme::style_faint()));
+        tab_spans.push(Span::styled("  Esc → Row", theme::style_faint()));
     } else {
         let tabs = ["Row", "Plan", "Chart", "JSON"];
         for (i, name) in tabs.iter().enumerate() {
             if i > 0 {
-                tab_spans.push(Span::styled(" ", theme::style_faint()));
+                tab_spans.push(Span::styled(" · ", theme::style_faint()));
             }
-            let label = format!(" {name} ");
             if i == tab {
                 tab_spans.push(Span::styled(
-                    label,
+                    (*name).to_string(),
                     Style::default()
-                        .fg(theme::bg())
-                        .bg(theme::text())
-                        .add_modifier(Modifier::BOLD),
+                        .fg(theme::text())
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 ));
             } else {
-                tab_spans.push(Span::styled(
-                    label,
-                    Style::default().fg(theme::muted()).bg(theme::surface_2()),
-                ));
+                tab_spans.push(Span::styled((*name).to_string(), theme::style_muted()));
             }
         }
     }
     tab_spans.push(Span::styled(
-        format!("  col {}/{} ", col_i + 1, result.columns.len()),
+        format!("  col {}/{}", col_i + 1, result.columns.len()),
         theme::style_faint(),
     ));
     frame.render_widget(
@@ -4491,7 +4474,14 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     } else {
         match tab {
             1 => modal_plan_lines(db, body.width as usize),
-            2 => modal_chart_lines(result, col_i, row_i, body.width as usize),
+            2 => modal_chart_lines(
+                result,
+                col_i,
+                row_i,
+                body.width as usize,
+                ctx.ui.chart_kind,
+                ctx.ui.chart_limit,
+            ),
             3 => modal_json_lines(result, cells, body.width as usize),
             _ => modal_row_lines(
                 result,
@@ -4541,14 +4531,21 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     } else if tab == 1 {
         " Tab Chart|JSON|Row   Ctrl-E for EXPLAIN   Esc ".into()
     } else if tab == 2 {
-        " ←→ numeric col   cursor row highlighted   Tab JSON   Esc ".into()
+        let kind = ide_db::CHART_KINDS
+            .get(ctx.ui.chart_kind % ide_db::CHART_KINDS.len())
+            .copied()
+            .unwrap_or("bar");
+        format!(
+            " c {kind}   [ ] rows·{}   ←→ col   Tab JSON   Esc ",
+            ctx.ui.chart_limit
+        )
     } else {
         " Tab Row   y yank JSON   Esc ".into()
     };
     frame.render_widget(
         Paragraph::new(Span::styled(
             truncate_chars(&hint, inner.width as usize),
-            Style::default().fg(theme::faint()).bg(theme::surface_2()),
+            theme::style_faint(),
         )),
         Rect {
             x: inner.x,
@@ -5021,27 +5018,35 @@ fn modal_row_lines(
             name.clone()
         };
         let label = pad_display(&label, name_w);
-        let base_style = if is_sel && editing {
+        // Clean row: accent rail + bold field; invert “cuadrado” only on the value
+        // text (not padded to full modal width — that was the heavy white bar).
+        let mark = if is_sel {
+            theme::select_mark()
+        } else {
+            " "
+        };
+        let name_style = if is_sel {
             Style::default()
-                .fg(theme::bg())
-                .bg(theme::accent())
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD)
+        } else {
+            theme::style_muted()
+        };
+        let val_style = if is_sel && editing {
+            theme::style_chip_run()
         } else if is_sel {
-            theme::style_selected()
+            theme::style_grid_cursor_cell()
         } else if cell == "NULL" {
-            theme::style_faint()
+            theme::style_faint().add_modifier(Modifier::ITALIC)
         } else {
             theme::style_text()
         };
-        let prefix_style = if is_sel {
-            base_style
-        } else {
-            theme::style_faint()
-        };
-        let val = pad_display(&value, value_w);
+        let val_pad = value_w.saturating_sub(display_width(&value));
         lines.push(Line::from(vec![
-            Span::styled(format!(" {label} │ "), prefix_style),
-            Span::styled(val, base_style),
+            Span::styled(format!("{mark}{label}"), name_style),
+            Span::styled(" │ ", theme::style_faint()),
+            Span::styled(value, val_style),
+            Span::raw(" ".repeat(val_pad)),
         ]));
     }
     if lines.is_empty() {
@@ -5052,7 +5057,7 @@ fn modal_row_lines(
     } else {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            " Enter on a field → full Cell view ",
+            " Enter → cell",
             theme::style_faint(),
         )));
     }
@@ -5094,62 +5099,51 @@ fn modal_chart_lines(
     col_i: usize,
     cursor_row: usize,
     width: usize,
+    kind_idx: usize,
+    limit: usize,
 ) -> Vec<Line<'static>> {
-    let col_name = result
-        .columns
-        .get(col_i)
-        .map(|s| s.as_str())
-        .unwrap_or("?");
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            format!(" Chart · {col_name} · cursor row {}", cursor_row + 1),
-            theme::style_text().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line> = Vec::new();
+    let kinds = ide_db::CHART_KINDS;
+    let kind = kinds.get(kind_idx % kinds.len()).copied().unwrap_or("bar");
+    // Control strip — kind is editable with `c`, depth with `[` `]`.
+    lines.push(Line::from(vec![
+        Span::styled("chart ", theme::style_faint()),
+        Span::styled(
+            kind.to_string(),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", theme::style_faint()),
+        Span::styled(format!("rows {limit}"), theme::style_muted()),
+        Span::styled(" · ", theme::style_faint()),
+        Span::styled("c type  [ ] depth  ←→ col", theme::style_faint()),
+    ]));
+    lines.push(Line::from(""));
 
-    // Prefer bar chart with cursor highlight on the focused row index.
-    if let Some(text) = ide_db::chart_kind(result, "bar", Some(col_i)) {
-        let cursor_tag = format!("{:>2} │", cursor_row + 1);
-        for l in text.lines() {
-            let shown = truncate_chars(l, width.saturating_sub(2));
-            let is_cursor = l.contains(&cursor_tag);
-            let style = if is_cursor {
-                theme::style_selected()
-            } else if l.contains('█') || l.contains('■') || l.contains('▁') || l.contains("Spark") {
-                theme::style_accent()
-            } else {
-                theme::style_text()
-            };
-            lines.push(Line::from(Span::styled(format!(" {shown}"), style)));
-        }
-    } else {
+    let Some(text) = ide_db::chart_kind_n(result, kind, Some(col_i), limit) else {
         lines.push(Line::from(Span::styled(
-            " No numeric column to chart — ←→ pick a number col",
+            "no numeric column — ←→ pick one",
             theme::style_faint(),
         )));
-    }
-
-    if let Some(line) = ide_db::chart_kind(result, "line", Some(col_i)) {
-        lines.push(Line::from(""));
-        for l in line.lines() {
-            lines.push(Line::from(Span::styled(
-                format!(" {}", truncate_chars(l, width.saturating_sub(2))),
-                theme::style_muted(),
-            )));
-        }
-    }
-    if let Some(pie) = ide_db::chart_kind(result, "pie", Some(col_i)) {
-        lines.push(Line::from(""));
-        for l in pie.lines() {
-            let shown = truncate_chars(l, width.saturating_sub(2));
-            let style = if l.contains('●') {
-                theme::style_accent()
-            } else {
-                theme::style_muted()
-            };
-            lines.push(Line::from(Span::styled(format!(" {shown}"), style)));
-        }
+        return lines;
+    };
+    let cursor_tag = format!("#{cursor_row} ");
+    for (i, l) in text.lines().enumerate() {
+        let shown = truncate_chars(l, width.saturating_sub(1));
+        let is_cursor = l.starts_with(&cursor_tag);
+        let style = if is_cursor {
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else if i == 0 {
+            theme::style_muted()
+        } else if i == 1 && kind != "pie" {
+            theme::style_accent()
+        } else {
+            theme::style_text()
+        };
+        lines.push(Line::from(Span::styled(shown, style)));
     }
     lines
 }
@@ -5661,6 +5655,7 @@ fn pad_display(s: &str, width: usize) -> String {
 /// Build Console toolbar spans; drop schema then database as whole chips when narrow.
 fn console_toolbar_spans(
     running: bool,
+    console_focused: bool,
     db_label: &str,
     schema_label: &str,
     lim: &str,
@@ -5672,24 +5667,22 @@ fn console_toolbar_spans(
             theme::style_warn(),
         )
     } else {
+        // Focused Console → filled accent chip; idle → accent ink (clear “hot” state).
         Span::styled(
             format!(" {} F5 ", icons::run_glyph()),
-            Style::default()
-                .fg(theme::accent())
-                .add_modifier(Modifier::BOLD),
+            if console_focused {
+                theme::style_chip_run()
+            } else {
+                theme::style_chip_run_idle()
+            },
         )
     };
-    let sep = Span::styled(" · ", theme::style_faint());
+    let sep = Span::styled(" · ", theme::Role::Faint.style());
     let db_chip = format!("{db_label} {}", icons::chevron_down());
     let schema_chip = format!("{schema_label} {}", icons::chevron_down());
     let lim_chip = format!("lim {lim}");
 
-    let chip = |label: String| {
-        Span::styled(
-            format!(" {label} "),
-            Style::default().fg(theme::muted()).bg(theme::surface()),
-        )
-    };
+    let chip = |label: String| Span::styled(format!(" {label} "), theme::style_chip());
 
     let candidates: Vec<Vec<Span<'static>>> = vec![
         vec![
@@ -5723,7 +5716,11 @@ fn console_toolbar_spans(
     }
     vec![Span::styled(
         format!(" {} F5 ", icons::run_glyph()),
-        theme::style_accent(),
+        if console_focused {
+            theme::style_chip_run()
+        } else {
+            theme::style_chip_run_idle()
+        },
     )]
 }
 
