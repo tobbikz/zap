@@ -116,6 +116,7 @@ impl Palette {
             item("Theme: new custom…", "theme_new_custom"),
             item("Theme: reload customs", "theme_reload"),
             item("Onboarding tips", "onboarding_tips"),
+            item("Reload persona.toml", "reload_persona"),
             item("Recipe gallery", "recipe_gallery"),
             item("Recipe: top customers", "recipe_top_customers"),
             item("Recipe: revenue by day", "recipe_revenue_by_day"),
