@@ -443,26 +443,31 @@ impl Keymap {
             | KeyContext::DataCompare
             | KeyContext::QueryParams
             | KeyContext::SaveMaterialize
-            | KeyContext::BrainAsk => match key.code {
-                KeyCode::Esc => Some(Action::Cancel),
-                KeyCode::Enter => Some(Action::Confirm),
-                KeyCode::Backspace => Some(Action::Backspace),
+            | KeyContext::BrainAsk => match (ctrl, key.code) {
+                (_, KeyCode::Esc) => Some(Action::Cancel),
+                (_, KeyCode::Enter) => Some(Action::Confirm),
+                (_, KeyCode::Backspace) => Some(Action::Backspace),
+                (true, KeyCode::Char('v') | KeyCode::Char('V')) => Some(Action::ClipboardPaste),
                 _ => None,
             },
-            KeyContext::EditTableFilter => match key.code {
-                KeyCode::Esc => Some(Action::Cancel),
-                KeyCode::Enter => Some(Action::Confirm),
-                KeyCode::Backspace => Some(Action::Backspace),
-                KeyCode::Tab => Some(Action::AcceptCompletion),
-                KeyCode::BackTab => Some(Action::DbConnectPrevField),
-                KeyCode::Down => Some(Action::NextCompletion),
-                KeyCode::Up => Some(Action::PrevCompletion),
+            KeyContext::EditTableFilter => match (ctrl, key.code) {
+                (_, KeyCode::Esc) => Some(Action::Cancel),
+                (_, KeyCode::Enter) => Some(Action::Confirm),
+                (_, KeyCode::Backspace) => Some(Action::Backspace),
+                (_, KeyCode::Tab) => Some(Action::AcceptCompletion),
+                (_, KeyCode::BackTab) => Some(Action::DbConnectPrevField),
+                (_, KeyCode::Down) => Some(Action::NextCompletion),
+                (_, KeyCode::Up) => Some(Action::PrevCompletion),
+                (true, KeyCode::Char('v') | KeyCode::Char('V')) => Some(Action::ClipboardPaste),
                 _ => None,
             },
             KeyContext::DbConnect => match (ctrl, shift, key.code) {
                 (_, _, KeyCode::Esc) => Some(Action::Cancel),
                 (_, _, KeyCode::Enter) => Some(Action::Confirm),
                 (_, _, KeyCode::Backspace) => Some(Action::Backspace),
+                (true, false, KeyCode::Char('v') | KeyCode::Char('V')) => {
+                    Some(Action::ClipboardPaste)
+                }
                 (true, _, KeyCode::Char('t'))
                 | (true, _, KeyCode::Char('T'))
                 | (_, _, KeyCode::F(6)) => Some(Action::DbConnectTest),
@@ -478,6 +483,9 @@ impl Keymap {
                 (_, _, KeyCode::Esc) => Some(Action::Cancel),
                 (_, _, KeyCode::Enter) => Some(Action::Confirm),
                 (_, _, KeyCode::Backspace) => Some(Action::Backspace),
+                (true, false, KeyCode::Char('v') | KeyCode::Char('V')) => {
+                    Some(Action::ClipboardPaste)
+                }
                 (_, _, KeyCode::Tab) | (_, _, KeyCode::Down) => Some(Action::CreateObjectNextField),
                 (_, true, KeyCode::BackTab) | (_, _, KeyCode::Up) => {
                     Some(Action::CreateObjectPrevField)
@@ -486,12 +494,13 @@ impl Keymap {
                 (_, _, KeyCode::Left) => Some(Action::CreateObjectNudgeBack),
                 _ => None,
             },
-            KeyContext::Palette | KeyContext::Search => match key.code {
-                KeyCode::Esc => Some(Action::Cancel),
-                KeyCode::Enter => Some(Action::Confirm),
-                KeyCode::Up => Some(Action::MoveUp),
-                KeyCode::Down => Some(Action::MoveDown),
-                KeyCode::Backspace => Some(Action::Backspace),
+            KeyContext::Palette | KeyContext::Search => match (ctrl, key.code) {
+                (_, KeyCode::Esc) => Some(Action::Cancel),
+                (_, KeyCode::Enter) => Some(Action::Confirm),
+                (_, KeyCode::Up) => Some(Action::MoveUp),
+                (_, KeyCode::Down) => Some(Action::MoveDown),
+                (_, KeyCode::Backspace) => Some(Action::Backspace),
+                (true, KeyCode::Char('v') | KeyCode::Char('V')) => Some(Action::ClipboardPaste),
                 _ => None,
             },
             KeyContext::Tree => match (ctrl, key.code) {
@@ -671,6 +680,7 @@ impl Keymap {
                 (_, KeyCode::Tab) => Some(Action::SessionFormNextField),
                 (_, KeyCode::BackTab) => Some(Action::SessionFormPrevField),
                 (_, KeyCode::Backspace) => Some(Action::Backspace),
+                (true, KeyCode::Char('v') | KeyCode::Char('V')) => Some(Action::ClipboardPaste),
                 _ => None,
             },
             KeyContext::Agents => match (ctrl, shift, key.code) {
@@ -693,6 +703,7 @@ impl Keymap {
                 (_, KeyCode::Tab) => Some(Action::AgentFormNextField),
                 (_, KeyCode::BackTab) => Some(Action::AgentFormPrevField),
                 (_, KeyCode::Backspace) => Some(Action::Backspace),
+                (true, KeyCode::Char('v') | KeyCode::Char('V')) => Some(Action::ClipboardPaste),
                 _ => None,
             },
             KeyContext::ConfirmDelete => match key.code {
@@ -767,6 +778,24 @@ mod tests {
             Keymap::context(Mode::Settings, Focus::Editor),
             KeyContext::Settings
         );
+    }
+
+    #[test]
+    fn modal_ctrl_v_is_clipboard_paste() {
+        for ctx in [
+            KeyContext::Find,
+            KeyContext::OpenFolder,
+            KeyContext::Settings,
+            KeyContext::ImportCsv,
+            KeyContext::DbConnect,
+            KeyContext::Palette,
+        ] {
+            assert_eq!(
+                Keymap::map(ctx, ctrl(KeyCode::Char('v'))),
+                Some(Action::ClipboardPaste),
+                "{ctx:?}"
+            );
+        }
     }
 
     fn ctrl_shift(code: KeyCode) -> KeyEvent {
