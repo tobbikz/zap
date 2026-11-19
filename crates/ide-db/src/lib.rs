@@ -1511,6 +1511,30 @@ fn ssh_forward_port_busy(err: &anyhow::Error) -> bool {
         || msg.contains("error: bind")
 }
 
+/// `ssh` argv for a DB local forward (before `-i` / target). Host-key policy matches
+/// Sessions (`BatchMode=yes` + `StrictHostKeyChecking=accept-new`) so first connect to a
+/// new jump host does not fail closed (#195).
+pub(crate) fn ssh_tunnel_base_args(forward: &str, ssh_port: u16) -> Vec<String> {
+    [
+        "-N",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ServerAliveInterval=30",
+        "-L",
+        forward,
+        "-p",
+    ]
+    .into_iter()
+    .map(String::from)
+    .chain(std::iter::once(ssh_port.to_string()))
+    .collect()
+}
+
 impl Default for DbWorkspace {
     fn default() -> Self {
         Self {
@@ -4707,19 +4731,7 @@ impl DbWorkspace {
         };
 
         let mut cmd = Command::new("ssh");
-        cmd.args([
-            "-N",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ServerAliveInterval=30",
-            "-L",
-            &forward,
-            "-p",
-            &src.ssh_port.to_string(),
-        ]);
+        cmd.args(ssh_tunnel_base_args(&forward, src.ssh_port));
         if !src.ssh_key.trim().is_empty() {
             cmd.args(["-i", src.ssh_key.trim()]);
         }
@@ -4750,10 +4762,13 @@ impl DbWorkspace {
                         use std::io::Read;
                         let _ = stderr.read_to_string(&mut err);
                     }
-                    bail!(
-                        "SSH tunnel failed ({status}): {}",
-                        err.trim().lines().next().unwrap_or("see ssh -v")
-                    );
+                    let first = err.trim().lines().next().unwrap_or("see ssh -v");
+                    let hint = if err.contains("Host key verification failed") {
+                        " — host key changed or rejected; fix ~/.ssh/known_hosts (ssh-keygen -R <host>) or connect once manually"
+                    } else {
+                        ""
+                    };
+                    bail!("SSH tunnel failed ({status}): {first}{hint}");
                 }
                 Ok(None) if std::time::Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(100));
@@ -11213,7 +11228,7 @@ mod paste_grid_tests {
 
 #[cfg(test)]
 mod ssh_tunnel_port_tests {
-    use super::ssh_forward_port_busy;
+    use super::{ssh_forward_port_busy, ssh_tunnel_base_args};
 
     #[test]
     fn detects_bind_busy_from_ssh_stderr() {
@@ -11223,6 +11238,14 @@ mod ssh_tunnel_port_tests {
         assert!(ssh_forward_port_busy(&busy));
         let other = anyhow::anyhow!("SSH tunnel failed (exit status: 255): Permission denied");
         assert!(!ssh_forward_port_busy(&other));
+    }
+
+    #[test]
+    fn ssh_tunnel_args_accept_new_host_keys() {
+        let a = ssh_tunnel_base_args("15432:db.internal:5432", 2222);
+        assert!(a.iter().any(|s| s == "StrictHostKeyChecking=accept-new"));
+        assert!(a.iter().any(|s| s == "BatchMode=yes"));
+        assert_eq!(a.last().map(String::as_str), Some("2222"));
     }
 }
 
