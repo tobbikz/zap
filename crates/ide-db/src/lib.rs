@@ -5885,11 +5885,16 @@ impl DbWorkspace {
     }
 
     pub fn export_explore_pack(&mut self) -> Result<PathBuf> {
+        let dir = self.queries_dir.join("explore_packs");
+        self.export_explore_pack_to(&dir)
+    }
+
+    /// Export the current result pack into `dir` (created if needed). Used by BI export (#193).
+    pub fn export_explore_pack_to(&mut self, dir: &Path) -> Result<PathBuf> {
         let Some(result) = &self.last_result else {
             bail!("no results to export");
         };
-        let dir = self.queries_dir.join("explore_packs");
-        let path = export_result_pack(result, &self.sql, &dir)?;
+        let path = export_result_pack(result, &self.sql, dir)?;
         self.status = format!("result pack → {}", path.display());
         Ok(path)
     }
@@ -11245,6 +11250,35 @@ mod migration_txn_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction is open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod bi_export_dir_tests {
+    use super::{DbWorkspace, QueryResult};
+    use std::fs;
+
+    #[test]
+    fn export_explore_pack_to_honors_dir() {
+        let mut ws = DbWorkspace::default();
+        let mut qr = QueryResult::empty();
+        qr.columns = vec!["id".into()];
+        qr.rows = vec![vec!["1".into()]];
+        qr.original_rows = qr.rows.clone();
+        ws.last_result = Some(qr);
+        ws.sql = "select 1".into();
+
+        let dir = std::env::temp_dir().join(format!(
+            "zap-bi-export-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = ws.export_explore_pack_to(&dir).unwrap();
+        assert!(path.starts_with(&dir), "{} vs {}", path.display(), dir.display());
+        assert!(path.join("result.csv").is_file());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
