@@ -1,4 +1,4 @@
-use ide_db::{DataSource, DbDriver, DbWorkspace};
+use ide_db::{DataSource, DbDriver, DbWorkspace, QueryResult};
 
 #[tokio::test]
 async fn sqlite_query_and_introspect() {
@@ -549,4 +549,71 @@ fn wave18_21_paste_blob_migrate_status_help() {
     assert!(help.contains("Rollback") || help.contains("down.sql"));
     assert!(help.contains("Redis") || help.contains("EXPIRE"));
     let _ = format_sql_light("select 1");
+}
+
+fn editable_result(rows: Vec<Vec<&str>>, cursor_row: usize, cursor_col: usize) -> QueryResult {
+    let rows: Vec<Vec<String>> = rows
+        .into_iter()
+        .map(|row| row.into_iter().map(str::to_string).collect())
+        .collect();
+    QueryResult {
+        columns: vec!["a".to_string(), "b".to_string()],
+        rows: rows.clone(),
+        affected: None,
+        elapsed_ms: 0,
+        truncated: false,
+        source_schema: Some("main".to_string()),
+        source_table: Some("t".to_string()),
+        primary_keys: vec!["a".to_string()],
+        original_rows: rows,
+        cursor_row,
+        cursor_col,
+        explain: None,
+        chart: None,
+        page: 0,
+        has_more: false,
+    }
+}
+
+#[test]
+fn paste_tsv_undo_restores_overwritten_cells() {
+    let mut ws = DbWorkspace::default();
+    ws.last_result = Some(editable_result(vec![vec!["1", "x"], vec!["2", "y"]], 0, 0));
+
+    let batch = {
+        let result = ws.last_result.as_mut().unwrap();
+        let (_, batch) = result.paste_tsv_undoable("9\t8").unwrap();
+        batch
+    };
+    ws.cell_undo.push(batch);
+
+    assert!(ws.undo_last_cell_edit());
+    let result = ws.last_result.as_ref().unwrap();
+    assert_eq!(
+        result.rows,
+        vec![
+            vec!["1".to_string(), "x".to_string()],
+            vec!["2".to_string(), "y".to_string()]
+        ]
+    );
+}
+
+#[test]
+fn paste_tsv_undo_drops_appended_rows() {
+    let mut ws = DbWorkspace::default();
+    ws.last_result = Some(editable_result(vec![vec!["1", "x"]], 0, 0));
+
+    let batch = {
+        let result = ws.last_result.as_mut().unwrap();
+        let (_, batch) = result.paste_tsv_undoable("2\ty\n3\tz").unwrap();
+        batch
+    };
+    ws.cell_undo.push(batch);
+
+    let result = ws.last_result.as_ref().unwrap();
+    assert_eq!(result.rows.len(), 2);
+
+    assert!(ws.undo_last_cell_edit());
+    let result = ws.last_result.as_ref().unwrap();
+    assert_eq!(result.rows, vec![vec!["1".to_string(), "x".to_string()]]);
 }

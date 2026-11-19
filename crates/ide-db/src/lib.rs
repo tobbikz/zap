@@ -706,6 +706,21 @@ impl SqlTab {
 }
 
 #[derive(Debug, Clone)]
+pub struct CellUndoBatch {
+    pub cells: Vec<(usize, usize, String)>,
+    pub truncate_rows: Option<usize>,
+}
+
+impl CellUndoBatch {
+    pub fn single(row: usize, col: usize, prev: String) -> Self {
+        Self {
+            cells: vec![(row, col, prev)],
+            truncate_rows: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
@@ -972,7 +987,7 @@ impl QueryResult {
     }
 
     /// Paste TSV/CSV lines starting at cursor (extra rows become pending INSERTs).
-    pub fn paste_tsv_at_cursor(&mut self, text: &str) -> Result<usize> {
+    pub fn paste_tsv_undoable(&mut self, text: &str) -> Result<(usize, CellUndoBatch)> {
         if self.columns.is_empty() {
             bail!("no result grid");
         }
@@ -980,30 +995,57 @@ impl QueryResult {
         if lines.is_empty() {
             bail!("clipboard/paste empty");
         }
+        let orig_rows = self.rows.len();
         let start_row = self.cursor_row;
         let start_col = self.cursor_col;
+        let mut undo = CellUndoBatch {
+            cells: Vec::new(),
+            truncate_rows: None,
+        };
         let mut touched = 0usize;
-        for (li, cols) in lines.iter().enumerate() {
-            let ri = start_row + li;
-            while self.rows.len() <= ri {
-                if self.source_table.is_none() {
-                    bail!("cannot append rows — open a single-table SELECT first");
+        let result = (|| -> Result<usize> {
+            for (li, cols) in lines.iter().enumerate() {
+                let ri = start_row + li;
+                while self.rows.len() <= ri {
+                    if self.source_table.is_none() {
+                        bail!("cannot append rows — open a single-table SELECT first");
+                    }
+                    let row = vec!["NULL".to_string(); self.columns.len()];
+                    self.rows.push(row);
+                    undo.truncate_rows.get_or_insert(orig_rows);
                 }
-                let row = vec!["NULL".to_string(); self.columns.len()];
-                self.rows.push(row);
-            }
-            for (di, val) in cols.iter().enumerate() {
-                let ci = start_col + di;
-                if ci < self.columns.len() {
-                    if let Some(cell) = self.rows[ri].get_mut(ci) {
-                        *cell = val.clone();
+                for (di, val) in cols.iter().enumerate() {
+                    let ci = start_col + di;
+                    if ci < self.columns.len() {
+                        if let Some(cell) = self.rows[ri].get_mut(ci) {
+                            undo.cells.push((ri, ci, cell.clone()));
+                            *cell = val.clone();
+                        }
                     }
                 }
+                touched += 1;
             }
-            touched += 1;
+            self.cursor_row = (start_row + touched.saturating_sub(1)).min(self.rows.len() - 1);
+            Ok(touched)
+        })();
+        match result {
+            Ok(n) => Ok((n, undo)),
+            Err(err) => {
+                for (row, col, prev) in undo.cells.iter().rev() {
+                    if let Some(cell) = self.rows.get_mut(*row).and_then(|r| r.get_mut(*col)) {
+                        *cell = prev.clone();
+                    }
+                }
+                if let Some(rows) = undo.truncate_rows {
+                    self.rows.truncate(rows);
+                }
+                Err(err)
+            }
         }
-        self.cursor_row = (start_row + touched.saturating_sub(1)).min(self.rows.len() - 1);
-        Ok(touched)
+    }
+
+    pub fn paste_tsv_at_cursor(&mut self, text: &str) -> Result<usize> {
+        self.paste_tsv_undoable(text).map(|(n, _)| n)
     }
 
     pub fn to_csv(&self) -> String {
@@ -1354,8 +1396,8 @@ pub struct DbWorkspace {
     pub select_limit: usize,
     /// Explorer health after last expand/ping.
     pub connection_health: HashMap<String, ConnHealth>,
-    /// Cell edit undo stack: (row, col, previous value).
-    pub cell_undo: Vec<(usize, usize, String)>,
+    /// Cell edit undo stack, grouped so paste can undo atomically.
+    pub cell_undo: Vec<CellUndoBatch>,
     /// Backend pid/id for the in-flight query connection (PG/MySQL).
     pub query_backend_pid: Arc<AtomicI64>,
     /// Recent table keys `source|schema|table` (newest first).
@@ -5599,21 +5641,28 @@ impl DbWorkspace {
     }
 
     pub fn undo_last_cell_edit(&mut self) -> bool {
-        let Some((row, col, prev)) = self.cell_undo.pop() else {
+        let Some(batch) = self.cell_undo.pop() else {
             return false;
         };
         let Some(result) = self.last_result.as_mut() else {
             return false;
         };
-        if let Some(cell) = result.rows.get_mut(row).and_then(|r| r.get_mut(col)) {
-            *cell = prev;
-            result.cursor_row = row;
-            result.cursor_col = col;
-            self.flush_active_tab();
-            true
-        } else {
-            false
+        for (row, col, prev) in batch.cells.iter().rev() {
+            if let Some(cell) = result.rows.get_mut(*row).and_then(|r| r.get_mut(*col)) {
+                *cell = prev.clone();
+            } else {
+                return false;
+            }
         }
+        if let Some(rows) = batch.truncate_rows {
+            result.rows.truncate(rows);
+        }
+        if let Some((row, col, _)) = batch.cells.first() {
+            result.cursor_row = (*row).min(result.rows.len().saturating_sub(1));
+            result.cursor_col = (*col).min(result.columns.len().saturating_sub(1));
+        }
+        self.flush_active_tab();
+        true
     }
 
     /// Jump explorer selection to `schema.table` (best-effort, case-insensitive).
@@ -6401,8 +6450,7 @@ impl DbWorkspace {
             result.set_cell_null()
         };
         if let Some(p) = prev {
-            self.cell_undo
-                .push((result.cursor_row, result.cursor_col, p));
+            self.cell_undo.push(CellUndoBatch::single(result.cursor_row, result.cursor_col, p));
         }
         self.flush_active_tab();
         self.status = "cell NULL toggled · Ctrl-S apply".into();

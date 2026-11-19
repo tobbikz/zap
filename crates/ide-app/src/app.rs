@@ -20,7 +20,8 @@ use ide_core::{
 };
 use ide_db::{
     default_brain_source, query_param_prompt_seed, sql_has_query_params, substitute_query_params,
-    AlterColumnKind, DataSource, DbDriver, DbNodeKind, DbWorkspace, PostgresMaintenance,
+    AlterColumnKind, CellUndoBatch, DataSource, DbDriver, DbNodeKind, DbWorkspace,
+    PostgresMaintenance,
 };
 use ide_dap::{find_adapter, DapClient, DapEvent};
 use ide_nvim::{self, NvimSession, detect_astronvim, key_to_nvim};
@@ -3021,8 +3022,9 @@ impl App {
             }
             Some("__paste_tsv__") => {
                 match self.db.last_result.as_mut() {
-                    Some(r) => match r.paste_tsv_at_cursor(&raw) {
-                        Ok(n) => {
+                    Some(r) => match r.paste_tsv_undoable(&raw) {
+                        Ok((n, batch)) => {
+                            self.db.cell_undo.push(batch);
                             self.db.flush_active_tab();
                             self.ui.focus = Focus::Results;
                             self.set_status(
@@ -3399,7 +3401,7 @@ impl App {
             let row = result.cursor_row;
             let col = result.cursor_col;
             if let Some(prev) = result.set_cell(value) {
-                self.db.cell_undo.push((row, col, prev));
+                self.db.cell_undo.push(CellUndoBatch::single(row, col, prev));
             }
             self.db.flush_active_tab();
             self.set_status("cell dirty · Ctrl-S apply · u undo cell", false);
@@ -8283,8 +8285,9 @@ async fn event_loop(
                             && app.ui.product == ProductMode::Database
                         {
                             if let Some(r) = app.db.last_result.as_mut() {
-                                match r.paste_tsv_at_cursor(&text) {
-                                    Ok(n) => {
+                                match r.paste_tsv_undoable(&text) {
+                                    Ok((n, batch)) => {
+                                        app.db.cell_undo.push(batch);
                                         app.db.flush_active_tab();
                                         app.set_status(
                                             format!("pasted {n} row(s) · Ctrl-S apply"),
