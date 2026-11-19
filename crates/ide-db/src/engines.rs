@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -12,9 +13,16 @@ use crate::{ColumnInfo, DataSource, DbNodeKind, DbTreeNode, QueryResult};
 
 pub type MssqlClient = Client<Compat<TcpStream>>;
 
-/// Shared reqwest client for HTTP engines: `ssl_ca` and `ssl_trust_cert` (#205).
+/// Connect timeout for ClickHouse / ES / Trino HTTP (#197).
+pub(crate) const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Overall request timeout so a hung CH does not freeze the Studio forever (#197).
+pub(crate) const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Shared reqwest client for HTTP engines: timeouts, `ssl_ca`, and `ssl_trust_cert` (#197/#205).
 pub(crate) fn build_http_client(src: &DataSource) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT);
     if !src.ssl_ca.trim().is_empty() {
         let pem = std::fs::read(src.ssl_ca.trim())
             .with_context(|| format!("read ssl CA {}", src.ssl_ca))?;
@@ -692,3 +700,18 @@ pub async fn ch_columns(
         .collect())
 }
 
+#[cfg(test)]
+mod http_client_tests {
+    use super::{build_http_client, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT};
+    use crate::DataSource;
+
+    #[test]
+    fn build_http_client_applies_timeouts_and_trust() {
+        assert_eq!(HTTP_CONNECT_TIMEOUT.as_secs(), 10);
+        assert_eq!(HTTP_REQUEST_TIMEOUT.as_secs(), 300);
+        let mut s = DataSource::postgres_local("ch", "default");
+        s.ssl_mode = "require".into();
+        s.ssl_trust_cert = true;
+        assert!(build_http_client(&s).is_ok());
+    }
+}
