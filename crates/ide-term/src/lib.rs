@@ -74,11 +74,8 @@ impl TerminalPane {
                         let s = String::from_utf8_lossy(&tmp[..n]);
                         let mut g = buf_c.lock();
                         g.push_str(&s);
-                        // keep last ~200k chars
-                        if g.len() > 200_000 {
-                            let keep = g.len() - 150_000;
-                            g.drain(..keep);
-                        }
+                        // keep last ~200k bytes, cut only on a UTF-8 boundary (#199)
+                        trim_buffer(&mut g, 200_000, 150_000);
                     }
                     Err(e) => {
                         warn!("pty read: {e}");
@@ -159,6 +156,19 @@ impl TerminalPane {
     }
 }
 
+/// Drop the oldest bytes of `buf` once it exceeds `max`, keeping about `keep_len`.
+/// Advances the cut to a UTF-8 char boundary so `drain` never panics (#199).
+fn trim_buffer(buf: &mut String, max: usize, keep_len: usize) {
+    if buf.len() <= max {
+        return;
+    }
+    let mut cut = buf.len().saturating_sub(keep_len);
+    while cut < buf.len() && !buf.is_char_boundary(cut) {
+        cut += 1;
+    }
+    buf.drain(..cut);
+}
+
 fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -229,6 +239,31 @@ mod strip_tests {
     fn strips_orphan_osc_crumb() {
         let s = "]0;Cursor Agent\u{07}plan";
         assert_eq!(strip_ansi(s), "plan");
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::trim_buffer;
+
+    #[test]
+    fn noop_when_under_max() {
+        let mut s = "hello".to_string();
+        trim_buffer(&mut s, 100, 50);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn does_not_panic_on_mid_codepoint_cut() {
+        // "é" is 2 bytes (C3 A9). Without boundary flooring, drain would panic.
+        let mut s = String::new();
+        for _ in 0..80 {
+            s.push('é');
+        }
+        trim_buffer(&mut s, 20, 10);
+        assert!(s.len() <= 20);
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+        assert!(!s.is_empty());
     }
 }
 
