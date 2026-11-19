@@ -1082,14 +1082,17 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 let accent = src
                     .map(|s| parse_accent_color(&s.accent))
                     .unwrap_or(color);
-                let row_bg = if selected {
-                    theme::surface_3()
+                let (row_fg, row_bg) = if selected && theme::is_mono() {
+                    // AMOLED: invert — grey slab on pure black reads as “dirty”, not mono.
+                    (theme::bg(), theme::text())
+                } else if selected {
+                    (theme::text(), theme::surface_3())
                 } else {
-                    theme::bg()
+                    (theme::text(), theme::bg())
                 };
                 let glyph_style = if selected {
                     Style::default()
-                        .fg(accent)
+                        .fg(if theme::is_mono() { row_fg } else { accent })
                         .bg(row_bg)
                         .add_modifier(Modifier::BOLD)
                 } else if matches!(e.kind, DbNodeKind::Source) {
@@ -1099,7 +1102,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 };
                 let label_style = if selected {
                     Style::default()
-                        .fg(theme::text())
+                        .fg(row_fg)
                         .bg(row_bg)
                         .add_modifier(Modifier::BOLD)
                 } else if matches!(e.kind, DbNodeKind::Source) {
@@ -1108,8 +1111,12 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     Style::default().fg(theme::text())
                 };
                 let inner_w = area.width.saturating_sub(2) as usize;
-                // Selection cue: accent bar ▎ (DataRig-like) instead of reverse-video wash.
-                let mark = if selected { theme::select_mark() } else { " " };
+                // Chromatic: accent bar ▎. AMOLED: invert row (no grey wash).
+                let mark = if selected && !theme::is_mono() {
+                    theme::select_mark()
+                } else {
+                    " "
+                };
                 let glyph_part = if matches!(e.kind, DbNodeKind::Source) {
                     format!("● {glyph} ")
                 } else {
@@ -1442,7 +1449,7 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             inner.width,
         );
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::surface_2())),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::chrome_wash())),
             Rect {
                 x: inner.x,
                 y,
@@ -2568,8 +2575,8 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         header_spans.push(Span::styled(format!("{t}"), style));
     }
-    // Header strip on L1 surface; active column uses grid_cursor_header fill.
-    let header: Line = Line::from(header_spans).style(Style::default().bg(theme::surface()));
+    // Header strip on pane fill; active column uses grid_cursor_header cue.
+    let header: Line = Line::from(header_spans).style(Style::default().bg(theme::pane_fill()));
 
     let filter = db.results_filter.clone();
     let filtered_idx: Vec<usize> = result
@@ -2591,9 +2598,13 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     for &ri in filtered_idx.iter().skip(scroll).take(visible_rows) {
         let row = &result.rows[ri];
         let row_dirty = dirty.contains(&ri);
+        let on_cursor_row = ri == result.cursor_row;
         let mut spans = vec![Span::styled(
             format!("{:>gutter_w$}  ", ri + 1),
-            if ri == result.cursor_row {
+            if on_cursor_row && theme::is_mono() {
+                // Inherit AMOLED invert from the line (don't re-assert body ink).
+                Style::default().add_modifier(Modifier::BOLD)
+            } else if on_cursor_row {
                 theme::style_text().add_modifier(Modifier::BOLD)
             } else {
                 theme::style_faint()
@@ -2607,7 +2618,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 spans.push(Span::raw("  "));
             }
             let w = col_widths[pos];
-            let is_cursor = ri == result.cursor_row && ci == result.cursor_col;
+            let is_cursor = on_cursor_row && ci == result.cursor_col;
             let is_null = cell == "NULL";
             let col_name = result.columns.get(ci).map(|s| s.as_str()).unwrap_or("");
             let mut t = if is_cursor && editing {
@@ -2634,8 +2645,11 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             let style = if is_cursor && editing {
                 theme::style_chip_run()
             } else if is_cursor {
-                // Loud cell (accent fill) + selection tint on the row.
+                // Loud cell (accent fill / mono invert+underline).
                 theme::style_grid_cursor_cell()
+            } else if on_cursor_row && theme::is_mono() {
+                // Keep invert readable — body `text` ink would wash on the light bar.
+                Style::default()
             } else if row_dirty {
                 Style::default().fg(theme::accent_warm()).add_modifier(Modifier::BOLD)
             } else if ci < pinned {
@@ -2675,28 +2689,43 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     } else {
         String::new()
     };
-    // Column rule: muted `─` with an accent segment under the active column.
-    let mut rule_spans = vec![Span::styled(
-        format!("{:>gutter_w$}  ", ""),
-        theme::style_faint(),
-    )];
-    for (pos, &ci) in col_indices.iter().enumerate() {
-        if pos > 0 {
-            rule_spans.push(Span::styled("  ", theme::style_faint()));
+    // Column rule: AMOLED keeps one quiet continuous rule; DataRig accents the active col.
+    let rule = if theme::is_mono() {
+        let rule_w = (grid_area.width as usize).saturating_sub(gutter_w + 2);
+        let mut rule_spans = vec![
+            Span::styled(format!("{:>gutter_w$}  ", ""), theme::style_faint()),
+            Span::styled(
+                "─".repeat(rule_w.min(120).max(8)),
+                theme::style_faint(),
+            ),
+        ];
+        if !h_hint.is_empty() {
+            rule_spans.push(Span::styled(h_hint, theme::style_faint()));
         }
-        let w = col_widths[pos];
-        let seg = "─".repeat(w.max(1));
-        let style = if ci == result.cursor_col {
-            Style::default().fg(theme::accent())
-        } else {
-            Style::default().fg(theme::border_idle())
-        };
-        rule_spans.push(Span::styled(seg, style));
-    }
-    if !h_hint.is_empty() {
-        rule_spans.push(Span::styled(h_hint, theme::style_faint()));
-    }
-    let rule = Line::from(rule_spans).style(Style::default().bg(theme::surface()));
+        Line::from(rule_spans).style(Style::default().bg(theme::pane_fill()))
+    } else {
+        let mut rule_spans = vec![Span::styled(
+            format!("{:>gutter_w$}  ", ""),
+            theme::style_faint(),
+        )];
+        for (pos, &ci) in col_indices.iter().enumerate() {
+            if pos > 0 {
+                rule_spans.push(Span::styled("  ", theme::style_faint()));
+            }
+            let w = col_widths[pos];
+            let seg = "─".repeat(w.max(1));
+            let style = if ci == result.cursor_col {
+                Style::default().fg(theme::accent())
+            } else {
+                Style::default().fg(theme::border_idle())
+            };
+            rule_spans.push(Span::styled(seg, style));
+        }
+        if !h_hint.is_empty() {
+            rule_spans.push(Span::styled(h_hint, theme::style_faint()));
+        }
+        Line::from(rule_spans).style(Style::default().bg(theme::pane_fill()))
+    };
     let mut lines = vec![header, rule];
     if nrows == 0 {
         lines.push(Line::from(Span::styled(
