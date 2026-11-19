@@ -7072,9 +7072,9 @@ impl App {
                 } else {
                     PathBuf::from(&self.db.persona.bi_export_dir)
                 };
-                match self.db.export_explore_pack() {
+                match self.db.export_explore_pack_to(&dir) {
                     Ok(p) => self.set_status(
-                        format!("BI export pack {} (configure bi_export_dir={})", p.display(), dir.display()),
+                        format!("BI export pack → {}", p.display()),
                         false,
                     ),
                     Err(e) => self.set_status(format!("bi export: {e:#}"), true),
