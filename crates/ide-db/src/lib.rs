@@ -5995,7 +5995,12 @@ impl DbWorkspace {
     }
 
     pub fn should_confirm_destructive(&self, sql: &str) -> bool {
-        self.persona.confirm_destructive_ddl && is_destructive_ddl(sql)
+        if !self.persona.confirm_destructive_ddl {
+            return false;
+        }
+        split_statements(sql)
+            .iter()
+            .any(|stmt| is_destructive_ddl(stmt))
     }
 
     pub fn viewer_hides_ddl(&self) -> bool {
@@ -11427,6 +11432,22 @@ mod migration_txn_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction is open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod destructive_confirm_tests {
+    use super::DbWorkspace;
+
+    #[test]
+    fn should_confirm_scans_statements() {
+        let mut ws = DbWorkspace::default();
+        ws.persona.confirm_destructive_ddl = true;
+        assert!(ws.should_confirm_destructive("DROP TABLE t;"));
+        assert!(ws.should_confirm_destructive("SELECT 1;\nTRUNCATE t;"));
+        assert!(!ws.should_confirm_destructive("SELECT 1;"));
+        ws.persona.confirm_destructive_ddl = false;
+        assert!(!ws.should_confirm_destructive("DROP TABLE t;"));
     }
 }
 
