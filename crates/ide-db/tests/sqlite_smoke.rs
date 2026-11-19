@@ -307,7 +307,8 @@ fn wave12_params_markdown_alter_fanout_help() {
     assert!(md.contains("| id |"));
     assert!(md.contains("| 1 |"));
     let chart = chart_result(&res, Some(1)).expect("numeric chart");
-    assert!(chart.contains("Spark"));
+    assert!(chart.contains("n="));
+    assert!(chart.contains('#')); // bar row tags
 
     let mut ws = DbWorkspace::default();
     let src = DataSource {

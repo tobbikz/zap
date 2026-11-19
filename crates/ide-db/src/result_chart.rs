@@ -28,14 +28,16 @@ pub fn chart_result(result: &QueryResult, col_idx: Option<usize>) -> Option<Stri
         let t = ((v - min) / span).clamp(0.0, 1.0);
         let n = (t * bar_w as f64).round() as usize;
         let bar: String = std::iter::repeat(crate::draw_glyphs::bar()).take(n).collect();
-        bars.push_str(&format!(" {:>2} │{:<width$} {:.4}\n", i + 1, bar, v, width = bar_w));
+        // Quiet rows — no index gutter; tag row for cursor highlight in the UI.
+        bars.push_str(&format!(
+            "#{i} {:<width$}  {v:.4}\n",
+            bar,
+            width = bar_w
+        ));
     }
     Some(format!(
-        "Chart · {col_name} (n={}) min={min:.4} max={max:.4}\n\
-         Spark: {sparkline}\n\
-         Bars (first {} rows):\n{bars}",
+        "{col_name}  n={}  {min:.4}…{max:.4}\n{sparkline}\n{bars}",
         values.len(),
-        values.len().min(12)
     ))
 }
 
@@ -129,18 +131,18 @@ pub fn chart_kind(result: &QueryResult, kind: &str, col_idx: Option<usize>) -> O
                 })
                 .collect();
             Some(format!(
-                "Line · {col_name}\n  {spark}\n  min={min:.4} max={max:.4} n={}\n",
+                "{col_name}  n={}  {min:.4}…{max:.4}\n{spark}\n",
                 values.len()
             ))
         }
         "pie" => {
             let sum: f64 = values.iter().sum::<f64>().max(f64::EPSILON);
-            let mut out = format!("Pie · {col_name}\n");
-            for (i, v) in values.iter().take(12).enumerate() {
+            let mut out = format!("{col_name}\n");
+            for (i, v) in values.iter().take(8).enumerate() {
                 let pct = (v / sum) * 100.0;
                 let n = (pct / 5.0).round() as usize;
                 let wedge: String = std::iter::repeat('●').take(n).collect();
-                out.push_str(&format!("  {:>2} {pct:5.1}% {wedge}\n", i + 1));
+                out.push_str(&format!("#{i} {pct:4.0}% {wedge}\n"));
             }
             Some(out)
         }

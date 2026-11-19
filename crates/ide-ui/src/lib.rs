@@ -3165,22 +3165,30 @@ fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
     );
 }
 
-/// Results cell peek card — quiet nubecita (column + value only).
-fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &str) {
-    if grid_area.width < 16 || grid_area.height < 4 {
+/// Results cell peek — value only (no column/meta chrome).
+fn render_cell_hover(frame: &mut Frame, grid_area: Rect, _col_name: &str, raw: &str) {
+    if grid_area.width < 12 || grid_area.height < 3 {
         return;
     }
-    let width = grid_area.width.saturating_sub(8).min(48).max(24);
-    let inner_w = (width as usize).saturating_sub(4).max(10);
+    let width = grid_area.width.saturating_sub(8).min(44).max(20);
+    let inner_w = (width as usize).saturating_sub(4).max(8);
     let pretty = display_cell_value(raw);
     let mut body_lines = hover_wrap_lines(&pretty, inner_w);
-    if body_lines.len() > 5 {
-        body_lines.truncate(5);
+    if body_lines.is_empty() {
+        body_lines.push(if raw.is_empty() {
+            "∅".into()
+        } else {
+            pretty
+        });
+    }
+    if body_lines.len() > 6 {
+        body_lines.truncate(6);
         body_lines.push("…".into());
     }
-    // Title + body (+ optional hairline) — no meta dump.
+    // borders(2) + body — previous +3 left value_area height 0 for short values.
     let height = (body_lines.len() as u16)
-        .saturating_add(3)
+        .saturating_add(2)
+        .max(3)
         .min(10)
         .min(grid_area.height.saturating_sub(1));
     let x = grid_area
@@ -3210,38 +3218,6 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_chars(col_name, inner.width as usize),
-            Style::default()
-                .fg(theme::accent())
-                .add_modifier(Modifier::BOLD),
-        ))),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "─".repeat(inner.width as usize),
-            theme::style_faint(),
-        )),
-        Rect {
-            x: inner.x,
-            y: inner.y + 1,
-            width: inner.width,
-            height: 1,
-        },
-    );
-    let value_area = Rect {
-        x: inner.x,
-        y: inner.y + 2,
-        width: inner.width,
-        height: inner.height.saturating_sub(2),
-    };
     let body: Vec<Line> = body_lines
         .into_iter()
         .map(|l| {
@@ -3253,7 +3229,7 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
             Line::from(Span::styled(l, style))
         })
         .collect();
-    frame.render_widget(Paragraph::new(body), value_area);
+    frame.render_widget(Paragraph::new(body), inner);
 }
 
 fn hover_wrap_lines(s: &str, width: usize) -> Vec<String> {
@@ -5104,61 +5080,32 @@ fn modal_chart_lines(
     cursor_row: usize,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let col_name = result
-        .columns
-        .get(col_i)
-        .map(|s| s.as_str())
-        .unwrap_or("?");
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            format!(" Chart · {col_name} · cursor row {}", cursor_row + 1),
-            theme::style_text().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-
-    // Prefer bar chart with cursor highlight on the focused row index.
-    if let Some(text) = ide_db::chart_kind(result, "bar", Some(col_i)) {
-        let cursor_tag = format!("{:>2} │", cursor_row + 1);
-        for l in text.lines() {
-            let shown = truncate_chars(l, width.saturating_sub(2));
-            let is_cursor = l.contains(&cursor_tag);
-            let style = if is_cursor {
-                theme::style_selected()
-            } else if l.contains('█') || l.contains('■') || l.contains('▁') || l.contains("Spark") {
-                theme::style_accent()
-            } else {
-                theme::style_text()
-            };
-            lines.push(Line::from(Span::styled(format!(" {shown}"), style)));
-        }
-    } else {
+    let mut lines: Vec<Line> = Vec::new();
+    // One clean bar view — no stacked Line/Pie dumps under it.
+    let Some(text) = ide_db::chart_kind(result, "bar", Some(col_i)) else {
         lines.push(Line::from(Span::styled(
-            " No numeric column to chart — ←→ pick a number col",
+            "no numeric column — ←→ pick one",
             theme::style_faint(),
         )));
-    }
-
-    if let Some(line) = ide_db::chart_kind(result, "line", Some(col_i)) {
-        lines.push(Line::from(""));
-        for l in line.lines() {
-            lines.push(Line::from(Span::styled(
-                format!(" {}", truncate_chars(l, width.saturating_sub(2))),
-                theme::style_muted(),
-            )));
-        }
-    }
-    if let Some(pie) = ide_db::chart_kind(result, "pie", Some(col_i)) {
-        lines.push(Line::from(""));
-        for l in pie.lines() {
-            let shown = truncate_chars(l, width.saturating_sub(2));
-            let style = if l.contains('●') {
-                theme::style_accent()
-            } else {
-                theme::style_muted()
-            };
-            lines.push(Line::from(Span::styled(format!(" {shown}"), style)));
-        }
+        return lines;
+    };
+    let cursor_tag = format!("#{cursor_row} ");
+    for (i, l) in text.lines().enumerate() {
+        let shown = truncate_chars(l, width.saturating_sub(1));
+        let is_cursor = l.starts_with(&cursor_tag);
+        let style = if is_cursor {
+            // Quiet caret — bold + accent ink, not a full invert wash.
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else if i == 0 {
+            theme::style_muted()
+        } else if i == 1 {
+            theme::style_accent()
+        } else {
+            theme::style_text()
+        };
+        lines.push(Line::from(Span::styled(shown, style)));
     }
     lines
 }
