@@ -8054,7 +8054,8 @@ fn history_folder(
     bookmarks: &[String],
 ) -> DbTreeNode {
     let mut children = Vec::new();
-    for (i, sql) in bookmarks.iter().rev().take(20).enumerate() {
+    // Show every bookmark (memory cap is 40) — do not hide the second half (#192).
+    for (i, sql) in bookmarks.iter().rev().enumerate() {
         children.push(admin_query_node(
             source_id,
             &format!("bookmark-{i}"),
@@ -9135,17 +9136,25 @@ impl DbWorkspace {
             self.status = "nothing to bookmark".into();
             return;
         }
-        if !self.bookmarks.iter().any(|b| b == &sql) {
-            self.bookmarks.push(sql.clone());
-            if self.bookmarks.len() > 40 {
-                let drop_n = self.bookmarks.len() - 40;
-                self.bookmarks.drain(0..drop_n);
-            }
-            self.persist_history();
+        if self.bookmarks.iter().any(|b| b == &sql) {
+            self.status = "already bookmarked".into();
+            return;
         }
-        // Also persist as a file so it can sync via GitHub/GitLab.
-        let _ = self.save_query_file(None, &sql);
-        self.status = "bookmarked + saved under queries/".into();
+        self.bookmarks.push(sql.clone());
+        if self.bookmarks.len() > 40 {
+            let drop_n = self.bookmarks.len() - 40;
+            self.bookmarks.drain(0..drop_n);
+        }
+        self.persist_history();
+        // Persist as a file so it can sync via GitHub/GitLab (skip on re-bookmark, #192).
+        match self.save_query_file(None, &sql) {
+            Ok(p) => {
+                self.status = format!("bookmarked → {}", p.display());
+            }
+            Err(e) => {
+                self.status = format!("bookmarked in memory, file save failed: {e:#}");
+            }
+        }
     }
 
     /// Save SQL to `queries_dir/{name}.sql`. Auto-names if `name` is None.
@@ -11250,6 +11259,36 @@ mod migration_txn_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction is open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod bookmark_dedupe_tests {
+    use super::DbWorkspace;
+
+    #[test]
+    fn rebookmark_skips_duplicate_file_and_status() {
+        let dir = std::env::temp_dir().join(format!(
+            "zap-bm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ws = DbWorkspace::default();
+        ws.set_queries_dir(dir.clone());
+        ws.sql = "SELECT 42;".into();
+        ws.bookmark_current_sql();
+        assert_eq!(ws.bookmarks.len(), 1);
+        assert!(ws.status.contains("bookmarked"), "{}", ws.status);
+        let count_after_first = std::fs::read_dir(&dir).unwrap().count();
+        ws.bookmark_current_sql();
+        assert_eq!(ws.bookmarks.len(), 1);
+        assert_eq!(ws.status, "already bookmarked");
+        let count_after_second = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count_after_first, count_after_second);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
