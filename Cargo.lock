@@ -1920,6 +1920,7 @@ dependencies = [
  "dirs",
  "ide-core",
  "serde",
+ "tokio",
  "toml",
  "tracing",
 ]
