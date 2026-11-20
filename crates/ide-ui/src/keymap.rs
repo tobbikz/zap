@@ -529,6 +529,7 @@ impl Keymap {
                 (false, false, KeyCode::Char('n')) => Some(Action::OpenCreateMenu),
                 (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
                 (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
+                (false, false, KeyCode::Char('o')) => Some(Action::OpenDbObjectPalette),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
                 (false, true, KeyCode::Char('T')) => Some(Action::CycleTheme),
@@ -608,6 +609,9 @@ impl Keymap {
                 (false, false, KeyCode::Char('m')) => Some(Action::OpenResultsActions),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
                 (false, true, KeyCode::Char('T')) => Some(Action::CycleTheme),
+                (true, true, KeyCode::Char('p') | KeyCode::Char('P')) => {
+                    Some(Action::OpenDbObjectPalette)
+                }
                 (false, false, KeyCode::Down) => Some(Action::MoveDown),
                 (false, false, KeyCode::Up) => Some(Action::MoveUp),
                 (false, false, KeyCode::Left) => Some(Action::MoveLeft),

@@ -2120,6 +2120,27 @@ impl DbWorkspace {
     }
 
     /// Label for Console toolbar schema dropdown.
+    /// Short table chip label for the Console toolbar (#8).
+    pub fn console_table_label(&self) -> String {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            if let Some(key) = tab.table_key.as_deref() {
+                let name = key.rsplit('.').next().unwrap_or(key);
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+            let title = tab.title.trim();
+            if !title.is_empty()
+                && !title.eq_ignore_ascii_case("Query")
+                && !title.starts_with("Query ")
+                && !title.starts_with("inspect")
+            {
+                return title.to_string();
+            }
+        }
+        "table".into()
+    }
+
     pub fn console_schema_label(&self) -> String {
         self.active_schema_name()
             .unwrap_or_else(|| "schema".into())
@@ -11432,6 +11453,22 @@ mod migration_txn_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction is open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod console_chip_label_tests {
+    use super::{DbWorkspace, SqlTab};
+
+    #[test]
+    fn console_table_label_from_table_key() {
+        let mut ws = DbWorkspace::default();
+        let mut tab = SqlTab::query(1);
+        tab.table_key = Some("quetzal.activity".into());
+        tab.title = "activity".into();
+        ws.tabs = vec![tab];
+        ws.active_tab = 0;
+        assert_eq!(ws.console_table_label(), "activity");
     }
 }
 
