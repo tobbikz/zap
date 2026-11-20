@@ -241,10 +241,10 @@ pub static PALETTES: &[Palette] = &[
         syn_function: rgb(40, 40, 40),
         syn_ident: rgb(30, 30, 30),
     },
-    // 2 — OpenCode gray canvas + Zap arc-blue accent — default
+    // 2 — Zap default: charcoal gray + arc-blue accent
     Palette {
-        id: "opencode",
-        label: "OpenCode",
+        id: "zap",
+        label: "Zap",
         light: false,
         bg: rgb(0x0a, 0x0a, 0x0a),
         surface: rgb(0x1a, 0x1a, 0x1a),
@@ -492,7 +492,9 @@ pub fn resolve_theme_id(name: &str) -> String {
         "bone" => "light".into(),
         "mocha" | "catppuccin" => "catppuccin-mocha".into(),
         "tokyo" | "tokyonight" => "tokyo-night".into(),
-        "oc" | "open-code" | "open_code" | "gray" | "grey" => "opencode".into(),
+        "oc" | "open-code" | "open_code" | "opencode" | "gray" | "grey" | "default" => {
+            "zap".into()
+        }
         "hc" | "contrast" => "high-contrast".into(),
         other => other.to_string(),
     }
@@ -509,7 +511,7 @@ pub fn set_mode_name(name: &str) {
         return;
     }
     // Fallback: product default
-    if let Some(p) = builtin_by_id("opencode") {
+    if let Some(p) = builtin_by_id("zap") {
         set_active(OwnedPalette::from_builtin(p));
     }
 }
@@ -537,7 +539,7 @@ pub fn list_themes() -> Vec<(String, String)> {
 pub fn cycle_theme(forward: bool) -> String {
     let all = list_themes();
     if all.is_empty() {
-        return "opencode".into();
+        return "zap".into();
     }
     let cur = current_id();
     let i = all.iter().position(|(id, _)| id == &cur).unwrap_or(0);
@@ -1005,15 +1007,16 @@ mod tests {
         assert_eq!(resolve_theme_id("Solarized"), "solarized");
         assert!(theme_custom::valid_theme_name("MyTheme"));
         assert!(!theme_custom::valid_theme_name("dark")); // built-in
-        assert!(!theme_custom::valid_theme_name("opencode"));
-        assert_eq!(resolve_theme_id("gray"), "opencode");
+        assert!(!theme_custom::valid_theme_name("zap"));
+        assert_eq!(resolve_theme_id("gray"), "zap");
+        assert_eq!(resolve_theme_id("opencode"), "zap");
     }
 
     #[test]
-    fn opencode_default_palette_exists() {
-        set_mode_name("opencode");
+    fn zap_default_palette_exists() {
+        set_mode_name("zap");
         assert!(!is_mono());
-        assert_eq!(current_id(), "opencode");
+        assert_eq!(current_id(), "zap");
         assert_ne!(bg(), surface());
         assert_eq!(accent(), rgb(0x60, 0xa5, 0xfa));
     }

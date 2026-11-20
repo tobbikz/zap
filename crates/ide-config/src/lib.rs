@@ -183,8 +183,8 @@ pub struct ThemeConfig {
 }
 
 fn default_theme_name() -> String {
-    // OpenCode-inspired neutral gray — AMOLED mono still available as `black`.
-    "opencode".into()
+    // Zap default: charcoal canvas + arc-blue accent (AMOLED mono still `black`).
+    "zap".into()
 }
 
 impl Default for ThemeConfig {
