@@ -167,33 +167,66 @@ pub fn mask_result(result: &QueryResult) -> QueryResult {
     out
 }
 
+/// Cell budget before we sample rows (cheap profile, not a full scan) (#172).
+const QUALITY_MAX_CELLS: usize = 200_000;
+/// Stop inserting into the distinct set past this size.
+const QUALITY_DISTINCT_CAP: usize = 10_000;
+
+fn quality_is_null_sentinel(cell: &str) -> bool {
+    cell.eq_ignore_ascii_case("NULL") || cell.eq_ignore_ascii_case("<null>")
+}
+
 /// null% / distinct / min / max quality strip for Results.
 pub fn quality_strip(result: &QueryResult) -> String {
     if result.columns.is_empty() {
         return "quality: (no columns)".into();
     }
-    let n = result.rows.len().max(1) as f64;
-    let mut lines = vec![format!("══ Quality strip · {} rows ══", result.rows.len())];
+    let cols = result.columns.len().max(1);
+    let max_rows = (QUALITY_MAX_CELLS / cols)
+        .max(1)
+        .min(result.rows.len());
+    let sample = &result.rows[..max_rows];
+    let truncated = max_rows < result.rows.len();
+    let n = sample.len().max(1) as f64;
+    let mut lines = vec![format!(
+        "══ Quality strip · {} rows{} ══",
+        result.rows.len(),
+        if truncated {
+            format!(" (sampled {max_rows})")
+        } else {
+            String::new()
+        }
+    )];
     for (ci, name) in result.columns.iter().enumerate() {
         let mut nulls = 0usize;
-        let mut distinct = std::collections::BTreeSet::new();
+        let mut distinct = std::collections::HashSet::<&str>::new();
+        let mut distinct_capped = false;
         let mut nums = Vec::new();
-        for row in &result.rows {
+        for row in sample {
             let cell = row.get(ci).map(|s| s.as_str()).unwrap_or("NULL");
-            if cell == "NULL" || cell.is_empty() {
+            // Empty string is a value — only the NULL sentinel counts (#172 / #83).
+            if quality_is_null_sentinel(cell) {
                 nulls += 1;
             } else {
-                distinct.insert(cell.to_string());
+                if !distinct_capped {
+                    if distinct.len() >= QUALITY_DISTINCT_CAP {
+                        distinct_capped = true;
+                    } else {
+                        distinct.insert(cell);
+                    }
+                }
                 if let Ok(v) = cell.parse::<f64>() {
                     nums.push(v);
                 }
             }
         }
         let null_pct = (nulls as f64 / n) * 100.0;
-        let mut line = format!(
-            "  {name}: null={null_pct:.1}% distinct={}",
-            distinct.len()
-        );
+        let distinct_s = if distinct_capped {
+            format!("≥{QUALITY_DISTINCT_CAP}")
+        } else {
+            distinct.len().to_string()
+        };
+        let mut line = format!("  {name}: null={null_pct:.1}% distinct={distinct_s}");
         if let (Some(min), Some(max)) = (
             nums.iter().copied().reduce(f64::min),
             nums.iter().copied().reduce(f64::max),
@@ -833,6 +866,23 @@ mod tests {
         assert!(chart_typed(&qr, "pie", Some(1), Some(0)).unwrap().contains("Pie"));
         assert!(chart_typed(&qr, "bar", Some(1), Some(0)).unwrap().contains("Bar"));
         assert!(chart_typed(&qr, "line", Some(1), None).unwrap().contains("Line"));
+    }
+
+    #[test]
+    fn quality_strip_empty_not_null() {
+        let qr = QueryResult {
+            columns: vec!["c".into()],
+            rows: vec![
+                vec!["".into()],
+                vec!["NULL".into()],
+                vec!["x".into()],
+            ],
+            ..QueryResult::empty()
+        };
+        let q = quality_strip(&qr);
+        // 1 of 3 is NULL sentinel → ~33.3%; empty must not inflate nulls.
+        assert!(q.contains("null=33.3%"), "{q}");
+        assert!(q.contains("distinct=2"), "{q}");
     }
 
     #[test]
