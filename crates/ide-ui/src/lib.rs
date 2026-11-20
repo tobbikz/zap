@@ -1117,12 +1117,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     Style::default().fg(theme::text())
                 };
                 let inner_w = area.width.saturating_sub(2) as usize;
-                // Chromatic: accent bar ▎. AMOLED: invert row (no grey wash).
-                let mark = if selected && !theme::is_mono() {
-                    theme::select_mark()
-                } else {
-                    " "
-                };
+                // Chromatic: solid accent rail cell. AMOLED: invert row (no grey wash).
                 let glyph_part = if matches!(e.kind, DbNodeKind::Source) {
                     format!("● {glyph} ")
                 } else {
@@ -1142,10 +1137,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     label.push_str(&" ".repeat(pad));
                 }
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        mark.to_string(),
-                        Style::default().fg(theme::accent()).bg(row_bg),
-                    ),
+                    theme::select_rail_span(selected),
                     Span::styled(
                         tree,
                         if selected {
@@ -1503,15 +1495,14 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         let rel = row - start;
         let text = lines.get(row).copied().unwrap_or("");
         let on_cursor = focused && row == cursor_row;
-        // DataRig-ish: accent bar ▎ + bold line number on cursor row.
+        // Solid accent rail + bold line number on cursor row.
         let gutter_fg = if on_cursor {
             theme::accent()
         } else {
             theme::faint()
         };
-        let bar = if on_cursor { theme::select_mark() } else { " " };
         let mut spans = vec![
-            Span::styled(bar.to_string(), Style::default().fg(theme::accent())),
+            theme::select_rail_span(on_cursor),
             Span::styled(
                 format!("{:>width$} ", row + 1, width = gutter),
                 Style::default()
@@ -5038,13 +5029,8 @@ fn modal_row_lines(
             name.clone()
         };
         let label = pad_display(&label, name_w);
-        // Clean row: accent rail + bold field; invert “cuadrado” only on the value
+        // Clean row: solid accent rail + bold field; invert “cuadrado” only on the value
         // text (not padded to full modal width — that was the heavy white bar).
-        let mark = if is_sel {
-            theme::select_mark()
-        } else {
-            " "
-        };
         let name_style = if is_sel {
             Style::default()
                 .fg(theme::accent())
@@ -5063,7 +5049,8 @@ fn modal_row_lines(
         };
         let val_pad = value_w.saturating_sub(display_width(&value));
         lines.push(Line::from(vec![
-            Span::styled(format!("{mark}{label}"), name_style),
+            theme::select_rail_span(is_sel),
+            Span::styled(label, name_style),
             Span::styled(" │ ", theme::style_faint()),
             Span::styled(value, val_style),
             Span::raw(" ".repeat(val_pad)),

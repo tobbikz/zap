@@ -106,6 +106,7 @@ impl Palette {
             item("Studio help", "studio_help"),
             item("Theme: AMOLED mono", "theme_black"),
             item("Theme: AMOLED light mono", "theme_white"),
+            item("Theme: Zap", "theme_zap"),
             item("Theme: Dark", "theme_dark"),
             item("Theme: Nord", "theme_nord"),
             item("Theme: Catppuccin Mocha", "theme_catppuccin-mocha"),

@@ -176,7 +176,8 @@ pub fn active() -> OwnedPalette {
     if let Some(a) = ACTIVE.lock().clone() {
         return a;
     }
-    let p = super::builtin_by_id("dark")
+    let p = super::builtin_by_id("zap")
+        .or_else(|| super::builtin_by_id("dark"))
         .or_else(|| super::builtin_by_id("black"))
         .expect("builtins");
     let owned = OwnedPalette::from_builtin(p);
@@ -200,7 +201,7 @@ pub fn create_custom_theme(name: &str, extends: &str) -> Result<PathBuf> {
     if !valid_theme_name(&name) {
         bail!("invalid theme name (letters/digits/-/_ , not a built-in)");
     }
-    let base = super::builtin_by_id(extends).or_else(|| super::builtin_by_id("dark"));
+    let base = super::builtin_by_id(extends).or_else(|| super::builtin_by_id("zap"));
     let Some(base) = base else {
         bail!("unknown extends theme");
     };
@@ -245,11 +246,11 @@ fn load_theme_file(path: &Path, id: &str) -> Result<OwnedPalette> {
     let ext = file
         .extends
         .as_deref()
-        .unwrap_or("dark")
+        .unwrap_or("zap")
         .trim()
         .to_ascii_lowercase();
     let base = super::builtin_by_id(&ext)
-        .or_else(|| super::builtin_by_id("dark"))
+        .or_else(|| super::builtin_by_id("zap"))
         .context("extends")?;
     let mut p = OwnedPalette::from_builtin(base);
     p.id = id.to_string();
