@@ -229,7 +229,35 @@ pub static PALETTES: &[Palette] = &[
         syn_function: rgb(40, 40, 40),
         syn_ident: rgb(30, 30, 30),
     },
-    // 2 — DataRig dark (teal accent) — values from DokaDev/datarig `DARK`
+    // 2 — OpenCode gray (neutral charcoal + warm accent) — default
+    Palette {
+        id: "opencode",
+        label: "OpenCode",
+        light: false,
+        bg: rgb(0x0a, 0x0a, 0x0a),
+        surface: rgb(0x1a, 0x1a, 0x1a),
+        surface_2: rgb(0x21, 0x21, 0x21),
+        surface_3: rgb(0x30, 0x30, 0x30), // selection
+        modal: rgb(0x1a, 0x1a, 0x1a),
+        border_idle: rgb(0x40, 0x40, 0x40),
+        border_focus: rgb(0xfa, 0xb2, 0x83), // warm cursor/accent
+        text: rgb(0xee, 0xee, 0xee),
+        muted: rgb(0xa3, 0xa3, 0xa3),
+        faint: rgb(0x73, 0x73, 0x73),
+        accent: rgb(0xfa, 0xb2, 0x83),
+        accent_warm: rgb(0xf5, 0xa7, 0x42),
+        warn: rgb(0xe5, 0xc0, 0x7b),
+        danger: rgb(0xe0, 0x6c, 0x75),
+        success: rgb(0x7f, 0xd8, 0x8f),
+        info: rgb(0x56, 0xb6, 0xc2),
+        syn_keyword: rgb(0x9d, 0x7c, 0xd8),
+        syn_string: rgb(0x7f, 0xd8, 0x8f),
+        syn_number: rgb(0xfa, 0xb2, 0x83),
+        syn_comment: rgb(0x6a, 0x6a, 0x6a),
+        syn_function: rgb(0x5c, 0x9c, 0xf5),
+        syn_ident: rgb(0xe0, 0xe0, 0xe0),
+    },
+    // 3 — DataRig dark (teal accent)
     Palette {
         id: "dark",
         label: "Dark",
@@ -257,7 +285,7 @@ pub static PALETTES: &[Palette] = &[
         syn_function: rgb(0x6F, 0xA8, 0xDC),
         syn_ident: rgb(0xD8, 0xDE, 0xE9),
     },
-    // 2 — Nord
+    // 4 — Nord
     Palette {
         id: "nord",
         label: "Nord",
@@ -452,6 +480,7 @@ pub fn resolve_theme_id(name: &str) -> String {
         "bone" => "light".into(),
         "mocha" | "catppuccin" => "catppuccin-mocha".into(),
         "tokyo" | "tokyonight" => "tokyo-night".into(),
+        "oc" | "open-code" | "open_code" | "gray" | "grey" => "opencode".into(),
         "hc" | "contrast" => "high-contrast".into(),
         other => other.to_string(),
     }
@@ -467,8 +496,8 @@ pub fn set_mode_name(name: &str) {
         set_active(c);
         return;
     }
-    // Fallback dark
-    if let Some(p) = builtin_by_id("dark") {
+    // Fallback: product default
+    if let Some(p) = builtin_by_id("opencode") {
         set_active(OwnedPalette::from_builtin(p));
     }
 }
@@ -496,7 +525,7 @@ pub fn list_themes() -> Vec<(String, String)> {
 pub fn cycle_theme(forward: bool) -> String {
     let all = list_themes();
     if all.is_empty() {
-        return "dark".into();
+        return "opencode".into();
     }
     let cur = current_id();
     let i = all.iter().position(|(id, _)| id == &cur).unwrap_or(0);
@@ -964,5 +993,15 @@ mod tests {
         assert_eq!(resolve_theme_id("Solarized"), "solarized");
         assert!(theme_custom::valid_theme_name("MyTheme"));
         assert!(!theme_custom::valid_theme_name("dark")); // built-in
+        assert!(!theme_custom::valid_theme_name("opencode"));
+        assert_eq!(resolve_theme_id("gray"), "opencode");
+    }
+
+    #[test]
+    fn opencode_default_palette_exists() {
+        set_mode_name("opencode");
+        assert!(!is_mono());
+        assert_eq!(current_id(), "opencode");
+        assert_ne!(bg(), surface());
     }
 }

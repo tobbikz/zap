@@ -183,8 +183,8 @@ pub struct ThemeConfig {
 }
 
 fn default_theme_name() -> String {
-    // DataRig-like accent dark — AMOLED mono still available as `black`.
-    "dark".into()
+    // OpenCode-inspired neutral gray — AMOLED mono still available as `black`.
+    "opencode".into()
 }
 
 impl Default for ThemeConfig {
