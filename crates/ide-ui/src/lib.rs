@@ -1442,15 +1442,22 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             .db
             .map(|d| d.console_schema_label())
             .unwrap_or_else(|| "schema".into());
+        let table_label = ctx
+            .db
+            .map(|d| d.console_table_label())
+            .unwrap_or_else(|| "table".into());
         let lim = match ctx.db.map(|d| d.select_limit).unwrap_or(50) {
             0 => "off".into(),
             n => n.to_string(),
         };
+        let insert = ctx.ui.mode == Mode::Insert;
         let spans = console_toolbar_spans(
             running,
             focused,
+            insert,
             &db_label,
             &schema_label,
+            &table_label,
             &lim,
             inner.width,
         );
@@ -3385,13 +3392,16 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("i", "insert"),
             ("F5", "run"),
             ("Ctrl-E", "EXPLAIN"),
-            ("b  s", "database · schema"),
+            ("b  s  o", "database · schema · table"),
+            ("Alt-b/s/o", "same while Insert"),
+            ("Alt-L", "cycle SELECT limit"),
             ("Shift-T", "cycle theme"),
         ],
         Focus::Database | Focus::Structure => &[
             ("Ctrl-P", "command palette"),
             ("Ctrl-W", "close SQL tab"),
             ("Enter", "open / expand"),
+            ("b  s  o", "database · schema · table"),
             ("d", "Go to DDL"),
             ("n", "Create…"),
             ("e", "edit connection"),
@@ -3545,7 +3555,7 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "F5 run · b database · s schema · D density · Super-⇧E CSV",
+                "F5 run · b/s/o db·schema·table · Alt-L lim · D density",
                 theme::style_muted(),
             )),
             Line::from(""),
@@ -3990,7 +4000,8 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
             return vec![
                 ("Esc", "normal"),
                 ("F5", "run"),
-                ("Ctrl-Space", "complete"),
+                ("Alt-b/s/o", "db·schema·table"),
+                ("Alt-L", "limit"),
             ];
         }
         Mode::EditCell => return vec![("Enter", "apply"), ("Esc", "cancel")],
@@ -4008,7 +4019,14 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
         return match ui.focus {
             Focus::Database => vec![("f", "exit full"), ("Enter", "open"), ("d", "DDL")],
             Focus::Structure => vec![("f", "exit full"), ("↑↓", "move")],
-            Focus::Editor => vec![("f", "exit full"), ("i", "insert"), ("F5", "run")],
+            Focus::Editor => {
+                vec![
+                    ("f", "exit full"),
+                    ("i", "insert"),
+                    ("F5", "run"),
+                    ("b/s/o", "db·schema·table"),
+                ]
+            }
             Focus::Results => vec![
                 ("f", "exit full"),
                 ("Space", "keys"),
@@ -4021,26 +4039,26 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
     match ui.focus {
         Focus::Database => vec![
             ("Enter", "open"),
+            ("b/s/o", "db·schema·table"),
             ("Ctrl-P", "palette"),
-            ("Ctrl-W", "close"),
             ("Tab", "focus"),
         ],
         Focus::Structure => vec![
             ("↑↓", "move"),
-            ("Ctrl-P", "palette"),
+            ("b/s/o", "db·schema·table"),
             ("Tab", "focus"),
             ("Esc", "home"),
         ],
         Focus::Editor => vec![
             ("i", "insert"),
             ("F5", "run"),
-            ("Ctrl-P", "palette"),
-            ("Ctrl-W", "close"),
+            ("b/s/o", "db·schema·table"),
+            ("Alt-L", "limit"),
         ],
         Focus::Results => vec![
             ("Space", "keys"),
-            ("Ctrl-P", "palette"),
-            ("Ctrl-W", "close"),
+            ("b/s", "db·schema"),
+            ("Ctrl-⇧P", "table"),
             ("m", "actions"),
         ],
         Focus::Search => vec![("↑↓", "move"), ("Enter", "open"), ("Esc", "back")],
@@ -5654,12 +5672,14 @@ fn pad_display(s: &str, width: usize) -> String {
     }
 }
 
-/// Build Console toolbar spans; drop schema then database as whole chips when narrow.
+/// Build Console toolbar spans; drop chips as whole tokens when narrow (#8).
 fn console_toolbar_spans(
     running: bool,
     console_focused: bool,
+    insert: bool,
     db_label: &str,
     schema_label: &str,
+    table_label: &str,
     lim: &str,
     width: u16,
 ) -> Vec<Span<'static>> {
@@ -5680,13 +5700,33 @@ fn console_toolbar_spans(
         )
     };
     let sep = Span::styled(" · ", theme::Role::Faint.style());
-    let db_chip = format!("{db_label} {}", icons::chevron_down());
-    let schema_chip = format!("{schema_label} {}", icons::chevron_down());
-    let lim_chip = format!("lim {lim}");
+    // Insert mode: bare b/s/o type SQL — show Alt chords that actually work.
+    let (db_key, schema_key, table_key, lim_key) = if insert {
+        ("Alt-b", "Alt-s", "Alt-o", "Alt-L")
+    } else {
+        ("b", "s", "o", "Alt-L")
+    };
+    let chev = icons::chevron_down();
+    let db_chip = format!("{db_key} {db_label} {chev}");
+    let schema_chip = format!("{schema_key} {schema_label} {chev}");
+    let table_chip = format!("{table_key} {table_label} {chev}");
+    let lim_chip = format!("lim {lim} {lim_key}");
 
     let chip = |label: String| Span::styled(format!(" {label} "), theme::style_chip());
 
     let candidates: Vec<Vec<Span<'static>>> = vec![
+        vec![
+            Span::raw(" "),
+            run.clone(),
+            sep.clone(),
+            chip(db_chip.clone()),
+            sep.clone(),
+            chip(schema_chip.clone()),
+            sep.clone(),
+            chip(table_chip.clone()),
+            sep.clone(),
+            chip(lim_chip.clone()),
+        ],
         vec![
             Span::raw(" "),
             run.clone(),

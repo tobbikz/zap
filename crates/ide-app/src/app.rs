@@ -9230,8 +9230,8 @@ async fn event_loop(
                                     .await?;
                                 continue;
                             }
-                            // Console DB/schema: Normal uses bare b/s; Insert uses Alt-b / Alt-s
-                            // so typing "select" / "schema" never opens the picker mid-edit.
+                            // Console DB/schema/table (#8): Normal uses bare b/s/o;
+                            // Insert uses Alt-b / Alt-s / Alt-o so typing SQL never opens pickers.
                             if app.ui.focus == Focus::Editor
                                 && !ctrl
                                 && matches!(
@@ -9240,6 +9240,8 @@ async fn event_loop(
                                         | KeyCode::Char('B')
                                         | KeyCode::Char('s')
                                         | KeyCode::Char('S')
+                                        | KeyCode::Char('o')
+                                        | KeyCode::Char('O')
                                 )
                             {
                                 let from_insert_alt = app.ui.mode == Mode::Insert && alt;
@@ -9254,9 +9256,17 @@ async fn event_loop(
                                             )
                                             .await?;
                                         }
-                                        _ => {
+                                        KeyCode::Char('s') | KeyCode::Char('S') => {
                                             app.handle_action(
                                                 Action::OpenConsoleSchema,
+                                                view_h,
+                                                term_rows,
+                                            )
+                                            .await?;
+                                        }
+                                        _ => {
+                                            app.handle_action(
+                                                Action::OpenDbObjectPalette,
                                                 view_h,
                                                 term_rows,
                                             )
