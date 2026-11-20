@@ -93,9 +93,21 @@ pub fn caret_char() -> char {
     if block_glyphs() { '▌' } else { '|' }
 }
 
-/// Explorer / gutter selection bar. `▎` is missing from Consolas and becomes a wide tofu box.
+/// Explorer / gutter selection rail glyph (legacy). Prefer `select_rail_span` —
+/// a space with accent *background* fills the whole cell (no black gap beside `▎`).
 pub fn select_mark() -> &'static str {
-    if block_glyphs() { "▎" } else { "│" }
+    " "
+}
+
+/// Solid 1-cell accent rail for selected rows (Explorer, gutters, inspectors).
+pub fn select_rail_span(selected: bool) -> ratatui::text::Span<'static> {
+    use ratatui::style::Style;
+    use ratatui::text::Span;
+    if selected && !is_mono() {
+        Span::styled(" ", Style::default().bg(accent()))
+    } else {
+        Span::styled(" ", Style::default())
+    }
 }
 
 pub fn swatch() -> &'static str {
@@ -229,7 +241,7 @@ pub static PALETTES: &[Palette] = &[
         syn_function: rgb(40, 40, 40),
         syn_ident: rgb(30, 30, 30),
     },
-    // 2 — OpenCode gray (neutral charcoal + warm accent) — default
+    // 2 — OpenCode gray canvas + Zap arc-blue accent — default
     Palette {
         id: "opencode",
         label: "OpenCode",
@@ -240,21 +252,21 @@ pub static PALETTES: &[Palette] = &[
         surface_3: rgb(0x30, 0x30, 0x30), // selection
         modal: rgb(0x1a, 0x1a, 0x1a),
         border_idle: rgb(0x40, 0x40, 0x40),
-        border_focus: rgb(0xfa, 0xb2, 0x83), // warm cursor/accent
+        border_focus: rgb(0x60, 0xa5, 0xfa), // arc blue
         text: rgb(0xee, 0xee, 0xee),
         muted: rgb(0xa3, 0xa3, 0xa3),
         faint: rgb(0x73, 0x73, 0x73),
-        accent: rgb(0xfa, 0xb2, 0x83),
-        accent_warm: rgb(0xf5, 0xa7, 0x42),
+        accent: rgb(0x60, 0xa5, 0xfa),
+        accent_warm: rgb(0x93, 0xc5, 0xfd),
         warn: rgb(0xe5, 0xc0, 0x7b),
         danger: rgb(0xe0, 0x6c, 0x75),
         success: rgb(0x7f, 0xd8, 0x8f),
         info: rgb(0x56, 0xb6, 0xc2),
         syn_keyword: rgb(0x9d, 0x7c, 0xd8),
         syn_string: rgb(0x7f, 0xd8, 0x8f),
-        syn_number: rgb(0xfa, 0xb2, 0x83),
+        syn_number: rgb(0x93, 0xc5, 0xfd),
         syn_comment: rgb(0x6a, 0x6a, 0x6a),
-        syn_function: rgb(0x5c, 0x9c, 0xf5),
+        syn_function: rgb(0x60, 0xa5, 0xfa),
         syn_ident: rgb(0xe0, 0xe0, 0xe0),
     },
     // 3 — DataRig dark (teal accent)
@@ -1003,5 +1015,6 @@ mod tests {
         assert!(!is_mono());
         assert_eq!(current_id(), "opencode");
         assert_ne!(bg(), surface());
+        assert_eq!(accent(), rgb(0x60, 0xa5, 0xfa));
     }
 }
