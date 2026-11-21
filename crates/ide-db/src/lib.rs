@@ -1471,6 +1471,8 @@ pub struct DbWorkspace {
     duck_interrupt: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     /// Recent table keys `source|schema|table` (newest first).
     pub recent_tables: Vec<String>,
+    /// Last Explorer Table selection (Vacuum/Reindex when AdminAction is focused) (#138).
+    pub last_table_sel: Option<(String, Option<String>, String, String)>,
     /// Optional Results row filter (substring, case-insensitive).
     pub results_filter: String,
     /// When true, Studio re-runs Health · Activity periodically (~5s).
@@ -1608,6 +1610,7 @@ impl Default for DbWorkspace {
             query_cancel_token: None,
             duck_interrupt: None,
             recent_tables: Vec::new(),
+            last_table_sel: None,
             results_filter: String::new(),
             health_activity_auto_refresh: false,
             pending_row_deletes: Vec::new(),
@@ -2087,12 +2090,34 @@ impl DbWorkspace {
         if self.selected > 0 {
             self.selected -= 1;
         }
+        self.note_explorer_table_sel();
     }
 
     pub fn move_down(&mut self) {
         if self.selected + 1 < self.flat.len() {
             self.selected += 1;
         }
+        self.note_explorer_table_sel();
+    }
+
+    /// Remember the current Explorer Table for maintenance when focus moves to Admin (#138).
+    fn note_explorer_table_sel(&mut self) {
+        let Some(e) = self.flat.get(self.selected) else {
+            return;
+        };
+        if !matches!(e.kind, DbNodeKind::Table) {
+            return;
+        }
+        let Some(schema) = e.schema.clone() else {
+            return;
+        };
+        let Some(table) = e.table.clone() else {
+            return;
+        };
+        if table == "er_sketch" || table == "wide_cell" {
+            return;
+        }
+        self.last_table_sel = Some((e.source_id.clone(), e.database.clone(), schema, table));
     }
 
     /// Keep the selected explorer row inside the visible window.
@@ -5998,6 +6023,7 @@ impl DbWorkspace {
             if let Some(sid) = self.flat.get(idx).map(|e| e.source_id.clone()) {
                 self.active_source = Some(sid);
             }
+            self.note_explorer_table_sel();
             true
         } else if let Some(idx) = self.flat.iter().position(|e| {
             e.table
@@ -6008,6 +6034,7 @@ impl DbWorkspace {
             if let Some(sid) = self.flat.get(idx).map(|e| e.source_id.clone()) {
                 self.active_source = Some(sid);
             }
+            self.note_explorer_table_sel();
             true
         } else {
             false
@@ -6543,10 +6570,63 @@ impl DbWorkspace {
     pub fn select_flat_index(&mut self, idx: usize) -> bool {
         if idx < self.flat.len() {
             self.selected = idx;
+            self.note_explorer_table_sel();
             true
         } else {
             false
         }
+    }
+
+    /// Strict table pick for Vacuum/Reindex — Explorer Table or last Table sel; never views/`last_result` (#138).
+    pub fn selected_maintenance_table(
+        &self,
+    ) -> Result<(String, Option<String>, String, String, DbDriver)> {
+        let picked = if let Some(e) = self.flat.get(self.selected) {
+            if matches!(e.kind, DbNodeKind::Table) {
+                let schema = e
+                    .schema
+                    .clone()
+                    .context("select a table with a schema")?;
+                let table = e.table.clone().context("missing table")?;
+                Some((e.source_id.clone(), e.database.clone(), schema, table))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (source_id, database, schema, table) = picked
+            .or_else(|| self.last_table_sel.clone())
+            .context("select a table in Explorer first (views / result fallbacks are blocked)")?;
+        if table == "er_sketch" || table == "wide_cell" {
+            bail!("synthetic result tables cannot be vacuumed");
+        }
+        let driver = self
+            .source_cfg(&source_id)
+            .map(|s| s.driver)
+            .unwrap_or_default();
+        Ok((source_id, database, schema, table, driver))
+    }
+
+    /// Build confirm payload for maintenance without executing (#138).
+    pub fn preview_maintenance(
+        &self,
+        op: PostgresMaintenance,
+    ) -> Result<(String, String, String, Option<String>)> {
+        let (source_id, database, schema, table, driver) = self.selected_maintenance_table()?;
+        let rbac_op = match op {
+            PostgresMaintenance::VacuumAnalyze | PostgresMaintenance::Analyze => "vacuum",
+            PostgresMaintenance::Reindex => "reindex",
+        };
+        self.guard_writable_op(&source_id, rbac_op)?;
+        let (label, sql) = maintenance_sql(driver, op, &schema, &table)?;
+        let msg = format!(
+            "{label} on {schema}.{table}\n\
+             source={source_id} db={}\n\
+             {sql}",
+            database.as_deref().unwrap_or("(default)")
+        );
+        Ok((sql, msg, source_id, database))
     }
 
     /// Table maintenance equivalents per engine (VACUUM / OPTIMIZE / REBUILD / …).
@@ -6554,13 +6634,7 @@ impl DbWorkspace {
         if self.in_txn {
             bail!("maintenance cannot run inside a transaction — commit or rollback first");
         }
-        let (source_id, database, schema, table) = self
-            .selected_table_context()
-            .context("select a table/view in Explorer or open a table data tab")?;
-        let driver = self
-            .source_cfg(&source_id)
-            .map(|s| s.driver)
-            .unwrap_or_default();
+        let (source_id, database, schema, table, driver) = self.selected_maintenance_table()?;
         let rbac_op = match op {
             PostgresMaintenance::VacuumAnalyze => "vacuum",
             PostgresMaintenance::Analyze => "vacuum",
@@ -7237,7 +7311,8 @@ impl DbWorkspace {
         };
         let sql = if truncate {
             match driver {
-                DbDriver::Sqlite => format!("DELETE FROM {qual};"),
+                // Transactional wipe — SQLite has no TRUNCATE (#126).
+                DbDriver::Sqlite => format!("BEGIN;\nDELETE FROM {qual};\nCOMMIT;"),
                 _ => format!("TRUNCATE TABLE {qual};"),
             }
         } else {
@@ -7247,9 +7322,16 @@ impl DbWorkspace {
             }
         };
         let label = if truncate {
-            format!("TRUNCATE {schema}.{table}? This cannot be undone.")
+            match driver {
+                DbDriver::Sqlite => format!(
+                    "DELETE all rows from {schema}.{table}?\n\
+                     (SQLite has no TRUNCATE — this wipes the table.)\n\
+                     This cannot be undone."
+                ),
+                _ => format!("TRUNCATE {schema}.{table}?\nThis cannot be undone."),
+            }
         } else {
-            format!("DROP TABLE {schema}.{table}? This cannot be undone.")
+            format!("DROP TABLE {schema}.{table}?\nThis cannot be undone.")
         };
         Ok((
             sql,
@@ -9128,6 +9210,9 @@ fn admin_folder_for(
         }
         DbDriver::Mysql => {
             let mut v = vec![
+                admin_action_node(source_id, "vacuum-analyze", "OPTIMIZE TABLE…"),
+                admin_action_node(source_id, "analyze-table", "ANALYZE TABLE…"),
+                admin_action_node(source_id, "reindex-table", "OPTIMIZE (reindex)…"),
                 admin_query_node(
                     source_id,
                     "processlist",
@@ -9165,6 +9250,9 @@ fn admin_folder_for(
             v
         }
         DbDriver::Sqlite => vec![
+            admin_action_node(source_id, "vacuum-analyze", "VACUUM…"),
+            admin_action_node(source_id, "analyze-table", "ANALYZE table…"),
+            admin_action_node(source_id, "reindex-table", "REINDEX table…"),
             admin_query_node(
                 source_id,
                 "database_list",
@@ -9192,6 +9280,9 @@ fn admin_folder_for(
         ],
         DbDriver::Mssql => {
             let mut v = vec![
+                admin_action_node(source_id, "vacuum-analyze", "UPDATE STATS + REBUILD…"),
+                admin_action_node(source_id, "analyze-table", "UPDATE STATISTICS…"),
+                admin_action_node(source_id, "reindex-table", "REBUILD indexes…"),
                 admin_query_node(
                     source_id,
                     "sessions",
@@ -9229,6 +9320,9 @@ fn admin_folder_for(
         }
         DbDriver::Clickhouse => {
             let mut v = vec![
+                admin_action_node(source_id, "vacuum-analyze", "OPTIMIZE TABLE FINAL…"),
+                admin_action_node(source_id, "analyze-table", "FLUSH LOGS…"),
+                admin_action_node(source_id, "reindex-table", "OPTIMIZE FINAL…"),
                 admin_query_node(
                     source_id,
                     "databases",
@@ -9267,13 +9361,18 @@ fn admin_folder_for(
             v.insert(0, clickhouse_health_folder(source_id));
             v
         }
-        DbDriver::Duckdb => vec![admin_query_node(
-            source_id,
-            "tables",
-            "Tables",
-            "SELECT table_schema, table_name, table_type FROM information_schema.tables \
-             WHERE table_schema NOT IN ('information_schema','pg_catalog') ORDER BY 1, 2;",
-        )],
+        DbDriver::Duckdb => vec![
+            admin_action_node(source_id, "vacuum-analyze", "CHECKPOINT…"),
+            admin_action_node(source_id, "analyze-table", "ANALYZE table…"),
+            admin_action_node(source_id, "reindex-table", "FORCE CHECKPOINT…"),
+            admin_query_node(
+                source_id,
+                "tables",
+                "Tables",
+                "SELECT table_schema, table_name, table_type FROM information_schema.tables \
+                 WHERE table_schema NOT IN ('information_schema','pg_catalog') ORDER BY 1, 2;",
+            ),
+        ],
         DbDriver::Redis => vec![
             admin_query_node(source_id, "scan", "SCAN keys", "SCAN"),
             admin_query_node(source_id, "dbsize", "DBSIZE", "DBSIZE"),
@@ -9936,6 +10035,7 @@ impl DbWorkspace {
             bail!("no active source");
         };
         let source_id = source_id.clone();
+        self.guard_writable_op(&source_id, "dump")?;
         let src = self
             .sources
             .iter()
@@ -10072,7 +10172,7 @@ impl DbWorkspace {
             .iter()
             .find(|s| &s.id == source_id)
             .context("missing source")?;
-        self.guard_writable_op(source_id, "restore dump")?;
+        self.guard_writable_op(source_id, "restore")?;
         let restored: Result<()> = match src.driver {
             DbDriver::Postgres => {
                 let db = self
@@ -11452,8 +11552,11 @@ fn row_preview(row: &[String], cols: &[String]) -> String {
         parts.push(format!("{name}={v}"));
     }
     let s = parts.join(", ");
-    if s.len() > 120 {
-        format!("{}…", &s[..117])
+    // Truncate on UTF-8 char boundaries — byte slicing panics on CJK/emoji (#136).
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(117).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
     } else {
         s
     }
