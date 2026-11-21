@@ -7692,14 +7692,21 @@ async fn exec_sqlite(pool: &SqlitePool, sql: &str) -> Result<QueryResult> {
 }
 
 fn is_query(sql: &str) -> bool {
-    let t = sql.trim_start().to_ascii_lowercase();
-    t.starts_with("select")
+    let stripped = strip_sql_comments(sql);
+    let t = stripped.trim_start().to_ascii_lowercase();
+    if t.starts_with("select")
         || t.starts_with("with")
         || t.starts_with("show")
         || t.starts_with("explain")
         || t.starts_with("pragma")
         || t.starts_with("describe")
         || t.starts_with("desc")
+    {
+        return true;
+    }
+    // DML with a result set (Postgres RETURNING / MSSQL OUTPUT) still returns rows (#77).
+    (t.starts_with("insert") || t.starts_with("update") || t.starts_with("delete"))
+        && (t.contains(" returning ") || t.contains(" output "))
 }
 
 fn rows_from_pg(rows: Vec<PgRow>) -> QueryResult {
@@ -11722,5 +11729,19 @@ mod ssl_trust_tests {
         s.driver = DbDriver::Mysql;
         let mysql_t = s.url_via(Some(13306));
         assert!(mysql_t.contains("ssl-mode=VERIFY_CA"), "{mysql_t}");
+    }
+}
+
+#[cfg(test)]
+mod is_query_comment_tests {
+    use super::is_query;
+
+    #[test]
+    fn leading_comments_keep_select_rows() {
+        assert!(is_query("-- Zap Console starter\nSELECT 1 AS ok;"));
+        assert!(is_query("/* recipe */\nSELECT 1"));
+        assert!(is_query("INSERT INTO t VALUES (1) RETURNING id"));
+        assert!(is_query("UPDATE t SET x=1 OUTPUT inserted.id"));
+        assert!(!is_query("-- note\nDELETE FROM t"));
     }
 }
