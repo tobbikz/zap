@@ -33,10 +33,8 @@ fn load_file() -> OauthFile {
 
 fn save_file(file: &OauthFile) -> Result<()> {
     let path = oauth_path().context("no config dir for oauth")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, toml::to_string_pretty(file)?)?;
+    ide_core::write_atomic(&path, toml::to_string_pretty(file)?)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -48,13 +46,50 @@ fn env_key(driver: DbDriver) -> &'static str {
     }
 }
 
-/// Default authorize URLs (MVP — paste token after browser consent).
-pub fn authorize_url(driver: DbDriver) -> Option<&'static str> {
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Build the Google installed-app authorize URL. Requires a real client id;
+/// without one Google rejects the request, so callers get `None` (#63).
+pub fn bigquery_authorize_url(client_id: &str, redirect_uri: &str) -> Option<String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        return None;
+    }
+    let redirect_uri = if redirect_uri.trim().is_empty() {
+        "http://localhost"
+    } else {
+        redirect_uri.trim()
+    };
+    Some(format!(
+        "https://accounts.google.com/o/oauth2/v2/auth?response_type=token&client_id={}&redirect_uri={}&scope={}&prompt=consent",
+        pct_encode(client_id),
+        pct_encode(redirect_uri),
+        pct_encode("https://www.googleapis.com/auth/bigquery"),
+    ))
+}
+
+/// Authorize URLs for browser OAuth (paste token after consent).
+/// BigQuery needs `ZAP_GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_ID` or returns `None`.
+pub fn authorize_url(driver: DbDriver) -> Option<String> {
     match driver {
-        DbDriver::Bigquery => Some(
-            "https://accounts.google.com/o/oauth2/v2/auth?response_type=token&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fbigquery",
-        ),
-        DbDriver::Snowflake => Some("https://app.snowflake.com/"),
+        DbDriver::Bigquery => {
+            let client_id = std::env::var("ZAP_GOOGLE_CLIENT_ID")
+                .or_else(|_| std::env::var("GOOGLE_CLIENT_ID"))
+                .unwrap_or_default();
+            let redirect = std::env::var("ZAP_OAUTH_REDIRECT_URI").unwrap_or_default();
+            bigquery_authorize_url(&client_id, &redirect)
+        }
+        DbDriver::Snowflake => Some("https://app.snowflake.com/".to_string()),
         _ => None,
     }
 }
@@ -113,5 +148,26 @@ pub fn load_persisted_tokens() {
         if std::env::var(&key).ok().filter(|s| !s.is_empty()).is_none() {
             std::env::set_var(key, val);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bigquery_url_requires_client_id() {
+        assert!(bigquery_authorize_url("", "http://localhost").is_none());
+        assert!(bigquery_authorize_url("   ", "").is_none());
+    }
+
+    #[test]
+    fn bigquery_url_includes_client_and_redirect() {
+        let url = bigquery_authorize_url("my-client.apps.googleusercontent.com", "").unwrap();
+        assert!(url.contains("client_id=my-client.apps.googleusercontent.com"), "{url}");
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost"), "{url}");
+        assert!(url.contains("response_type=token"), "{url}");
+        assert!(url.contains("bigquery"), "{url}");
+        assert!(!url.contains("client_id=&"), "{url}");
     }
 }
