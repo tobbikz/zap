@@ -7040,12 +7040,13 @@ impl DbWorkspace {
     }
 
     /// Build ALTER TABLE … ADD/DROP/RENAME COLUMN for the selected table (caller confirms).
+    /// Returns `(sql, label, source_id, database)` for confirm → execute (#151).
     pub fn alter_sql_for_selection(
         &self,
         kind: AlterColumnKind,
         spec: &str,
-    ) -> Result<(String, String)> {
-        let (source_id, _database, schema, table) = self
+    ) -> Result<(String, String, String, Option<String>)> {
+        let (source_id, database, schema, table) = self
             .selected_table_context()
             .context("select a table in Explorer or open a table data tab")?;
         let driver = self
@@ -7092,7 +7093,7 @@ impl DbWorkspace {
             AlterColumnKind::Drop => format!("DROP COLUMN on {schema}.{table}? This cannot be undone."),
             AlterColumnKind::Rename => format!("RENAME COLUMN on {schema}.{table}?"),
         };
-        Ok((sql, label))
+        Ok((sql, label, source_id, database))
     }
 
     /// Run active console SQL on every ★ pinned connection; summary in Results.
@@ -7160,7 +7161,11 @@ impl DbWorkspace {
     }
 
     /// Build DROP or TRUNCATE for the selected table (caller must confirm).
-    pub fn destructive_sql_for_selection(&self, truncate: bool) -> Result<(String, String)> {
+    /// Returns `(sql, label, source_id, database)` so confirm runs on the right pool (#151).
+    pub fn destructive_sql_for_selection(
+        &self,
+        truncate: bool,
+    ) -> Result<(String, String, String, Option<String>)> {
         let entry = self
             .flat
             .get(self.selected)
@@ -7204,7 +7209,12 @@ impl DbWorkspace {
         } else {
             format!("DROP TABLE {schema}.{table}? This cannot be undone.")
         };
-        Ok((sql, label))
+        Ok((
+            sql,
+            label,
+            entry.source_id.clone(),
+            entry.database.clone(),
+        ))
     }
 
     fn next_migration_version(&self) -> u32 {

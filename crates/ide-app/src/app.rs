@@ -2489,6 +2489,8 @@ impl App {
         self.ui.confirm_apply_pending = false;
         self.ui.confirm_delete_source_id = None;
         self.ui.confirm_run_sql = Some(sql);
+        self.ui.confirm_run_source_id = self.db.active_source.clone();
+        self.ui.confirm_run_database = self.db.active_database.clone();
         self.ui.confirm_delete_label = format!("Destructive SQL — Enter run · Esc cancel\n{preview}");
         self.ui.mode = Mode::ConfirmDeleteSource;
         self.set_status("confirm destructive SQL — Enter run · Esc cancel", true);
@@ -2823,10 +2825,12 @@ impl App {
 
     fn start_destructive_sql(&mut self, truncate: bool) {
         match self.db.destructive_sql_for_selection(truncate) {
-            Ok((sql, label)) => {
+            Ok((sql, label, source_id, database)) => {
                 self.ui.confirm_apply_pending = false;
                 self.ui.confirm_delete_source_id = None;
                 self.ui.confirm_run_sql = Some(sql);
+                self.ui.confirm_run_source_id = Some(source_id);
+                self.ui.confirm_run_database = database;
                 self.ui.confirm_delete_label = label;
                 self.ui.mode = Mode::ConfirmDeleteSource;
             }
@@ -2839,10 +2843,28 @@ impl App {
             self.ui.mode = Mode::Normal;
             return Ok(());
         };
+        let target_source = self.ui.confirm_run_source_id.take();
+        let target_db = self.ui.confirm_run_database.take();
         self.ui.confirm_delete_label.clear();
         self.ui.mode = Mode::Normal;
-        self.db.sql = sql;
-        self.queue_db_query();
+        // Run on the Explorer target pool without clobbering Console SQL (#151).
+        let prev_source = self.db.active_source.clone();
+        let prev_db = self.db.active_database.clone();
+        if let Some(sid) = target_source {
+            self.db.active_source = Some(sid);
+        }
+        if target_db.is_some() {
+            self.db.active_database = target_db;
+        }
+        self.ui.busy_label = Some("RUNNING…".into());
+        let result = self.db.execute_sql_text(&sql).await;
+        self.db.active_source = prev_source;
+        self.db.active_database = prev_db;
+        self.finish_query_ui();
+        match result {
+            Ok(()) => self.set_status(self.db.status.clone(), false),
+            Err(e) => self.show_query_error(format!("{e:#}")),
+        }
         Ok(())
     }
 
@@ -3213,10 +3235,12 @@ impl App {
                     _ => AlterColumnKind::Add,
                 };
                 match self.db.alter_sql_for_selection(kind, &raw) {
-                    Ok((sql, label)) => {
+                    Ok((sql, label, source_id, database)) => {
                         self.ui.confirm_apply_pending = false;
                         self.ui.confirm_delete_source_id = None;
                         self.ui.confirm_run_sql = Some(sql);
+                        self.ui.confirm_run_source_id = Some(source_id);
+                        self.ui.confirm_run_database = database;
                         self.ui.confirm_delete_label = label;
                         self.ui.mode = Mode::ConfirmDeleteSource;
                     }
@@ -5086,6 +5110,8 @@ impl App {
                     self.pending_workspace_path = None;
                     self.ui.confirm_apply_pending = false;
                     self.ui.confirm_run_sql = None;
+                    self.ui.confirm_run_source_id = None;
+                    self.ui.confirm_run_database = None;
                     self.ui.rename_tab_pending = false;
                     self.ui.oauth_paste_pending = false;
                     self.ui.show_completions = false;
