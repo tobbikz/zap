@@ -68,18 +68,82 @@ pub fn audit_log_path() -> PathBuf {
         .join("audit.log")
 }
 
+/// Rotate the audit log before it grows past this size (keeps one `.1` backup).
+const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+fn redact_audit_sql(sql: &str) -> String {
+    fn re(cell: &'static std::sync::OnceLock<Regex>, pattern: &str) -> &'static Regex {
+        cell.get_or_init(|| Regex::new(pattern).expect("valid audit redaction regex"))
+    }
+    static ASSIGN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static IDENT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static PASSWORD: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static URL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+    let mut out = re(
+        &URL,
+        r"(?i)(://[^:/@\s]+:)([^@\s]+)(@)",
+    )
+    .replace_all(sql, "$1[redacted]$3")
+    .to_string();
+    out = re(
+        &ASSIGN,
+        r#"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key)\b(\s*=\s*)(['"])[^'"]*"#,
+    )
+    .replace_all(&out, "$1$2$3[redacted]$3")
+    .to_string();
+    out = re(
+        &IDENT,
+        r#"(?i)(IDENTIFIED\s+BY\s+)('[^']*'|"[^"]*")"#,
+    )
+    .replace_all(&out, "$1[redacted]")
+    .to_string();
+    out = re(
+        &PASSWORD,
+        r#"(?i)\b(PASSWORD\s+)('[^']*'|"[^"]*")"#,
+    )
+    .replace_all(&out, "$1[redacted]")
+    .to_string();
+    out
+}
+
 /// Append one DDL/DML audit line (local file).
+///
+/// The log is owner-only on Unix, rotated at 5 MiB, and SQL is redacted for
+/// common credential literals before it is written (#165).
 pub fn audit_append(source: &str, driver: &str, sql: &str) -> Result<()> {
     let path = audit_log_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= AUDIT_MAX_BYTES {
+        let rotated = path.with_extension("log.1");
+        let _ = fs::remove_file(&rotated);
+        let _ = fs::rename(&path, &rotated);
+    }
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?
+    };
+    #[cfg(not(unix))]
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
-    let one_line = sql.replace('\n', " ").chars().take(500).collect::<String>();
+    let redacted = redact_audit_sql(sql);
+    let one_line = redacted
+        .replace('\n', " ")
+        .chars()
+        .take(500)
+        .collect::<String>();
     writeln!(f, "{ts}\t{driver}\t{source}\t{one_line}")?;
     Ok(())
 }
@@ -905,5 +969,17 @@ mod tests {
         assert_eq!(audit_csv_field("plain"), "plain");
         assert_eq!(audit_csv_field("a,b"), "\"a,b\"");
         assert_eq!(audit_csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn audit_redacts_credentials() {
+        let sql = "ALTER ROLE app PASSWORD 'hunter2'; CREATE USER u IDENTIFIED BY 's3cret';";
+        let out = redact_audit_sql(sql);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(!out.contains("s3cret"), "{out}");
+        assert!(out.contains("[redacted]"), "{out}");
+        let url = redact_audit_sql("postgres://alice:topsecret@db:5432/app");
+        assert!(!url.contains("topsecret"), "{url}");
+        assert!(url.contains("postgres://alice:[redacted]@db"), "{url}");
     }
 }
