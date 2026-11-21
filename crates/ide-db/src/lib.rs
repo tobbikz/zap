@@ -1238,7 +1238,8 @@ fn json_escape_value(v: &str) -> String {
 
 fn sql_literal(v: &str) -> String {
     let t = v.trim();
-    if t.is_empty() || t == "NULL" || t.eq_ignore_ascii_case("<null>") {
+    // `NULL` / `<null>` are the grid's NULL sentinels; an empty string is a real value (#82).
+    if t == "NULL" || t.eq_ignore_ascii_case("<null>") {
         "NULL".into()
     } else {
         format!("'{}'", v.replace('\'', "''"))
@@ -11818,6 +11819,20 @@ mod ssl_trust_tests {
         s.driver = DbDriver::Mysql;
         let mysql_t = s.url_via(Some(13306));
         assert!(mysql_t.contains("ssl-mode=VERIFY_CA"), "{mysql_t}");
+    }
+}
+
+#[cfg(test)]
+mod sql_literal_tests {
+    use super::sql_literal;
+
+    #[test]
+    fn empty_string_is_not_null() {
+        assert_eq!(sql_literal(""), "''");
+        assert_eq!(sql_literal(" "), "' '");
+        assert_eq!(sql_literal("NULL"), "NULL");
+        assert_eq!(sql_literal("<null>"), "NULL");
+        assert_eq!(sql_literal("O'Brien"), "'O''Brien'");
     }
 }
 
