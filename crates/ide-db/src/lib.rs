@@ -1927,7 +1927,13 @@ impl DbWorkspace {
         if !src.role.allows_admin()
             && matches!(
                 op,
-                "dump" | "restore" | "vacuum" | "reindex" | "schema diff apply"
+                "dump"
+                    | "restore"
+                    | "vacuum"
+                    | "reindex"
+                    | "schema diff apply"
+                    | "kill session"
+                    | "migration apply"
             )
         {
             bail!("RBAC editor on \"{}\" — {op} requires admin", src.name);
@@ -6524,7 +6530,12 @@ impl DbWorkspace {
             .source_cfg(&source_id)
             .map(|s| s.driver)
             .unwrap_or_default();
-        self.guard_writable_op(&source_id, "maintenance")?;
+        let rbac_op = match op {
+            PostgresMaintenance::VacuumAnalyze => "vacuum",
+            PostgresMaintenance::Analyze => "vacuum",
+            PostgresMaintenance::Reindex => "reindex",
+        };
+        self.guard_writable_op(&source_id, rbac_op)?;
         self.ensure_connected(&source_id, database.as_deref())
             .await?;
         let (label, sql) = maintenance_sql(driver, op, &schema, &table)?;
@@ -10179,6 +10190,7 @@ impl DbWorkspace {
         let Some(source_id) = self.active_source.clone() else {
             bail!("no active source");
         };
+        self.guard_writable_op(&source_id, "kill session")?;
         let driver = self
             .sources
             .iter()
@@ -12045,6 +12057,26 @@ mod cancel_tests {
             "{}",
             ws.status
         );
+    }
+}
+
+#[cfg(test)]
+mod rbac_admin_op_tests {
+    use super::{DataSource, DbWorkspace, SourceRole};
+
+    #[test]
+    fn editor_blocked_from_vacuum_kill_and_migration() {
+        let mut ws = DbWorkspace::default();
+        let mut src = DataSource::postgres_local("t", "db");
+        src.id = "s1".into();
+        src.role = SourceRole::Editor;
+        ws.sources.push(src);
+        for op in ["vacuum", "reindex", "kill session", "migration apply"] {
+            let err = ws.guard_writable_op("s1", op).unwrap_err().to_string();
+            assert!(err.contains("requires admin"), "{op}: {err}");
+        }
+        // Ordinary writes still allowed for editor.
+        ws.guard_writable_op("s1", "CSV import").unwrap();
     }
 }
 
