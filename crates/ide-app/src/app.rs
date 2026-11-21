@@ -1009,13 +1009,14 @@ impl App {
         Ok(())
     }
 
+    /// Only when the Explorer cursor is on a Source row — never fall back to
+    /// `active_source` (that made Delete/x on tables prompt Remove connection, #153).
     fn selected_connection_id(&self) -> Option<String> {
         self.db
             .flat
             .get(self.db.selected)
             .filter(|e| matches!(e.kind, DbNodeKind::Source))
             .map(|e| e.source_id.clone())
-            .or_else(|| self.db.active_source.clone())
     }
 
     fn start_delete_connection(&mut self, source_id: &str) {
@@ -1859,7 +1860,13 @@ impl App {
                         );
                         self.run_query().await?;
                     }
-                    Ok(false) => {}
+                    Ok(false) => {
+                        // History / bookmark / saved query: loaded into Console only (#89).
+                        self.ui.focus = Focus::Editor;
+                        self.ui.mode = Mode::Insert;
+                        self.ui.bottom = BottomPanel::Results;
+                        self.set_status(self.db.status.clone(), false);
+                    }
                     Err(e) => self.set_status(format!("admin: {e:#}"), true),
                 }
             }
@@ -6701,34 +6708,20 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("rollback: {e:#}"), true),
             },
-            "view_wide_cell" => match self.db.last_result.as_ref().map(|r| r.wide_cell_text()) {
-                Some(Ok(text)) => {
-                    let rows: Vec<Vec<String>> =
-                        text.lines().map(|l| vec![l.to_string()]).collect();
-                    let n = rows.len();
-                    self.db.last_result = Some(ide_db::QueryResult {
-                        columns: vec!["wide_cell".into()],
-                        rows,
-                        affected: None,
-                        elapsed_ms: 0,
-                        truncated: false,
-                        source_schema: None,
-                        source_table: Some("wide_cell".into()),
-                        primary_keys: Vec::new(),
-                        original_rows: Vec::new(),
-                        cursor_row: 0,
-                        cursor_col: 0,
-                        explain: None,
-                        chart: None,
-                        page: 0,
-                        has_more: false,
-                    });
+            "view_wide_cell" => {
+                // Open Inspect cell drill — do not replace last_result (#147).
+                if self.db.last_result.is_some() {
                     self.ui.focus = Focus::Results;
-                    self.set_status(format!("wide cell · {n} lines"), false);
+                    self.ui.bottom = BottomPanel::Results;
+                    self.ui.cell_modal = true;
+                    self.ui.cell_modal_drill = true;
+                    self.ui.cell_modal_tab = 0;
+                    self.ui.mode = Mode::Normal;
+                    self.set_status("wide cell · Inspect (Esc keeps the grid)", false);
+                } else {
+                    self.set_status("no result cell", true);
                 }
-                Some(Err(e)) => self.set_status(format!("wide cell: {e:#}"), true),
-                None => self.set_status("no result cell", true),
-            },
+            }
             "paste_tsv" => {
                 self.ui.mode = Mode::ImportCsv;
                 self.ui.confirm_run_sql = Some("__paste_tsv__".into());
