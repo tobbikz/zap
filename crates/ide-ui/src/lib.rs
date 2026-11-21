@@ -158,8 +158,11 @@ pub struct UiState {
     pub oauth_paste_pending: bool,
     /// ConfirmDeleteSource dialog is Apply UPDATEs (not delete connection).
     pub confirm_apply_pending: bool,
-    /// ConfirmDeleteSource dialog will run this SQL (DROP/TRUNCATE).
+    /// ConfirmDeleteSource dialog will run this SQL (DROP/TRUNCATE/ALTER).
     pub confirm_run_sql: Option<String>,
+    /// Pool target for `confirm_run_sql` (Explorer selection, not Console) (#151).
+    pub confirm_run_source_id: Option<String>,
+    pub confirm_run_database: Option<String>,
     /// BrainAsk / rename prompt collecting a SQL tab title.
     pub rename_tab_pending: bool,
     /// ConfirmQuit dialog message (Wave 3).
@@ -273,6 +276,8 @@ impl Default for UiState {
             oauth_paste_pending: false,
             confirm_apply_pending: false,
             confirm_run_sql: None,
+            confirm_run_source_id: None,
+            confirm_run_database: None,
             rename_tab_pending: false,
             confirm_quit_label: String::new(),
             session_form_field: 0,
