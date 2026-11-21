@@ -497,16 +497,31 @@ impl App {
     }
 
     async fn request_quit(&mut self) -> Result<()> {
-        if let Some(nvim) = self.nvim.as_ref() {
-            let dirty = nvim.dirty_buf_count().await.unwrap_or(0);
-            if dirty > 0 {
-                self.pending_workspace_path = None;
-                self.ui.confirm_quit_label = format!(
-                    "{dirty} dirty Neovim buffer(s). y=save & quit · !=discard · n=cancel"
-                );
-                self.ui.mode = Mode::ConfirmQuit;
-                return Ok(());
+        let dirty_nvim = if let Some(nvim) = self.nvim.as_ref() {
+            nvim.dirty_buf_count().await.unwrap_or(0)
+        } else {
+            0
+        };
+        let db_warning = self.db.quit_warning();
+        if dirty_nvim > 0 || db_warning.is_some() {
+            let mut parts = Vec::new();
+            if dirty_nvim > 0 {
+                parts.push(format!("{dirty_nvim} dirty Neovim buffer(s)"));
             }
+            if let Some(w) = &db_warning {
+                parts.push(w.clone());
+            }
+            let action = if dirty_nvim > 0 {
+                "y=save & quit"
+            } else {
+                "y=quit anyway"
+            };
+            self.pending_workspace_path = None;
+            self.ui.confirm_quit_label = format!("{}. {action} · n=cancel", parts.join(" · "));
+            self.ui.mode = Mode::ConfirmQuit;
+            return Ok(());
+        }
+        if let Some(nvim) = self.nvim.as_ref() {
             nvim.quit().await;
             self.nvim = None;
             self.should_quit = true;

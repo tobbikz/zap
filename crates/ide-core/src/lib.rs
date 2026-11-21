@@ -1,6 +1,7 @@
 //! Shared types, errors, and editor mode for Zap.
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -28,6 +29,66 @@ pub fn config_dir() -> Option<PathBuf> {
 /// Cache / log directory (`~/.cache/zap`).
 pub fn cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join(PRODUCT_BIN))
+}
+
+/// Write `contents` to `path` atomically.
+///
+/// The bytes go to a sibling temp file which is fsynced and then renamed over the
+/// destination, so a crash mid-write leaves the previous file intact instead of a
+/// truncated one. Parent directories are created. On Unix the temp file is created
+/// with mode `0600` and the final file keeps those private permissions.
+pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)?;
+
+    let result = file
+        .write_all(contents.as_ref())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    harden_private_file(path)
+}
+
+/// Best-effort owner-only permissions for files that may hold secrets or history.
+/// No-op on platforms where Unix mode bits are unavailable.
+pub fn harden_private_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -320,4 +381,32 @@ pub enum Sidebar {
     Sessions,
     Agents,
     Database,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_atomic_replaces_contents() {
+        let dir = std::env::temp_dir().join(format!(
+            "zap-core-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("nested").join("config.toml");
+        write_atomic(&path, "a = 1\n").unwrap();
+        write_atomic(&path, "a = 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a = 2\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
