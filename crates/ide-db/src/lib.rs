@@ -460,6 +460,14 @@ fn mssql_quote_ident(name: &str) -> String {
     format!("[{}]", name.replace(']', "]]"))
 }
 
+fn quote_ident(driver: DbDriver, name: &str) -> String {
+    match driver {
+        DbDriver::Mysql | DbDriver::Clickhouse => mysql_quote_ident(name),
+        DbDriver::Mssql => mssql_quote_ident(name),
+        _ => pg_quote_ident(name),
+    }
+}
+
 /// Qualify schema.table for SELECT * data tabs.
 pub fn qualify_table_name(driver: DbDriver, schema: &str, table: &str) -> String {
     match driver {
@@ -873,21 +881,43 @@ impl QueryResult {
             .collect()
     }
 
-    fn table_qual_sql(&self) -> Result<String> {
+    fn table_qual_sql(&self, driver: DbDriver) -> Result<String> {
         let table = self
             .source_table
             .as_ref()
             .context("result has no source table — run SELECT from a single table")?;
-        let schema = self.source_schema.as_deref();
-        Ok(match schema {
-            Some(s) if s != "main" => format!("\"{s}\".\"{table}\""),
-            _ => format!("\"{table}\""),
-        })
+        let schema = self.source_schema.as_deref().unwrap_or("");
+        Ok(qualify_table_name(driver, schema, table))
+    }
+
+    fn pk_where_clause(&self, driver: DbDriver, orig: &[String]) -> Result<String> {
+        if self.primary_keys.is_empty() {
+            bail!("no primary key metadata");
+        }
+        let mut wheres = Vec::with_capacity(self.primary_keys.len());
+        for pk in &self.primary_keys {
+            let Some(ci) = self.columns.iter().position(|c| c == pk) else {
+                bail!(
+                    "primary key column `{pk}` missing from result — cannot Apply safely"
+                );
+            };
+            let v = orig.get(ci).map(|s| s.as_str()).unwrap_or("NULL");
+            wheres.push(format!(
+                "{} = {}",
+                quote_ident(driver, pk),
+                sql_literal(v)
+            ));
+        }
+        Ok(wheres.join(" AND "))
     }
 
     /// Build UPDATE statements for dirty *existing* rows (requires table + PK metadata).
     pub fn pending_updates(&self) -> Result<Vec<String>> {
-        let qual = self.table_qual_sql()?;
+        self.pending_updates_for(DbDriver::Postgres)
+    }
+
+    pub fn pending_updates_for(&self, driver: DbDriver) -> Result<Vec<String>> {
+        let qual = self.table_qual_sql(driver)?;
         if self.primary_keys.is_empty() {
             bail!("no primary key metadata — cannot generate UPDATE");
         }
@@ -907,27 +937,17 @@ impl QueryResult {
                 if row.get(ci) != orig.get(ci) {
                     let v = row.get(ci).map(|s| s.as_str()).unwrap_or("NULL");
                     let lit = sql_literal(v);
-                    sets.push(format!("\"{col}\" = {lit}"));
+                    sets.push(format!("{} = {lit}", quote_ident(driver, col)));
                 }
             }
             if sets.is_empty() {
                 continue;
             }
-            let mut wheres = Vec::new();
-            for pk in &self.primary_keys {
-                let Some(ci) = self.columns.iter().position(|c| c == pk) else {
-                    continue;
-                };
-                let v = orig.get(ci).map(|s| s.as_str()).unwrap_or("NULL");
-                wheres.push(format!("\"{pk}\" = {}", sql_literal(v)));
-            }
-            if wheres.is_empty() {
-                continue;
-            }
+            let wheres = self.pk_where_clause(driver, orig)?;
             stmts.push(format!(
                 "UPDATE {qual} SET {} WHERE {};",
                 sets.join(", "),
-                wheres.join(" AND ")
+                wheres
             ));
         }
         Ok(stmts)
@@ -935,14 +955,18 @@ impl QueryResult {
 
     /// INSERT for rows appended after the original snapshot.
     pub fn pending_inserts(&self) -> Result<Vec<String>> {
-        let qual = self.table_qual_sql()?;
+        self.pending_inserts_for(DbDriver::Postgres)
+    }
+
+    pub fn pending_inserts_for(&self, driver: DbDriver) -> Result<Vec<String>> {
+        let qual = self.table_qual_sql(driver)?;
         if self.columns.is_empty() {
             return Ok(Vec::new());
         }
         let cols = self
             .columns
             .iter()
-            .map(|c| format!("\"{c}\""))
+            .map(|c| quote_ident(driver, c))
             .collect::<Vec<_>>()
             .join(", ");
         let mut stmts = Vec::new();
@@ -958,7 +982,15 @@ impl QueryResult {
     }
 
     pub fn delete_sql_for_original_row(&self, orig_idx: usize) -> Result<String> {
-        let qual = self.table_qual_sql()?;
+        self.delete_sql_for_original_row_driver(DbDriver::Postgres, orig_idx)
+    }
+
+    pub fn delete_sql_for_original_row_driver(
+        &self,
+        driver: DbDriver,
+        orig_idx: usize,
+    ) -> Result<String> {
+        let qual = self.table_qual_sql(driver)?;
         if self.primary_keys.is_empty() {
             bail!("no primary key metadata — cannot generate DELETE");
         }
@@ -966,21 +998,8 @@ impl QueryResult {
             .original_rows
             .get(orig_idx)
             .context("row index out of range")?;
-        let mut wheres = Vec::new();
-        for pk in &self.primary_keys {
-            let Some(ci) = self.columns.iter().position(|c| c == pk) else {
-                continue;
-            };
-            let v = orig.get(ci).map(|s| s.as_str()).unwrap_or("NULL");
-            wheres.push(format!("\"{pk}\" = {}", sql_literal(v)));
-        }
-        if wheres.is_empty() {
-            bail!("cannot build DELETE WHERE — missing PK columns in result");
-        }
-        Ok(format!(
-            "DELETE FROM {qual} WHERE {};",
-            wheres.join(" AND ")
-        ))
+        let wheres = self.pk_where_clause(driver, orig)?;
+        Ok(format!("DELETE FROM {qual} WHERE {wheres};"))
     }
 
     /// Append a blank (NULL-filled) row for editing → INSERT on Apply.
@@ -6752,6 +6771,10 @@ impl DbWorkspace {
     }
 
     pub fn delete_result_row(&mut self) -> Result<()> {
+        if self.last_result.is_none() {
+            bail!("no result set");
+        }
+        let driver = self.active_driver();
         let Some(result) = self.last_result.as_mut() else {
             bail!("no result set");
         };
@@ -6760,7 +6783,7 @@ impl DbWorkspace {
         }
         let i = result.cursor_row.min(result.rows.len() - 1);
         if i < result.original_rows.len() {
-            let sql = result.delete_sql_for_original_row(i)?;
+            let sql = result.delete_sql_for_original_row_driver(driver, i)?;
             self.pending_row_deletes.push(sql);
             result.rows.remove(i);
             result.original_rows.remove(i);
@@ -6804,12 +6827,28 @@ impl DbWorkspace {
         Ok(())
     }
 
+    fn active_driver(&self) -> DbDriver {
+        self.active_source
+            .as_ref()
+            .and_then(|id| self.sources.iter().find(|s| &s.id == id))
+            .map(|s| s.driver)
+            .unwrap_or_default()
+    }
+
+    fn driver_supports_apply_txn(driver: DbDriver) -> bool {
+        matches!(
+            driver,
+            DbDriver::Postgres | DbDriver::Mysql | DbDriver::Sqlite | DbDriver::Mssql
+        )
+    }
+
     pub fn pending_mutations(&self) -> Result<Vec<String>> {
         let Some(result) = self.last_result.as_ref() else {
             bail!("no result set");
         };
-        let mut stmts = result.pending_updates().unwrap_or_default();
-        stmts.extend(result.pending_inserts().unwrap_or_default());
+        let driver = self.active_driver();
+        let mut stmts = result.pending_updates_for(driver)?;
+        stmts.extend(result.pending_inserts_for(driver)?);
         stmts.extend(self.pending_row_deletes.clone());
         if stmts.is_empty() {
             // Surface a clearer error if UPDATEs failed due to missing PK.
@@ -6821,6 +6860,46 @@ impl DbWorkspace {
         Ok(stmts)
     }
 
+    async fn exec_apply_stmt(
+        &mut self,
+        key: &str,
+        database: Option<&str>,
+        stmt: &str,
+    ) -> Result<()> {
+        let pool = self.pools.get(key).context("not connected")?;
+        match pool {
+            LivePool::Pg(p) => {
+                sqlx::query(stmt).execute(p).await?;
+            }
+            LivePool::Mysql(p) => {
+                sqlx::query(stmt).execute(p).await?;
+            }
+            LivePool::Sqlite(p) => {
+                sqlx::query(stmt).execute(p).await?;
+            }
+            LivePool::Mssql(c) => {
+                let _ = engines::exec_mssql(c, stmt).await?;
+            }
+            LivePool::Clickhouse(c) => {
+                let _ = engines::exec_clickhouse(c, stmt, None).await?;
+            }
+            LivePool::Duckdb(d) => {
+                let _ = alt_engines::exec_duckdb(d, stmt).await?;
+            }
+            LivePool::Redis(r) => {
+                let _ = alt_engines::exec_redis(r, stmt).await?;
+            }
+            LivePool::Mongo(m) => {
+                let _ = alt_engines::exec_mongo(m, stmt, database).await?;
+            }
+            LivePool::CloudStub(d) => {
+                bail!(alt_engines::cloud_not_configured_message(*d));
+            }
+            LivePool::Http(_) => bail!("row apply not supported for HTTP engines"),
+        }
+        Ok(())
+    }
+
     pub async fn apply_pending_updates(&mut self) -> Result<usize> {
         let stmts = self.pending_mutations()?;
         let Some(source_id) = self.active_source.clone() else {
@@ -6830,41 +6909,46 @@ impl DbWorkspace {
         self.ensure_connected(&source_id, database.as_deref())
             .await?;
         let key = Self::pool_key(&source_id, database.as_deref());
-        for stmt in &stmts {
-            self.guard_writable(&source_id, stmt)?;
-            let pool = self.pools.get(&key).context("not connected")?;
-            match pool {
-                LivePool::Pg(p) => {
-                    sqlx::query(stmt).execute(p).await?;
+        let driver = self.active_driver();
+        let opened_txn = if self.in_txn {
+            false
+        } else if Self::driver_supports_apply_txn(driver) {
+            self.begin_transaction().await?;
+            true
+        } else {
+            false
+        };
+
+        let apply_result: Result<()> = async {
+            for stmt in &stmts {
+                self.guard_writable(&source_id, stmt)?;
+                if self.in_txn {
+                    let _ = self.exec_stmt_in_txn(stmt).await?;
+                } else {
+                    self.exec_apply_stmt(&key, database.as_deref(), stmt)
+                        .await?;
                 }
-                LivePool::Mysql(p) => {
-                    sqlx::query(stmt).execute(p).await?;
-                }
-                LivePool::Sqlite(p) => {
-                    sqlx::query(stmt).execute(p).await?;
-                }
-                LivePool::Mssql(c) => {
-                    let _ = engines::exec_mssql(c, stmt).await?;
-                }
-                LivePool::Clickhouse(c) => {
-                    let _ = engines::exec_clickhouse(c, stmt, None).await?;
-                }
-                LivePool::Duckdb(d) => {
-                    let _ = alt_engines::exec_duckdb(d, stmt).await?;
-                }
-                LivePool::Redis(r) => {
-                    let _ = alt_engines::exec_redis(r, stmt).await?;
-                }
-                LivePool::Mongo(m) => {
-                    let _ = alt_engines::exec_mongo(m, stmt, database.as_deref()).await?;
-                }
-                LivePool::CloudStub(d) => {
-                    bail!(alt_engines::cloud_not_configured_message(*d));
-                }
-                LivePool::Http(_) => bail!("row apply not supported for HTTP engines"),
+                self.audit_sql(stmt);
             }
-            self.audit_sql(stmt);
+            Ok(())
         }
+        .await;
+
+        match apply_result {
+            Ok(()) => {
+                if opened_txn {
+                    self.commit_transaction().await?;
+                }
+            }
+            Err(e) => {
+                // Only roll back a transaction we opened for this Apply (#99).
+                if opened_txn {
+                    let _ = self.rollback_transaction().await;
+                }
+                return Err(e);
+            }
+        }
+
         if let Some(res) = self.last_result.as_mut() {
             res.original_rows = res.rows.clone();
         }
