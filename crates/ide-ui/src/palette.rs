@@ -96,6 +96,7 @@ impl Palette {
             item("Fan-out SQL (pinned ★)", "fan_out_sql"),
             item("Export connection pack", "export_conn_pack"),
             item("Import connection pack", "import_conn_pack"),
+            item("Import from DataGrip…", "import_datagrip"),
             item("Find connection", "find_connection"),
             item("Pin / unpin SQL tab", "pin_tab"),
             item("Rename SQL tab", "rename_tab"),
@@ -1525,6 +1526,8 @@ pub fn render_confirm_dialog(
         || action_verb == "restore"
     {
         "Runs against the active Studio target. This cannot be undone."
+    } else if action_verb == "import" {
+        "Adds connections to Zap. Passwords stay in the OS keychain — set them after."
     } else {
         "Removes the entry from datasources.toml."
     };

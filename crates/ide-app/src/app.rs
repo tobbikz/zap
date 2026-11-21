@@ -2887,6 +2887,19 @@ impl App {
         self.ui.confirm_dialog_title.clear();
         self.ui.confirm_action_verb.clear();
         self.ui.mode = Mode::Normal;
+        if sql == "__import_datagrip__" {
+            match self.db.import_datagrip(None) {
+                Ok(n) => {
+                    self.enter_database_mode();
+                    self.set_status(
+                        format!("{} · {n} new", self.db.status),
+                        false,
+                    );
+                }
+                Err(e) => self.set_status(format!("DataGrip import: {e:#}"), true),
+            }
+            return Ok(());
+        }
         if let Some(path_s) = sql.strip_prefix("__restore_dump__") {
             let path = PathBuf::from(path_s);
             match self.db.restore_database(&path).await {
@@ -2980,6 +2993,42 @@ impl App {
             .join("result.csv")
             .display()
             .to_string();
+    }
+
+    /// Ctrl-P → Import from DataGrip… — detect JetBrains XML or ask for a path.
+    fn start_import_datagrip(&mut self) {
+        match self.db.datagrip_import_preview(14) {
+            Ok((_n, preview, _paths)) => {
+                self.ui.confirm_apply_pending = false;
+                self.ui.confirm_delete_source_id = None;
+                self.ui.confirm_run_sql = Some("__import_datagrip__".into());
+                self.ui.confirm_run_source_id = None;
+                self.ui.confirm_run_database = None;
+                self.ui.confirm_delete_label = preview;
+                self.ui.confirm_dialog_title = " Import DataGrip ".into();
+                self.ui.confirm_action_verb = "import".into();
+                self.ui.mode = Mode::ConfirmDeleteSource;
+                self.set_status(
+                    "DataGrip found — Enter import · Esc cancel (passwords not copied)",
+                    false,
+                );
+            }
+            Err(_) => {
+                let seed = dirs::config_dir()
+                    .map(|p| p.join("JetBrains").display().to_string())
+                    .unwrap_or_else(|| "~/.config/JetBrains".into());
+                self.ui.mode = Mode::ImportCsv;
+                self.ui.confirm_run_sql = Some("__import_datagrip_path__".into());
+                self.ui.prompt_modal_title = " Import DataGrip XML ".into();
+                self.ui.prompt_modal_hint =
+                    "  path to dataSources.xml · Enter import · Esc cancel".into();
+                self.ui.import_csv_input = seed;
+                self.set_status(
+                    "DataGrip not auto-detected — paste path to dataSources.xml",
+                    true,
+                );
+            }
+        }
     }
 
     async fn dump_database(&mut self) -> Result<()> {
@@ -3501,6 +3550,19 @@ impl App {
                     false,
                 ),
                 Err(e) => self.set_status(format!("pack import: {e:#}"), true),
+            }
+            return Ok(());
+        }
+        if marker.as_deref() == Some("__import_datagrip_path__") {
+            match self.db.import_datagrip(Some(&path)) {
+                Ok(n) => {
+                    self.enter_database_mode();
+                    self.set_status(
+                        format!("{} · {n} new from {}", self.db.status, path.display()),
+                        false,
+                    );
+                }
+                Err(e) => self.set_status(format!("DataGrip import: {e:#}"), true),
             }
             return Ok(());
         }
@@ -7011,6 +7073,7 @@ impl App {
                 self.set_status("connection pack path · Enter import · Esc cancel", false);
                 self.ui.confirm_run_sql = Some("__import_conn_pack__".into());
             }
+            "import_datagrip" => self.start_import_datagrip(),
             "chart_results" => match self.db.chart_last_result(None) {
                 Ok(_) => {
                     self.ui.focus = Focus::Results;
