@@ -1518,8 +1518,13 @@ pub fn render_confirm_dialog(
         "Runs the listed UPDATE statements against the active source."
     } else if action_verb.contains("save") {
         "Unsaved buffers will be handled as chosen."
-    } else if action_verb == "run" || action_verb == "vacuum" || action_verb == "drop" || action_verb == "truncate" {
-        "Runs against the Explorer target pool. This cannot be undone."
+    } else if action_verb == "run"
+        || action_verb == "vacuum"
+        || action_verb == "drop"
+        || action_verb == "truncate"
+        || action_verb == "restore"
+    {
+        "Runs against the active Studio target. This cannot be undone."
     } else {
         "Removes the entry from datasources.toml."
     };

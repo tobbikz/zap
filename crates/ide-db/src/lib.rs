@@ -917,9 +917,12 @@ impl QueryResult {
     }
 
     pub fn pending_updates_for(&self, driver: DbDriver) -> Result<Vec<String>> {
+        if self.source_table.is_none() {
+            bail!("editing requires single-table SELECT with PK");
+        }
         let qual = self.table_qual_sql(driver)?;
         if self.primary_keys.is_empty() {
-            bail!("no primary key metadata — cannot generate UPDATE");
+            bail!("editing requires single-table SELECT with PK");
         }
         let mut stmts = Vec::new();
         for i in self.dirty_rows() {
@@ -2929,7 +2932,9 @@ impl DbWorkspace {
             || slug.starts_with("hist-")
             || slug.starts_with("file-")
             || slug.ends_with("-empty");
-        self.ensure_connected(&entry.source_id, None).await?;
+        // Pin Studio target to the admin node before run (#131).
+        self.ensure_connected(&entry.source_id, entry.database.as_deref())
+            .await?;
 
         let (tab_key, title, should_run) = if user_sql_leaf {
             (
@@ -2938,8 +2943,9 @@ impl DbWorkspace {
                 false,
             )
         } else {
+            let key_slug = if slug.is_empty() { entry.label.as_str() } else { slug };
             (
-                format!("admin::{}::{}", entry.source_id, entry.label),
+                format!("admin::{}::{key_slug}", entry.source_id),
                 format!("Admin · {}", entry.label),
                 true,
             )
@@ -2950,7 +2956,7 @@ impl DbWorkspace {
             if let Some(tab) = self.tabs.get_mut(idx) {
                 tab.sql = sql.clone();
                 tab.source_id = Some(entry.source_id.clone());
-                tab.database = None;
+                tab.database = entry.database.clone();
             }
             self.sql = sql;
             if should_run {
@@ -2964,7 +2970,7 @@ impl DbWorkspace {
                 result: None,
                 table_key: None,
                 source_id: Some(entry.source_id.clone()),
-                database: None,
+                database: entry.database.clone(),
                 schema: None,
                 pinned: false,
                 where_clause: String::new(),
@@ -2978,6 +2984,7 @@ impl DbWorkspace {
             }
         }
         self.active_source = Some(entry.source_id.clone());
+        self.active_database = entry.database.clone();
         if should_run {
             self.structure_title = format!("Admin · {}", entry.label);
             self.structure_lines = vec![
@@ -6286,11 +6293,15 @@ impl DbWorkspace {
         let Some(source_id) = self.active_source.clone() else {
             bail!("no active data source");
         };
+        // Prefer this tab's last SELECT — not a stale workspace-wide page SQL (#139).
         let sql = self
-            .last_page_sql
-            .as_deref()
-            .unwrap_or_else(|| self.sql.trim());
-        if !query_paging::is_paged_query(sql) {
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.last_run_sql.as_deref())
+            .or(self.last_page_sql.as_deref())
+            .unwrap_or_else(|| self.sql.trim())
+            .to_string();
+        if !query_paging::is_paged_query(&sql) {
             bail!("last query is not a SELECT — run a SELECT first");
         }
         let base = sql.trim().trim_end_matches(';');
@@ -6316,7 +6327,32 @@ impl DbWorkspace {
             }
             _ => bail!("save as view/temp table supported for Postgres, SQLite, DuckDB first"),
         };
-        self.execute_sql_text(&ddl).await?;
+        // TEMP tables are session-local — pin a txn connection so later queries see them (#139).
+        let mut txn_note = String::new();
+        if as_temp && !self.in_txn {
+            match self.begin_transaction().await {
+                Ok(()) => {
+                    txn_note =
+                        " · pinned txn (COMMIT/ROLLBACK when done)".into();
+                }
+                Err(e) if matches!(driver, DbDriver::Duckdb) => {
+                    txn_note = format!(
+                        " · warn: DuckDB has no txn pin yet ({e:#}) — TEMP may vanish on next pool hitch"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let prev_result = self.last_result.clone();
+        let result = self.execute_sql_text(&ddl).await;
+        // Keep the SELECT grid; materialize must not wipe Results (#139).
+        if let Some(r) = prev_result {
+            self.last_result = Some(r);
+        }
+        result?;
+        if as_temp {
+            self.status = format!("created TEMP {name}{txn_note} · {ddl}");
+        }
         Ok(ddl)
     }
 
@@ -6962,14 +6998,23 @@ impl DbWorkspace {
         let Some(result) = self.last_result.as_ref() else {
             bail!("no result set");
         };
+        if result.source_table.is_none()
+            || result.primary_keys.is_empty()
+        {
+            if !result.dirty_rows().is_empty() || !self.pending_row_deletes.is_empty() {
+                bail!("editing requires single-table SELECT with PK");
+            }
+        }
         let driver = self.active_driver();
         let mut stmts = result.pending_updates_for(driver)?;
         stmts.extend(result.pending_inserts_for(driver)?);
         stmts.extend(self.pending_row_deletes.clone());
         if stmts.is_empty() {
             // Surface a clearer error if UPDATEs failed due to missing PK.
-            if !result.dirty_rows().is_empty() && result.primary_keys.is_empty() {
-                bail!("no primary key metadata — cannot generate UPDATE/DELETE");
+            if !result.dirty_rows().is_empty()
+                && (result.primary_keys.is_empty() || result.source_table.is_none())
+            {
+                bail!("editing requires single-table SELECT with PK");
             }
             bail!("no pending INSERT/UPDATE/DELETE to apply");
         }
@@ -8360,7 +8405,8 @@ fn split_statements(sql: &str) -> Vec<String> {
     out
 }
 
-/// Best-effort `FROM schema.table` / `FROM table` extractor for SELECT.
+/// Best-effort single-table `FROM schema.table` extractor for SELECT.
+/// Returns `(None, None)` for JOIN / multi-FROM so Apply cannot invent wrong UPDATEs (#73).
 fn parse_select_target(sql: &str) -> (Option<String>, Option<String>) {
     let lower = sql.to_ascii_lowercase();
     let Some(idx) = lower.find(" from ") else {
@@ -8380,6 +8426,11 @@ fn parse_select_target(sql: &str) -> (Option<String>, Option<String>) {
     if token.is_empty() {
         return (None, None);
     }
+    // Multi-table / JOIN — refuse editable provenance (#73).
+    let rest = after.get(token.len()..).unwrap_or("");
+    if from_list_has_second_table(rest) {
+        return (None, None);
+    }
     if let Some((schema, table)) = token.split_once('.') {
         (
             Some(schema.trim_matches('"').trim_matches('`').to_string()),
@@ -8388,6 +8439,20 @@ fn parse_select_target(sql: &str) -> (Option<String>, Option<String>) {
     } else {
         (None, Some(token.to_string()))
     }
+}
+
+fn from_list_has_second_table(after_first: &str) -> bool {
+    let lower = after_first.to_ascii_lowercase();
+    if lower.contains(" join ") {
+        return true;
+    }
+    let stop = [" where ", " group ", " order ", " limit ", " having ", " window ", ";"];
+    let end = stop
+        .iter()
+        .filter_map(|s| lower.find(s))
+        .min()
+        .unwrap_or(lower.len());
+    lower[..end].contains(',')
 }
 
 fn flatten(node: &DbTreeNode, depth: usize, out: &mut Vec<FlatDbEntry>) {
@@ -11819,6 +11884,22 @@ mod dba_engines_tests {
         let s = duckdb_inserts_from_result(&qr, "main", "t");
         assert!(s.contains("INSERT INTO"));
         assert!(s.contains("\"id\""));
+    }
+
+    #[test]
+    fn parse_select_target_rejects_join_and_multi_from() {
+        assert_eq!(
+            parse_select_target("SELECT * FROM a JOIN b ON a.id = b.id"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_select_target("SELECT * FROM a, b WHERE a.id = b.id"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_select_target("SELECT * FROM public.users WHERE id = 1"),
+            (Some("public".into()), Some("users".into()))
+        );
     }
 }
 

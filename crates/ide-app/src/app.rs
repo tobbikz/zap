@@ -2530,6 +2530,8 @@ impl App {
             self.set_status("cancelled", false);
             return;
         }
+        // Do not leave admin_modal armed over an error plate (#131).
+        self.ui.admin_modal = false;
         self.db.last_result = Some(ide_db::QueryResult {
             columns: vec!["error".into()],
             rows: vec![vec![msg.clone()]],
@@ -2873,6 +2875,14 @@ impl App {
         self.ui.confirm_dialog_title.clear();
         self.ui.confirm_action_verb.clear();
         self.ui.mode = Mode::Normal;
+        if let Some(path_s) = sql.strip_prefix("__restore_dump__") {
+            let path = PathBuf::from(path_s);
+            match self.db.restore_database(&path).await {
+                Ok(()) => self.set_status(format!("restored {}", path.display()), false),
+                Err(e) => self.set_status(format!("restore: {e:#}"), true),
+            }
+            return Ok(());
+        }
         // Maintenance markers re-resolve the Explorer table and RBAC (#138).
         let maint = match sql.as_str() {
             "__maint_vacuum_analyze__" => Some(PostgresMaintenance::VacuumAnalyze),
@@ -3057,10 +3067,57 @@ impl App {
                 self.workspace.root.join(p)
             }
         };
-        match self.db.restore_database(&path).await {
-            Ok(()) => self.set_status(format!("restored {}", path.display()), false),
-            Err(e) => self.set_status(format!("restore: {e:#}"), true),
-        }
+        // Confirm target before wipe/pollute (#102).
+        let src = self
+            .db
+            .active_source
+            .as_ref()
+            .and_then(|id| self.db.sources.iter().find(|s| &s.id == id));
+        let Some(src) = src else {
+            self.set_status("restore: no active connection", true);
+            return Ok(());
+        };
+        let size = std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let size_h = if size >= 1_048_576 {
+            format!("{:.1} MiB", size as f64 / 1_048_576.0)
+        } else if size >= 1024 {
+            format!("{:.1} KiB", size as f64 / 1024.0)
+        } else {
+            format!("{size} B")
+        };
+        let db = self
+            .db
+            .active_database
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if src.database.is_empty() {
+                    "(default)".into()
+                } else {
+                    src.database.clone()
+                }
+            });
+        self.ui.confirm_apply_pending = false;
+        self.ui.confirm_delete_source_id = None;
+        self.ui.confirm_run_sql = Some(format!("__restore_dump__{}", path.display()));
+        self.ui.confirm_run_source_id = Some(src.id.clone());
+        self.ui.confirm_run_database = self.db.active_database.clone();
+        self.ui.confirm_delete_label = format!(
+            "Restore dump into {driver} · {host}:{port}/{db}?\n\
+             file={path}\n\
+             size≈{size_h}\n\
+             This can overwrite objects. Enter run · Esc cancel",
+            driver = src.driver.label(),
+            host = src.host,
+            port = src.port,
+            path = path.display(),
+        );
+        self.ui.confirm_dialog_title = " restore dump ".into();
+        self.ui.confirm_action_verb = "restore".into();
+        self.ui.mode = Mode::ConfirmDeleteSource;
+        self.set_status("confirm restore — Enter run · Esc cancel", true);
         Ok(())
     }
 
@@ -3096,9 +3153,29 @@ impl App {
         Ok(())
     }
 
+    fn start_privilege_audit(&mut self) {
+        let seed = self
+            .db
+            .active_source
+            .as_ref()
+            .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
+            .map(|s| s.user.clone())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "public".into());
+        self.ui.oauth_paste_pending = false;
+        self.ui.rename_tab_pending = false;
+        self.ui.confirm_run_sql = Some("__privilege_audit__".into());
+        self.ui.prompt_modal_title = " Privilege audit ".into();
+        self.ui.prompt_modal_hint = "  role / user name · Enter opens a new SQL tab · Esc cancel".into();
+        self.ui.import_csv_input = seed;
+        self.ui.mode = Mode::BrainAsk;
+        self.set_status("privilege audit · role · Enter", false);
+    }
+
     fn start_brain_ask(&mut self) {
         self.ui.oauth_paste_pending = false;
         self.ui.rename_tab_pending = false;
+        self.ui.confirm_run_sql = None;
         self.ui.prompt_modal_title.clear();
         self.ui.prompt_modal_hint.clear();
         self.ui.import_csv_input.clear();
@@ -3108,6 +3185,7 @@ impl App {
     fn start_oauth_paste(&mut self) {
         self.ui.rename_tab_pending = false;
         self.ui.oauth_paste_pending = true;
+        self.ui.confirm_run_sql = None;
         self.ui.import_csv_input.clear();
         self.ui.prompt_modal_title = " OAuth token ".into();
         self.ui.prompt_modal_hint = "  paste access token · Enter apply · Esc cancel".into();
@@ -3121,6 +3199,35 @@ impl App {
         self.ui.prompt_modal_title.clear();
         self.ui.prompt_modal_hint.clear();
         self.ui.mode = Mode::Normal;
+        if self.ui.confirm_run_sql.as_deref() == Some("__privilege_audit__") {
+            self.ui.confirm_run_sql = None;
+            if q.is_empty() {
+                self.set_status("privilege audit cancelled", false);
+                return Ok(());
+            }
+            let driver = self
+                .db
+                .active_source
+                .as_ref()
+                .and_then(|id| self.db.sources.iter().find(|s| &s.id == id))
+                .map(|s| s.driver)
+                .unwrap_or_default();
+            match ide_db::privilege_audit_sql(driver, &q) {
+                Ok(sql) => {
+                    self.db.new_query_tab();
+                    self.db.sql = sql;
+                    if let Some(tab) = self.db.tabs.get_mut(self.db.active_tab) {
+                        tab.sql = self.db.sql.clone();
+                        tab.title = format!("Priv · {q}");
+                    }
+                    self.ui.focus = Focus::Editor;
+                    self.ui.mode = Mode::Insert;
+                    self.set_status(format!("privilege audit for {q} — F5 to run"), false);
+                }
+                Err(e) => self.set_status(format!("audit: {e:#}"), true),
+            }
+            return Ok(());
+        }
         // OAuth before rename so a leaked rename_tab_pending cannot title a tab with a token (#185).
         if self.ui.oauth_paste_pending {
             self.ui.oauth_paste_pending = false;
@@ -3667,6 +3774,11 @@ impl App {
             self.set_status("no result cell", true);
             return;
         };
+        // JOIN / multi-table SELECT must not invent UPDATEs (#73).
+        if result.source_table.is_none() || result.primary_keys.is_empty() {
+            self.set_status("editing requires single-table SELECT with PK", true);
+            return;
+        }
         let Some(cell) = result
             .rows
             .get(result.cursor_row)
@@ -5140,14 +5252,17 @@ impl App {
                 }
                 let was_edit_cell = self.ui.mode == Mode::EditCell;
                 let was_table_filter = self.ui.mode == Mode::EditTableFilter;
+                // Only resume Console Insert when Esc closes the live b/s palette (#81).
                 let resume_console = self.ui.resume_console_insert
-                    || matches!(
+                    && self.ui.mode == Mode::Palette
+                    && matches!(
                         self.ui.palette.mode,
                         PaletteMode::ConsoleDatabase | PaletteMode::ConsoleSchema
                     );
                 if resume_console {
                     self.ui.rename_tab_pending = false;
                     self.ui.oauth_paste_pending = false;
+                    self.ui.palette.mode = PaletteMode::Commands;
                     self.resume_console_editing();
                     self.set_status("Console · INSERT · keep typing", false);
                 } else {
@@ -6673,6 +6788,7 @@ impl App {
                     Err(e) => self.set_status(format!("database: {e:#}"), true),
                 }
             }
+            self.ui.palette.mode = PaletteMode::Commands;
             self.resume_console_editing();
             return Ok(());
         }
@@ -6683,6 +6799,7 @@ impl App {
                     Err(e) => self.set_status(format!("schema: {e:#}"), true),
                 }
             }
+            self.ui.palette.mode = PaletteMode::Commands;
             self.resume_console_editing();
             return Ok(());
         }
@@ -7127,6 +7244,7 @@ impl App {
             "rename_tab" => {
                 self.ui.rename_tab_pending = true;
                 self.ui.oauth_paste_pending = false;
+                self.ui.confirm_run_sql = None;
                 self.ui.import_csv_input = self
                     .db
                     .tabs
@@ -7265,32 +7383,7 @@ impl App {
                 let on = self.db.toggle_mask_pii();
                 self.set_status(if on { "PII mask ON" } else { "PII mask OFF" }, false);
             }
-            "privilege_audit" => {
-                let role = self
-                    .db
-                    .active_source
-                    .as_ref()
-                    .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
-                    .map(|s| s.user.clone())
-                    .unwrap_or_else(|| "public".into());
-                let driver = self
-                    .db
-                    .active_source
-                    .as_ref()
-                    .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
-                    .map(|s| s.driver)
-                    .unwrap_or_default();
-                match ide_db::privilege_audit_sql(driver, &role) {
-                    Ok(sql) => {
-                        self.db.sql = sql;
-                        self.set_status(
-                            format!("privilege audit SQL for {role} — F5 to run"),
-                            false,
-                        );
-                    }
-                    Err(e) => self.set_status(format!("audit: {e:#}"), true),
-                }
-            }
+            "privilege_audit" => self.start_privilege_audit(),
             "export_audit_csv" => {
                 let path = self.workspace.root.join("queries").join("audit_export.csv");
                 match ide_db::audit_export_csv(&path) {
@@ -8706,6 +8799,8 @@ async fn event_loop(
                             match key.code {
                                 KeyCode::Esc | KeyCode::Enter => {
                                     app.ui.query_error = None;
+                                    // Clear admin modal so error dismiss cannot trap the UI (#131).
+                                    app.ui.admin_modal = false;
                                     app.ui.focus = Focus::Editor;
                                     app.ui.mode = Mode::Insert;
                                     app.set_status("Console · fix SQL · F5 run", false);
@@ -8752,7 +8847,8 @@ async fn event_loop(
                                     }
                                     continue;
                                 }
-                                _ => {}
+                                // Swallow everything else while the modal owns the screen (#131).
+                                _ => continue,
                             }
                         }
                         // Inspector owns Esc/q while open — before FocusEditor / status / fullscreen.

@@ -762,23 +762,46 @@ pub fn cdc_lag_sql(driver: DbDriver) -> Result<&'static str> {
 }
 
 pub fn privilege_audit_sql(driver: DbDriver, role: &str) -> Result<String> {
-    let role = role.replace('\'', "''");
+    let role_raw = role.trim();
+    if role_raw.is_empty() {
+        bail!("role name required");
+    }
+    // MySQL `user@host` — default host `%` when omitted (#140).
+    let (mysql_user, mysql_host) = if let Some((u, h)) = role_raw.split_once('@') {
+        (u, h)
+    } else {
+        (role_raw, "%")
+    };
+    let role = role_raw.replace('\'', "''");
+    let mysql_user = mysql_user.replace('\'', "''");
+    let mysql_host = mysql_host.replace('\'', "''");
     match driver {
         DbDriver::Postgres => Ok(format!(
-            "SELECT table_schema, table_name, privilege_type\n\
+            "-- Privilege audit for '{role}' (table grants + role memberships + flags)\n\
+             SELECT table_schema, table_name, privilege_type, grantee\n\
              FROM information_schema.role_table_grants\n\
-             WHERE grantee = '{role}'\n\
-             ORDER BY 1,2,3;"
+             WHERE grantee IN ('{role}', 'PUBLIC')\n\
+             ORDER BY 1,2,3;\n\
+             \n\
+             SELECT r.rolname AS member, m.rolname AS role\n\
+             FROM pg_auth_members am\n\
+             JOIN pg_roles r ON r.oid = am.member\n\
+             JOIN pg_roles m ON m.oid = am.roleid\n\
+             WHERE r.rolname = '{role}' OR m.rolname = '{role}'\n\
+             ORDER BY 1,2;\n\
+             \n\
+             SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin\n\
+             FROM pg_roles WHERE rolname = '{role}';"
         )),
         DbDriver::Mysql => Ok(format!(
-            "SHOW GRANTS FOR '{role}'@'%';"
+            "SHOW GRANTS FOR '{mysql_user}'@'{mysql_host}';"
         )),
         DbDriver::Mssql => Ok(format!(
             "SELECT dp.name AS principal, o.name AS object, p.permission_name, p.state_desc\n\
              FROM sys.database_permissions p\n\
              JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id\n\
-             LEFT JOIN sys.objects o ON p.major_id = o.object_id\n\
-             WHERE dp.name = N'{role}';"
+             LEFT JOIN sys.objects o ON p.major_id = o.object_id AND p.class = 1\n\
+             WHERE dp.name = N'{role}' AND p.class = 1;"
         )),
         DbDriver::Clickhouse => Ok(format!(
             "SELECT * FROM system.grants WHERE user_name = '{role}' OR role_name = '{role}';"
