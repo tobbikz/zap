@@ -699,6 +699,8 @@ pub struct SqlTab {
     pub where_clause: String,
     /// DataGrip-style server-side sort for table data tabs.
     pub order_by: String,
+    /// SQL text as of the last successful run (None = never run / generated).
+    pub last_run_sql: Option<String>,
 }
 
 impl SqlTab {
@@ -719,6 +721,7 @@ impl SqlTab {
             pinned: false,
             where_clause: String::new(),
             order_by: String::new(),
+            last_run_sql: Some("SELECT 1;".into()),
         }
     }
 
@@ -2014,6 +2017,7 @@ impl DbWorkspace {
             pinned: false,
             where_clause: String::new(),
             order_by: String::new(),
+            last_run_sql: None,
         });
         self.active_tab = self.tabs.len() - 1;
         self.sql = entry.sql;
@@ -2315,6 +2319,11 @@ impl DbWorkspace {
             self.status = "tab is pinned — unpin first (palette)".into();
             return false;
         }
+        self.flush_active_tab();
+        if self.in_txn {
+            self.status = "transaction open — COMMIT or ROLLBACK before closing tabs".into();
+            return false;
+        }
         if self
             .tabs
             .get(self.active_tab)
@@ -2323,6 +2332,14 @@ impl DbWorkspace {
             || !self.pending_row_deletes.is_empty()
         {
             self.status = "tab has dirty cells — Apply or Undo first".into();
+            return false;
+        }
+        if self.tabs.get(self.active_tab).is_some_and(|t| {
+            t.last_run_sql
+                .as_ref()
+                .is_some_and(|last| last.trim() != t.sql.trim())
+        }) {
+            self.status = "tab has unsaved SQL — run it or clear the editor first".into();
             return false;
         }
         let idx = self.active_tab;
@@ -2550,6 +2567,7 @@ impl DbWorkspace {
                 pinned: false,
                 where_clause: String::new(),
                 order_by: String::new(),
+                last_run_sql: None,
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -2665,6 +2683,7 @@ impl DbWorkspace {
                 pinned: false,
                 where_clause: String::new(),
                 order_by: String::new(),
+                last_run_sql: None,
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -2835,6 +2854,7 @@ impl DbWorkspace {
                 pinned: false,
                 where_clause: String::new(),
                 order_by: String::new(),
+                last_run_sql: None,
             });
             self.active_tab = self.tabs.len() - 1;
             self.sql = sql;
@@ -2916,6 +2936,7 @@ impl DbWorkspace {
                 pinned: false,
                 where_clause: String::new(),
                 order_by: String::new(),
+                last_run_sql: None,
             });
             self.active_tab = self.tabs.len() - 1;
             self.sql = sql;
@@ -5302,6 +5323,9 @@ impl DbWorkspace {
             self.history.drain(0..drop_n);
         }
         self.persist_history();
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.last_run_sql = Some(sql.to_string());
+        }
         let elapsed_ms = start.elapsed().as_millis();
         let (schema, table) = parse_select_target(statements.last().map(|s| s.as_str()).unwrap_or(""));
         let pks = if let (Some(ref sch), Some(ref tbl)) = (&schema, &table) {
@@ -10151,6 +10175,7 @@ impl DbWorkspace {
                 pinned: false,
                 where_clause: String::new(),
                 order_by: String::new(),
+                last_run_sql: None,
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -10289,6 +10314,7 @@ impl DbWorkspace {
                 pinned: false,
                 where_clause: String::new(),
                 order_by: String::new(),
+                last_run_sql: None,
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -10439,6 +10465,7 @@ impl DbWorkspace {
                 pinned: false,
                 where_clause: String::new(),
                 order_by: String::new(),
+                last_run_sql: None,
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -11722,5 +11749,35 @@ mod ssl_trust_tests {
         s.driver = DbDriver::Mysql;
         let mysql_t = s.url_via(Some(13306));
         assert!(mysql_t.contains("ssl-mode=VERIFY_CA"), "{mysql_t}");
+    }
+}
+
+#[cfg(test)]
+mod close_tab_dirty_tests {
+    use super::{DbWorkspace, SqlTab};
+
+    fn two_tabs() -> DbWorkspace {
+        let mut ws = DbWorkspace::default();
+        ws.tabs = vec![SqlTab::query(1), SqlTab::query(2)];
+        ws.active_tab = 0;
+        ws
+    }
+
+    #[test]
+    fn close_blocks_unsaved_sql() {
+        let mut ws = two_tabs();
+        ws.sql = "SELECT 2;".into();
+        assert!(!ws.close_active_tab());
+        assert!(ws.status.contains("unsaved SQL"), "{}", ws.status);
+        assert_eq!(ws.tabs.len(), 2);
+    }
+
+    #[test]
+    fn close_blocks_open_txn() {
+        let mut ws = two_tabs();
+        ws.in_txn = true;
+        assert!(!ws.close_active_tab());
+        assert!(ws.status.contains("transaction open"), "{}", ws.status);
+        assert_eq!(ws.tabs.len(), 2);
     }
 }
