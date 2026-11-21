@@ -22,6 +22,8 @@ fn load() -> SecretsFile {
     if !path.exists() {
         return SecretsFile::default();
     }
+    // Tighten permissions left by older versions that wrote 0644 (#42).
+    let _ = ide_core::harden_private_file(&path);
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| toml::from_str(&t).ok())
@@ -30,10 +32,8 @@ fn load() -> SecretsFile {
 
 fn save(file: &SecretsFile) -> Result<()> {
     let path = secrets_path().context("no config dir for secrets")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, toml::to_string_pretty(file)?)?;
+    // Owner-only, atomic write: secrets.toml holds plaintext passwords (#42).
+    ide_core::write_atomic(&path, toml::to_string_pretty(file)?)?;
     Ok(())
 }
 

@@ -9230,19 +9230,20 @@ fn load_query_bookmarks() -> Vec<String> {
 }
 
 impl DbWorkspace {
-    fn persist_history(&self) {
+    fn persist_history(&mut self) {
         let Some(path) = history_path() else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let file = QueryMemoryFile {
             history: self.history.clone(),
             bookmarks: self.bookmarks.clone(),
         };
-        if let Ok(text) = serde_json::to_string_pretty(&file) {
-            let _ = std::fs::write(path, text);
+        let saved = serde_json::to_string_pretty(&file)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| ide_core::write_atomic(&path, text).map_err(anyhow::Error::from));
+        if let Err(e) = saved {
+            // Surface the failure instead of silently losing history (#162).
+            self.status = format!("query history save failed: {e:#}");
         }
     }
 
