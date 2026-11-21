@@ -132,6 +132,21 @@ pub async fn connect_mssql(src: &DataSource, local_port: Option<u16>) -> Result<
     Ok(Arc::new(Mutex::new(client)))
 }
 
+/// Session id (`@@SPID`) for the shared MSSQL client — used by Esc cancel (#41).
+pub async fn mssql_backend_spid(client: &Arc<Mutex<MssqlClient>>) -> Result<i64> {
+    let mut c = client.lock().await;
+    let stream = c
+        .simple_query("SELECT CONVERT(BIGINT, @@SPID)")
+        .await
+        .context("mssql @@SPID")?;
+    let rows = stream.into_first_result().await.context("mssql @@SPID rows")?;
+    let spid = rows
+        .first()
+        .and_then(|r| r.try_get::<i64, _>(0).ok().flatten())
+        .unwrap_or(0);
+    Ok(spid)
+}
+
 pub async fn exec_mssql(client: &Arc<Mutex<MssqlClient>>, sql: &str) -> Result<QueryResult> {
     let mut c = client.lock().await;
     let sql = sql.trim();
@@ -214,7 +229,11 @@ fn mssql_cell(row: &tiberius::Row, i: usize) -> String {
     "NULL".into()
 }
 
-pub async fn exec_clickhouse(ch: &ClickhouseHttp, sql: &str) -> Result<QueryResult> {
+pub async fn exec_clickhouse(
+    ch: &ClickhouseHttp,
+    sql: &str,
+    query_id: Option<&str>,
+) -> Result<QueryResult> {
     let sql = sql.trim();
     if sql.is_empty() {
         bail!("empty SQL");
@@ -224,12 +243,11 @@ pub async fn exec_clickhouse(ch: &ClickhouseHttp, sql: &str) -> Result<QueryResu
     } else {
         sql.to_string()
     };
-    let mut req = ch
-        .http
-        .post(&ch.base)
-        .query(&[("database", ch.database.as_str())])
-        .body(body)
-        .header("X-ClickHouse-User", &ch.user);
+    let mut req = ch.http.post(&ch.base).query(&[("database", ch.database.as_str())]);
+    if let Some(qid) = query_id.filter(|s| !s.is_empty()) {
+        req = req.query(&[("query_id", qid)]);
+    }
+    let mut req = req.body(body).header("X-ClickHouse-User", &ch.user);
     if !ch.password.is_empty() {
         req = req.header("X-ClickHouse-Key", &ch.password);
     }
@@ -473,7 +491,7 @@ pub async fn mssql_columns(
 }
 
 pub async fn ch_databases(ch: &ClickhouseHttp, source_id: &str) -> Result<Vec<DbTreeNode>> {
-    let qr = exec_clickhouse(ch, "SHOW DATABASES").await?;
+    let qr = exec_clickhouse(ch, "SHOW DATABASES", None).await?;
     Ok(qr
         .rows
         .into_iter()
@@ -505,6 +523,7 @@ pub async fn ch_tables(
             "SELECT name, engine FROM system.tables WHERE database = '{}' ORDER BY name",
             database.replace('\'', "''")
         ),
+        None,
     )
     .await?;
     Ok(qr
@@ -591,6 +610,7 @@ pub async fn ch_show_create(ch: &ClickhouseHttp, database: &str, table: &str) ->
             database.replace('`', "``"),
             table.replace('`', "``")
         ),
+        None,
     )
     .await?;
     Ok(qr
@@ -691,6 +711,7 @@ pub async fn ch_columns(
             database.replace('\'', "''"),
             table.replace('\'', "''")
         ),
+        None,
     )
     .await?;
     Ok(qr
