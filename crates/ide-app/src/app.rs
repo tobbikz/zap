@@ -2498,6 +2498,11 @@ impl App {
 
     fn show_query_error(&mut self, msg: String) {
         self.finish_query_ui();
+        if msg.contains("query cancelled") {
+            // Cancel stops the statement; it is not an error and must not imply reconnect (#36).
+            self.set_status("cancelled", false);
+            return;
+        }
         self.db.last_result = Some(ide_db::QueryResult {
             columns: vec!["error".into()],
             rows: vec![vec![msg.clone()]],

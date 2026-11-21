@@ -5220,7 +5220,7 @@ impl DbWorkspace {
             if self.query_cancel.load(Ordering::Relaxed) {
                 self.query_running = false;
                 let _ = self.cancel_backend_best_effort(&key, driver).await;
-                self.disconnect_active_pool();
+                self.abort_txn_after_cancel().await;
                 bail!("query cancelled");
             }
             self.guard_writable(&source_id, stmt)?;
@@ -5260,7 +5260,7 @@ impl DbWorkspace {
                     if msg.contains("cancelled") || msg.contains("timed out") {
                         let _ = self.cancel_backend_best_effort(&key, driver).await;
                         if msg.contains("cancelled") {
-                            self.disconnect_active_pool();
+                            self.abort_txn_after_cancel().await;
                         }
                     }
                     return Err(e);
@@ -5466,31 +5466,32 @@ impl DbWorkspace {
     /// Cancel the dedicated in-flight backend (pid captured on query connection).
     async fn cancel_backend_best_effort(&mut self, key: &str, driver: DbDriver) -> Result<()> {
         let pid = self.query_backend_pid.load(Ordering::Relaxed);
+        if pid <= 0 {
+            // Never broadcast-cancel by usename/database — that kills other sessions (#62).
+            return Ok(());
+        }
         let pool = self.pools.get(key).context("not connected")?;
         match (driver, pool) {
-            (DbDriver::Postgres, LivePool::Pg(p)) if pid > 0 => {
+            (DbDriver::Postgres, LivePool::Pg(p)) => {
                 let _ = sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
                     .bind(pid as i32)
                     .fetch_one(p)
                     .await;
             }
-            (DbDriver::Mysql, LivePool::Mysql(p)) if pid > 0 => {
+            (DbDriver::Mysql, LivePool::Mysql(p)) => {
                 let _ = sqlx::query(&format!("KILL QUERY {pid}")).execute(p).await;
-            }
-            (DbDriver::Postgres, LivePool::Pg(p)) => {
-                let _ = sqlx::query(
-                    "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
-                     WHERE datname = current_database() \
-                       AND pid <> pg_backend_pid() \
-                       AND state <> 'idle' \
-                       AND usename = current_user",
-                )
-                .execute(p)
-                .await;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Roll back an open TXN after a cancelled statement, but keep the pool alive (#36).
+    async fn abort_txn_after_cancel(&mut self) {
+        if self.in_txn {
+            let _ = self.rollback_transaction_inner().await;
+            self.clear_txn();
+        }
     }
 
     async fn introspect_elasticsearch(&self, source_id: &str) -> Result<Vec<DbTreeNode>> {
@@ -11722,5 +11723,29 @@ mod ssl_trust_tests {
         s.driver = DbDriver::Mysql;
         let mysql_t = s.url_via(Some(13306));
         assert!(mysql_t.contains("ssl-mode=VERIFY_CA"), "{mysql_t}");
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::{DbDriver, DbWorkspace};
+
+    #[tokio::test]
+    async fn unknown_pid_does_not_broadcast_cancel() {
+        let mut ws = DbWorkspace::default();
+        ws.query_backend_pid
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // No pool exists; the guard must return before touching it.
+        ws.cancel_backend_best_effort("missing", DbDriver::Postgres)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_open_txn_without_pool_disconnect() {
+        let mut ws = DbWorkspace::default();
+        ws.in_txn = true;
+        ws.abort_txn_after_cancel().await;
+        assert!(!ws.in_txn);
     }
 }
