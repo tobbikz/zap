@@ -728,6 +728,14 @@ pub async fn exec_mongo(m: &MongoConn, line: &str, active_db: Option<&str>) -> R
         .filter(|s| !s.is_empty())
         .unwrap_or(m.default_db.as_str());
     let lower = line.to_ascii_lowercase();
+    if lower == "ping" {
+        m.client
+            .database(db_name)
+            .run_command(mongodb::bson::doc! { "ping": 1 })
+            .await
+            .context("mongo ping")?;
+        return Ok(single_col_row("pong", "PONG".into()));
+    }
     if lower.starts_with("find ") {
         let rest = line[5..].trim();
         let (coll, filter, limit) = parse_mongo_find(rest)?;

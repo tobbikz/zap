@@ -351,7 +351,7 @@ impl IdeConfig {
                 let _ = std::fs::create_dir_all(parent);
             }
             let text = toml::to_string_pretty(&cfg)?;
-            std::fs::write(path, text)?;
+            ide_core::write_atomic(path, text)?;
             return Ok(cfg);
         }
         let text = std::fs::read_to_string(path)
@@ -468,7 +468,8 @@ impl IdeConfig {
             let _ = std::fs::copy(&path, &bak);
         }
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(&path, text)
+        // Atomic replace: a crash mid-save must not truncate the user's settings (#166).
+        ide_core::write_atomic(&path, text)
             .with_context(|| format!("write config {}", path.display()))?;
         Ok(())
     }
