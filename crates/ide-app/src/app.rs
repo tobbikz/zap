@@ -2546,6 +2546,30 @@ impl App {
         self.set_status(format!("query: {msg}"), true);
     }
 
+    /// Run the pending SQL while draining terminal events.
+    ///
+    /// Esc sets the cancel flag; every other event is ignored. The query future is
+    /// kept alive across events so a key/mouse/resize cannot drop and re-exec (#76).
+    async fn run_query_until_done(&mut self, events: &mut EventStream) -> Result<()> {
+        let cancel = self.db.query_cancel.clone();
+        let query = self.run_query_executed();
+        tokio::pin!(query);
+        loop {
+            tokio::select! {
+                biased;
+                res = &mut query => return res,
+                maybe_ev = events.next() => {
+                    if let Some(Ok(Event::Key(key))) = maybe_ev {
+                        if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Status is applied when the cancelled query returns (#36).
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn run_query_executed(&mut self) -> Result<()> {
         self.ui.bottom = BottomPanel::Results;
         // Prefer the explorer selection's source/db when Console has no active target yet.
@@ -8498,22 +8522,11 @@ async fn event_loop(
         }
 
         if app.pending_db_query {
-            tokio::select! {
-                res = app.run_query_executed() => {
-                    app.pending_db_query = false;
-                    app.finish_query_ui();
-                    if let Err(e) = res {
-                        app.show_query_error(format!("{e:#}"));
-                    }
-                }
-                maybe_ev = events.next() => {
-                    if let Some(Ok(Event::Key(key))) = maybe_ev {
-                        if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
-                            app.db.request_query_cancel();
-                            app.set_status("cancelling query…", false);
-                        }
-                    }
-                }
+            let res = app.run_query_until_done(&mut events).await;
+            app.pending_db_query = false;
+            app.finish_query_ui();
+            if let Err(e) = res {
+                app.show_query_error(format!("{e:#}"));
             }
             continue;
         }
