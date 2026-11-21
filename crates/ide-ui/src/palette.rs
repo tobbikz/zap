@@ -929,19 +929,56 @@ pub fn render_agent_form(
     );
 }
 
-pub fn render_brain_ask(frame: &mut Frame, screen: Rect, input: &str) {
-    render_path_prompt(
-        frame,
-        screen,
-        " Brain ask ",
-        "  natural-language question",
-        "  uses brain/rag CLI or BRAIN_DSN · brain.consult",
-        input,
-    );
+pub fn render_brain_ask(
+    frame: &mut Frame,
+    screen: Rect,
+    input: &str,
+    title: &str,
+    hint: &str,
+) {
+    let (title, hint1, hint2) = if !title.trim().is_empty() {
+        (
+            title,
+            if hint.is_empty() {
+                "  Enter confirm · Esc cancel"
+            } else {
+                hint
+            },
+            "",
+        )
+    } else {
+        (
+            " Brain ask ",
+            "  natural-language question",
+            "  uses brain/rag CLI or BRAIN_DSN · brain.consult",
+        )
+    };
+    render_path_prompt(frame, screen, title, hint1, hint2, input);
 }
 
-/// Centered CSV/JSON import path prompt.
-pub fn render_import_csv(frame: &mut Frame, screen: Rect, input: &str) {
+/// Centered CSV/JSON import path prompt (or paste/migrate/pack via title override) (#146).
+pub fn render_import_csv(
+    frame: &mut Frame,
+    screen: Rect,
+    input: &str,
+    title: &str,
+    hint: &str,
+) {
+    if !title.trim().is_empty() {
+        render_path_prompt(
+            frame,
+            screen,
+            title,
+            if hint.is_empty() {
+                "  Enter confirm · Esc cancel"
+            } else {
+                hint
+            },
+            "",
+            input,
+        );
+        return;
+    }
     let json = input.trim().ends_with(".json")
         || input.to_ascii_lowercase().contains("json");
     if json {
@@ -1183,9 +1220,20 @@ pub fn render_settings_modal(frame: &mut Frame, screen: Rect, draft: &str) {
     );
 }
 
-/// Yes/no confirm for destructive actions (delete connection / apply UPDATEs).
-pub fn render_confirm_delete(frame: &mut Frame, screen: Rect, title: &str, message: &str) {
-    render_confirm_dialog(frame, screen, title, message, "delete");
+/// Yes/no confirm for destructive actions (delete connection / DROP / vacuum).
+pub fn render_confirm_delete(
+    frame: &mut Frame,
+    screen: Rect,
+    title: &str,
+    message: &str,
+    action_verb: &str,
+) {
+    let verb = if action_verb.trim().is_empty() {
+        "delete"
+    } else {
+        action_verb
+    };
+    render_confirm_dialog(frame, screen, title, message, verb);
 }
 
 /// Blocking error ack (query failure). Enter / Esc dismiss.
@@ -1417,7 +1465,11 @@ pub fn render_confirm_dialog(
     );
 
     let width = screen.width.min(58).max(42);
-    let height = 12u16;
+    let msg_w = (width as usize).saturating_sub(6).max(20);
+    let msg_lines = textwrap_lines(message, msg_w);
+    // Grow message pane to wrapped lines (cap ~5) so multi-line confirms aren't clipped (#154).
+    let body_h = (msg_lines.len() as u16).clamp(1, 5);
+    let height = body_h.saturating_add(10).min(screen.height.saturating_sub(2));
     let x = screen.x + (screen.width.saturating_sub(width)) / 2;
     let y = screen.y + (screen.height.saturating_sub(height)) / 3;
     let area = Rect {
@@ -1444,7 +1496,7 @@ pub fn render_confirm_dialog(
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(body_h),
             Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Length(1),
@@ -1452,12 +1504,11 @@ pub fn render_confirm_dialog(
         ])
         .margin(2)
         .split(area);
-    let msg_w = (width as usize).saturating_sub(6).max(20);
-    let msg_lines = textwrap_lines(message, msg_w);
     frame.render_widget(
         Paragraph::new(
             msg_lines
                 .into_iter()
+                .take(body_h as usize)
                 .map(|l| Line::from(Span::styled(l, theme::style_text().add_modifier(Modifier::BOLD))))
                 .collect::<Vec<_>>(),
         ),
@@ -1467,6 +1518,8 @@ pub fn render_confirm_dialog(
         "Runs the listed UPDATE statements against the active source."
     } else if action_verb.contains("save") {
         "Unsaved buffers will be handled as chosen."
+    } else if action_verb == "run" || action_verb == "vacuum" || action_verb == "drop" || action_verb == "truncate" {
+        "Runs against the Explorer target pool. This cannot be undone."
     } else {
         "Removes the entry from datasources.toml."
     };

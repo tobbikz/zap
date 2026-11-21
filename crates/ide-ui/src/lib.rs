@@ -163,6 +163,14 @@ pub struct UiState {
     /// Pool target for `confirm_run_sql` (Explorer selection, not Console) (#151).
     pub confirm_run_source_id: Option<String>,
     pub confirm_run_database: Option<String>,
+    /// Confirm dialog title chrome (DROP / Vacuum / delete connection) (#146).
+    pub confirm_dialog_title: String,
+    /// Confirm dialog Enter verb (`delete` / `run` / `vacuum`) (#146).
+    pub confirm_action_verb: String,
+    /// Path/prompt modal title override when reusing BrainAsk / ImportCsv (#146).
+    pub prompt_modal_title: String,
+    /// Path/prompt modal hint line (#146).
+    pub prompt_modal_hint: String,
     /// BrainAsk / rename prompt collecting a SQL tab title.
     pub rename_tab_pending: bool,
     /// ConfirmQuit dialog message (Wave 3).
@@ -278,6 +286,10 @@ impl Default for UiState {
             confirm_run_sql: None,
             confirm_run_source_id: None,
             confirm_run_database: None,
+            confirm_dialog_title: String::new(),
+            confirm_action_verb: String::new(),
+            prompt_modal_title: String::new(),
+            prompt_modal_hint: String::new(),
             rename_tab_pending: false,
             confirm_quit_label: String::new(),
             session_form_field: 0,
@@ -540,7 +552,13 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
                 Some("__alter_rename__") => {
                     palette::render_alter_column(frame, size, &ctx.ui.import_csv_input, "rename")
                 }
-                _ => palette::render_import_csv(frame, size, &ctx.ui.import_csv_input),
+                _ => palette::render_import_csv(
+                    frame,
+                    size,
+                    &ctx.ui.import_csv_input,
+                    &ctx.ui.prompt_modal_title,
+                    &ctx.ui.prompt_modal_hint,
+                ),
             }
         }
         if ctx.ui.mode == Mode::RestoreDump {
@@ -564,7 +582,13 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
             );
         }
         if ctx.ui.mode == Mode::BrainAsk {
-            palette::render_brain_ask(frame, size, &ctx.ui.import_csv_input);
+            palette::render_brain_ask(
+                frame,
+                size,
+                &ctx.ui.import_csv_input,
+                &ctx.ui.prompt_modal_title,
+                &ctx.ui.prompt_modal_hint,
+            );
         }
         if ctx.ui.mode == Mode::SessionForm {
             if let Some(s) = ctx.sessions {
@@ -584,11 +608,17 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
                     &ctx.ui.confirm_delete_label,
                 );
             } else {
+                let title = if ctx.ui.confirm_dialog_title.is_empty() {
+                    " delete connection "
+                } else {
+                    ctx.ui.confirm_dialog_title.as_str()
+                };
                 palette::render_confirm_delete(
                     frame,
                     size,
-                    " delete connection ",
+                    title,
                     &ctx.ui.confirm_delete_label,
+                    &ctx.ui.confirm_action_verb,
                 );
             }
         }
@@ -691,7 +721,13 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
                 Some("__alter_rename__") => {
                     palette::render_alter_column(frame, size, &ctx.ui.import_csv_input, "rename")
                 }
-                _ => palette::render_import_csv(frame, size, &ctx.ui.import_csv_input),
+                _ => palette::render_import_csv(
+                    frame,
+                    size,
+                    &ctx.ui.import_csv_input,
+                    &ctx.ui.prompt_modal_title,
+                    &ctx.ui.prompt_modal_hint,
+                ),
             }
         }
         if ctx.ui.mode == Mode::RestoreDump {
@@ -715,7 +751,13 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
             );
         }
         if ctx.ui.mode == Mode::BrainAsk {
-            palette::render_brain_ask(frame, size, &ctx.ui.import_csv_input);
+            palette::render_brain_ask(
+                frame,
+                size,
+                &ctx.ui.import_csv_input,
+                &ctx.ui.prompt_modal_title,
+                &ctx.ui.prompt_modal_hint,
+            );
         }
         if ctx.ui.mode == Mode::SessionForm {
             if let Some(s) = ctx.sessions {
@@ -735,11 +777,17 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
                     &ctx.ui.confirm_delete_label,
                 );
             } else {
+                let title = if ctx.ui.confirm_dialog_title.is_empty() {
+                    " delete connection "
+                } else {
+                    ctx.ui.confirm_dialog_title.as_str()
+                };
                 palette::render_confirm_delete(
                     frame,
                     size,
-                    " delete connection ",
+                    title,
                     &ctx.ui.confirm_delete_label,
+                    &ctx.ui.confirm_action_verb,
                 );
             }
         }
@@ -893,7 +941,13 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
             Some("__alter_rename__") => {
                 palette::render_alter_column(frame, size, &ctx.ui.import_csv_input, "rename")
             }
-            _ => palette::render_import_csv(frame, size, &ctx.ui.import_csv_input),
+            _ => palette::render_import_csv(
+                frame,
+                size,
+                &ctx.ui.import_csv_input,
+                &ctx.ui.prompt_modal_title,
+                &ctx.ui.prompt_modal_hint,
+            ),
         }
     }
     if ctx.ui.mode == Mode::RestoreDump {
@@ -917,7 +971,13 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
         );
     }
     if ctx.ui.mode == Mode::BrainAsk {
-        palette::render_brain_ask(frame, size, &ctx.ui.import_csv_input);
+        palette::render_brain_ask(
+            frame,
+            size,
+            &ctx.ui.import_csv_input,
+            &ctx.ui.prompt_modal_title,
+            &ctx.ui.prompt_modal_hint,
+        );
     }
     if ctx.ui.mode == Mode::SessionForm {
         if let Some(s) = ctx.sessions {
@@ -937,11 +997,17 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
                 &ctx.ui.confirm_delete_label,
             );
         } else {
+            let title = if ctx.ui.confirm_dialog_title.is_empty() {
+                " delete connection "
+            } else {
+                ctx.ui.confirm_dialog_title.as_str()
+            };
             palette::render_confirm_delete(
                 frame,
                 size,
-                " delete connection ",
+                title,
                 &ctx.ui.confirm_delete_label,
+                &ctx.ui.confirm_action_verb,
             );
         }
     }

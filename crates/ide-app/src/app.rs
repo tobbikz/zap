@@ -1029,7 +1029,38 @@ impl App {
             .unwrap_or_else(|| format!("Remove connection {source_id}?"));
         self.ui.confirm_delete_source_id = Some(source_id.to_string());
         self.ui.confirm_delete_label = label;
+        self.ui.confirm_dialog_title = " delete connection ".into();
+        self.ui.confirm_action_verb = "delete".into();
+        self.ui.confirm_run_sql = None;
         self.ui.mode = Mode::ConfirmDeleteSource;
+    }
+
+    fn start_maintenance_confirm(&mut self, op: PostgresMaintenance) {
+        match self.db.preview_maintenance(op) {
+            Ok((_sql, msg, source_id, database)) => {
+                let marker = match op {
+                    PostgresMaintenance::VacuumAnalyze => "__maint_vacuum_analyze__",
+                    PostgresMaintenance::Analyze => "__maint_analyze__",
+                    PostgresMaintenance::Reindex => "__maint_reindex__",
+                };
+                self.ui.confirm_apply_pending = false;
+                self.ui.confirm_delete_source_id = None;
+                self.ui.confirm_run_sql = Some(marker.into());
+                self.ui.confirm_run_source_id = Some(source_id);
+                self.ui.confirm_run_database = database;
+                self.ui.confirm_delete_label = msg;
+                self.ui.confirm_dialog_title = match op {
+                    PostgresMaintenance::VacuumAnalyze => " vacuum / optimize ",
+                    PostgresMaintenance::Analyze => " analyze table ",
+                    PostgresMaintenance::Reindex => " reindex table ",
+                }
+                .into();
+                self.ui.confirm_action_verb = "run".into();
+                self.ui.mode = Mode::ConfirmDeleteSource;
+                self.set_status("confirm maintenance — Enter run · Esc cancel", true);
+            }
+            Err(e) => self.set_status(format!("maintenance: {e:#}"), true),
+        }
     }
 
     fn confirm_delete_connection(&mut self) -> Result<()> {
@@ -1906,43 +1937,13 @@ impl App {
                         }
                     }
                     Some("vacuum-analyze") => {
-                        if let Err(e) = self
-                            .db
-                            .run_postgres_maintenance(PostgresMaintenance::VacuumAnalyze)
-                            .await
-                        {
-                            self.set_status(format!("vacuum: {e:#}"), true);
-                        } else {
-                            self.ui.focus = Focus::Results;
-                            self.ui.bottom = BottomPanel::Results;
-                            self.set_status(self.db.status.clone(), false);
-                        }
+                        self.start_maintenance_confirm(PostgresMaintenance::VacuumAnalyze)
                     }
                     Some("analyze-table") => {
-                        if let Err(e) = self
-                            .db
-                            .run_postgres_maintenance(PostgresMaintenance::Analyze)
-                            .await
-                        {
-                            self.set_status(format!("analyze: {e:#}"), true);
-                        } else {
-                            self.ui.focus = Focus::Results;
-                            self.ui.bottom = BottomPanel::Results;
-                            self.set_status(self.db.status.clone(), false);
-                        }
+                        self.start_maintenance_confirm(PostgresMaintenance::Analyze)
                     }
                     Some("reindex-table") => {
-                        if let Err(e) = self
-                            .db
-                            .run_postgres_maintenance(PostgresMaintenance::Reindex)
-                            .await
-                        {
-                            self.set_status(format!("reindex: {e:#}"), true);
-                        } else {
-                            self.ui.focus = Focus::Results;
-                            self.ui.bottom = BottomPanel::Results;
-                            self.set_status(self.db.status.clone(), false);
-                        }
+                        self.start_maintenance_confirm(PostgresMaintenance::Reindex)
                     }
                     Some("dump") => self.dump_database().await?,
                     Some("restore") => self.start_restore_dump(),
@@ -2499,6 +2500,8 @@ impl App {
         self.ui.confirm_run_source_id = self.db.active_source.clone();
         self.ui.confirm_run_database = self.db.active_database.clone();
         self.ui.confirm_delete_label = format!("Destructive SQL — Enter run · Esc cancel\n{preview}");
+        self.ui.confirm_dialog_title = " destructive SQL ".into();
+        self.ui.confirm_action_verb = "run".into();
         self.ui.mode = Mode::ConfirmDeleteSource;
         self.set_status("confirm destructive SQL — Enter run · Esc cancel", true);
         true
@@ -2775,6 +2778,9 @@ impl App {
     fn start_import_json(&mut self) {
         self.ui.mode = Mode::ImportCsv;
         self.ui.confirm_run_sql = Some("__import_json__".into());
+        self.ui.prompt_modal_title = " Import JSON ".into();
+        self.ui.prompt_modal_hint =
+            "  path to JSON array / NDJSON · target = open table".into();
         self.ui.import_csv_input = self
             .workspace
             .root
@@ -2787,6 +2793,8 @@ impl App {
     fn start_migrate_apply(&mut self) {
         self.ui.mode = Mode::ImportCsv;
         self.ui.confirm_run_sql = Some("__migrate_apply__".into());
+        self.ui.prompt_modal_title = " Migrate apply ".into();
+        self.ui.prompt_modal_hint = "  migration SQL path · Enter apply · Esc cancel".into();
         self.ui.import_csv_input = self
             .db
             .latest_migration_path()
@@ -2805,6 +2813,8 @@ impl App {
     fn start_migrate_dry_run(&mut self) {
         self.ui.mode = Mode::ImportCsv;
         self.ui.confirm_run_sql = Some("__migrate_dry_run__".into());
+        self.ui.prompt_modal_title = " Migrate dry-run ".into();
+        self.ui.prompt_modal_hint = "  migration SQL path · Enter preview · Esc cancel".into();
         self.ui.import_csv_input = self
             .db
             .latest_migration_path()
@@ -2839,6 +2849,13 @@ impl App {
                 self.ui.confirm_run_source_id = Some(source_id);
                 self.ui.confirm_run_database = database;
                 self.ui.confirm_delete_label = label;
+                self.ui.confirm_dialog_title = if truncate {
+                    " truncate table "
+                } else {
+                    " drop table "
+                }
+                .into();
+                self.ui.confirm_action_verb = if truncate { "truncate" } else { "drop" }.into();
                 self.ui.mode = Mode::ConfirmDeleteSource;
             }
             Err(e) => self.set_status(format!("destructive: {e:#}"), true),
@@ -2853,7 +2870,38 @@ impl App {
         let target_source = self.ui.confirm_run_source_id.take();
         let target_db = self.ui.confirm_run_database.take();
         self.ui.confirm_delete_label.clear();
+        self.ui.confirm_dialog_title.clear();
+        self.ui.confirm_action_verb.clear();
         self.ui.mode = Mode::Normal;
+        // Maintenance markers re-resolve the Explorer table and RBAC (#138).
+        let maint = match sql.as_str() {
+            "__maint_vacuum_analyze__" => Some(PostgresMaintenance::VacuumAnalyze),
+            "__maint_analyze__" => Some(PostgresMaintenance::Analyze),
+            "__maint_reindex__" => Some(PostgresMaintenance::Reindex),
+            _ => None,
+        };
+        if let Some(op) = maint {
+            let prev_source = self.db.active_source.clone();
+            let prev_db = self.db.active_database.clone();
+            if let Some(sid) = target_source {
+                self.db.active_source = Some(sid);
+            }
+            if target_db.is_some() {
+                self.db.active_database = target_db;
+            }
+            let result = self.db.run_postgres_maintenance(op).await;
+            self.db.active_source = prev_source;
+            self.db.active_database = prev_db;
+            match result {
+                Ok(()) => {
+                    self.ui.focus = Focus::Results;
+                    self.ui.bottom = BottomPanel::Results;
+                    self.set_status(self.db.status.clone(), false);
+                }
+                Err(e) => self.set_status(format!("maintenance: {e:#}"), true),
+            }
+            return Ok(());
+        }
         // Run on the Explorer target pool without clobbering Console SQL (#151).
         let prev_source = self.db.active_source.clone();
         let prev_db = self.db.active_database.clone();
@@ -2901,6 +2949,8 @@ impl App {
     fn start_import_csv(&mut self) {
         self.ui.mode = Mode::ImportCsv;
         self.ui.confirm_run_sql = None;
+        self.ui.prompt_modal_title.clear();
+        self.ui.prompt_modal_hint.clear();
         self.ui.import_csv_input = self
             .workspace
             .root
@@ -3049,6 +3099,8 @@ impl App {
     fn start_brain_ask(&mut self) {
         self.ui.oauth_paste_pending = false;
         self.ui.rename_tab_pending = false;
+        self.ui.prompt_modal_title.clear();
+        self.ui.prompt_modal_hint.clear();
         self.ui.import_csv_input.clear();
         self.ui.mode = Mode::BrainAsk;
     }
@@ -3057,6 +3109,8 @@ impl App {
         self.ui.rename_tab_pending = false;
         self.ui.oauth_paste_pending = true;
         self.ui.import_csv_input.clear();
+        self.ui.prompt_modal_title = " OAuth token ".into();
+        self.ui.prompt_modal_hint = "  paste access token · Enter apply · Esc cancel".into();
         self.ui.mode = Mode::BrainAsk;
         self.set_status("paste OAuth access token · Enter", false);
     }
@@ -3064,6 +3118,8 @@ impl App {
     async fn confirm_brain_ask(&mut self) -> Result<()> {
         let q = self.ui.import_csv_input.trim().to_string();
         self.ui.import_csv_input.clear();
+        self.ui.prompt_modal_title.clear();
+        self.ui.prompt_modal_hint.clear();
         self.ui.mode = Mode::Normal;
         // OAuth before rename so a leaked rename_tab_pending cannot title a tab with a token (#185).
         if self.ui.oauth_paste_pending {
@@ -5119,6 +5175,10 @@ impl App {
                     self.ui.confirm_run_sql = None;
                     self.ui.confirm_run_source_id = None;
                     self.ui.confirm_run_database = None;
+                    self.ui.confirm_dialog_title.clear();
+                    self.ui.confirm_action_verb.clear();
+                    self.ui.prompt_modal_title.clear();
+                    self.ui.prompt_modal_hint.clear();
                     self.ui.rename_tab_pending = false;
                     self.ui.oauth_paste_pending = false;
                     self.ui.show_completions = false;
@@ -6751,6 +6811,9 @@ impl App {
             "paste_tsv" => {
                 self.ui.mode = Mode::ImportCsv;
                 self.ui.confirm_run_sql = Some("__paste_tsv__".into());
+                self.ui.prompt_modal_title = " Paste TSV ".into();
+                self.ui.prompt_modal_hint =
+                    "  paste TSV/CSV · Enter apply into Results · Esc cancel".into();
                 self.ui.import_csv_input.clear();
                 self.set_status("paste TSV/CSV · Enter apply into Results · Esc cancel", false);
             },
@@ -6808,6 +6871,9 @@ impl App {
                     .join("connections.toml")
                     .display()
                     .to_string();
+                self.ui.prompt_modal_title = " Import connection pack ".into();
+                self.ui.prompt_modal_hint =
+                    "  TOML pack path · Enter import · Esc cancel".into();
                 self.set_status("connection pack path · Enter import · Esc cancel", false);
                 self.ui.confirm_run_sql = Some("__import_conn_pack__".into());
             }
@@ -7067,6 +7133,8 @@ impl App {
                     .get(self.db.active_tab)
                     .map(|t| t.title.clone())
                     .unwrap_or_default();
+                self.ui.prompt_modal_title = " Rename tab ".into();
+                self.ui.prompt_modal_hint = "  new SQL tab title · Enter · Esc cancel".into();
                 self.ui.mode = Mode::BrainAsk;
                 self.set_status("rename tab · Enter", false);
             }
@@ -7741,41 +7809,10 @@ impl App {
                 }
             }
             "vacuum_analyze" => {
-                if let Err(e) = self
-                    .db
-                    .run_postgres_maintenance(PostgresMaintenance::VacuumAnalyze)
-                    .await
-                {
-                    self.set_status(format!("vacuum: {e:#}"), true);
-                } else {
-                    self.ui.focus = Focus::Results;
-                    self.set_status(self.db.status.clone(), false);
-                }
+                self.start_maintenance_confirm(PostgresMaintenance::VacuumAnalyze)
             }
-            "analyze_table" => {
-                if let Err(e) = self
-                    .db
-                    .run_postgres_maintenance(PostgresMaintenance::Analyze)
-                    .await
-                {
-                    self.set_status(format!("analyze: {e:#}"), true);
-                } else {
-                    self.ui.focus = Focus::Results;
-                    self.set_status(self.db.status.clone(), false);
-                }
-            }
-            "reindex_table" => {
-                if let Err(e) = self
-                    .db
-                    .run_postgres_maintenance(PostgresMaintenance::Reindex)
-                    .await
-                {
-                    self.set_status(format!("reindex: {e:#}"), true);
-                } else {
-                    self.ui.focus = Focus::Results;
-                    self.set_status(self.db.status.clone(), false);
-                }
-            }
+            "analyze_table" => self.start_maintenance_confirm(PostgresMaintenance::Analyze),
+            "reindex_table" => self.start_maintenance_confirm(PostgresMaintenance::Reindex),
             "inspect_privileges" => match self.db.inspect_table_privileges().await {
                 Ok(()) => {
                     self.ui.focus = Focus::Results;

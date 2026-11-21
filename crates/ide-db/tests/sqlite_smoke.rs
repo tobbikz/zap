@@ -388,25 +388,8 @@ async fn wave13_sqlite_maintenance_and_help() {
     ws.execute_sql_text("INSERT INTO t VALUES (1, 1.5), (2, 3.0);")
         .await
         .unwrap();
-    // Point selection at the table via flat rebuild after introspect path:
-    // open table context by setting last_result source.
-    ws.last_result = Some(ide_db::QueryResult {
-        columns: vec!["id".into()],
-        rows: vec![vec!["1".into()]],
-        affected: None,
-        elapsed_ms: 0,
-        truncated: false,
-        source_schema: Some("main".into()),
-        source_table: Some("t".into()),
-        primary_keys: vec!["id".into()],
-        original_rows: Vec::new(),
-        cursor_row: 0,
-        cursor_col: 0,
-        explain: None,
-        chart: None,
-        page: 0,
-        has_more: false,
-    });
+    // Maintenance requires Explorer Table (or last_table_sel) — not last_result (#138).
+    ws.last_table_sel = Some((id.clone(), None, "main".into(), "t".into()));
     ws.run_postgres_maintenance(PostgresMaintenance::Analyze)
         .await
         .expect("sqlite ANALYZE");
