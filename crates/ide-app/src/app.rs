@@ -1659,20 +1659,32 @@ impl App {
             self.set_status("copy all: no results", true);
             return;
         };
+        let filt = self.db.results_filter.trim();
         let mut lines: Vec<String> = Vec::with_capacity(result.rows.len() + 1);
         lines.push(result.columns.join("\t"));
+        let mut n = 0usize;
         for row in &result.rows {
+            if !filt.is_empty() && !ide_db::row_matches_filter(row, filt) {
+                continue;
+            }
             lines.push(
                 row.iter()
                     .map(|c| if c == "NULL" { "" } else { c.as_str() })
                     .collect::<Vec<_>>()
                     .join("\t"),
             );
+            n += 1;
         }
         let text = lines.join("\n");
-        let n = result.rows.len();
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-            Ok(()) => self.set_status(format!("copied all · {n} rows TSV"), false),
+            Ok(()) => self.set_status(
+                if filt.is_empty() {
+                    format!("copied all · {n} rows TSV")
+                } else {
+                    format!("copied filtered · {n} rows TSV")
+                },
+                false,
+            ),
             Err(e) => self.set_status(format!("clipboard: {e}"), true),
         }
     }
@@ -4332,6 +4344,9 @@ impl App {
         self.ui.mode = Mode::Normal;
         if self.ui.focus == Focus::Results {
             self.db.results_filter = q.clone();
+            if let Some(r) = self.db.last_result.as_mut() {
+                r.snap_cursor_to_filter(&q);
+            }
             if q.is_empty() {
                 self.set_status("results filter cleared", false);
             } else {
@@ -5474,7 +5489,8 @@ impl App {
                     }
                     Focus::Results => {
                         if let Some(result) = self.db.last_result.as_mut() {
-                            result.move_cell(-1, 0);
+                            let filt = self.db.results_filter.clone();
+                            result.move_cell_filtered(-1, 0, &filt);
                         }
                     }
                     Focus::Diagnostics => {
@@ -5535,7 +5551,8 @@ impl App {
                     }
                     Focus::Results => {
                         if let Some(result) = self.db.last_result.as_mut() {
-                            result.move_cell(1, 0);
+                            let filt = self.db.results_filter.clone();
+                            result.move_cell_filtered(1, 0, &filt);
                         }
                     }
                     Focus::Diagnostics => {
@@ -9563,13 +9580,13 @@ async fn event_loop(
                                     }
                                     continue;
                                 }
+                                // Lowercase `t` / `+` only — Shift+T is CycleTheme (#85).
                                 if !ctrl
                                     && !alt
+                                    && !key.modifiers.contains(KeyModifiers::SHIFT)
                                     && matches!(
                                         key.code,
-                                        KeyCode::Char('t')
-                                            | KeyCode::Char('T')
-                                            | KeyCode::Char('+')
+                                        KeyCode::Char('t') | KeyCode::Char('+')
                                     )
                                 {
                                     app.db.new_query_tab();

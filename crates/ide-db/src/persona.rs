@@ -193,11 +193,15 @@ pub fn mask_pii_cell(s: &str) -> String {
     if s == "NULL" || s.is_empty() {
         return s.to_string();
     }
+    // Never mask pure integer PKs / timestamps (#59).
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return s.to_string();
+    }
     let only_cardish = s
         .chars()
         .all(|c| c.is_ascii_digit() || c == ' ' || c == '-' || c == '+');
     let digit_n = s.chars().filter(|c| c.is_ascii_digit()).count();
-    if only_cardish && (13..=19).contains(&digit_n) {
+    if only_cardish && (13..=19).contains(&digit_n) && s.chars().any(|c| !c.is_ascii_digit()) {
         return "[card]".into();
     }
     let mut out = lazy_regex_email()
@@ -214,20 +218,30 @@ fn lazy_regex_email() -> &'static Regex {
 }
 fn lazy_regex_phone() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:\+?\d[\d\-\s().]{7,}\d)").unwrap())
+    // Require + or a separator so bare digit runs / ids are not phones (#59).
+    RE.get_or_init(|| {
+        Regex::new(r"(?:\+\d[\d\-\s().]{7,}\d)|(?:\(\d{2,4}\)[\d\-\s.]{5,}\d)|(?:\d{2,4}[\-\s.]\d[\d\-\s.]{5,}\d)")
+            .unwrap()
+    })
 }
 fn lazy_regex_card() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\b(?:\d[ -]*?){13,19}\b").unwrap())
+    RE.get_or_init(|| Regex::new(r"\b(?:\d[ -]+?){12,18}\d\b").unwrap())
 }
 
+/// Mask display rows only — keep `original_rows` (and apply/export baseline) unmasked (#59).
 pub fn mask_result(result: &QueryResult) -> QueryResult {
     let mut out = result.clone();
+    if out.original_rows.is_empty() {
+        out.original_rows = out.rows.clone();
+    }
+    let baseline = out.original_rows.clone();
     for row in &mut out.rows {
         for cell in row.iter_mut() {
             *cell = mask_pii_cell(cell);
         }
     }
+    out.original_rows = baseline;
     out
 }
 
