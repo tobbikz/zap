@@ -3,6 +3,7 @@
 //! Drivers: PostgreSQL (primary), MySQL, SQLite, MSSQL, ClickHouse, DuckDB, Redis, MongoDB, …
 
 mod alt_engines;
+mod datagrip;
 mod draw_glyphs;
 mod brain_ask;
 mod engines;
@@ -19,6 +20,7 @@ mod secrets;
 mod snippets;
 
 pub use brain_ask::brain_ask;
+pub use datagrip::{datagrip_detected, discover_datagrip_xmls, parse_datagrip_xml};
 pub use er_canvas::render_er_canvas;
 pub use oauth::{apply_pasted_token, authorize_url, load_persisted_tokens, open_browser};
 pub use secrets::{
@@ -7821,6 +7823,92 @@ impl DbWorkspace {
         };
         std::fs::write(path, toml::to_string_pretty(&file)?)?;
         Ok(())
+    }
+
+    /// Import JetBrains DataGrip / Database Tools `dataSources.xml`.
+    /// Pass `None` to import every discovered project file.
+    pub fn import_datagrip(&mut self, path: Option<&Path>) -> Result<usize> {
+        let paths: Vec<PathBuf> = match path {
+            Some(p) => vec![p.to_path_buf()],
+            None => {
+                let found = datagrip::discover_datagrip_xmls();
+                if found.is_empty() {
+                    bail!(
+                        "DataGrip not found — open Ctrl-P → Import from DataGrip… and paste a path to dataSources.xml"
+                    );
+                }
+                found
+            }
+        };
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for xml in &paths {
+            let sources = datagrip::parse_datagrip_xml(xml).with_context(|| {
+                format!("parse {}", xml.display())
+            })?;
+            for mut s in sources {
+                if self.sources.iter().any(|x| x.id == s.id) {
+                    skipped += 1;
+                    continue;
+                }
+                if self.sources.iter().any(|x| {
+                    x.name == s.name
+                        && x.host == s.host
+                        && x.database == s.database
+                        && x.file == s.file
+                        && x.driver == s.driver
+                }) {
+                    skipped += 1;
+                    continue;
+                }
+                // Passwords live in the OS keychain — leave empty for the user to set.
+                s.password.clear();
+                self.sources.push(s);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.save_sources()?;
+            self.rebuild_tree_roots();
+            self.rebuild_flat();
+        }
+        self.status = if added == 0 && skipped > 0 {
+            format!("DataGrip · 0 new ({skipped} already present) · set passwords in connection edit")
+        } else {
+            format!(
+                "DataGrip · imported {added} · skipped {skipped} · set passwords (keychain not copied)"
+            )
+        };
+        Ok(added)
+    }
+
+    /// Preview names that would be imported (for confirm dialog).
+    pub fn datagrip_import_preview(&self, max: usize) -> Result<(usize, String, Vec<PathBuf>)> {
+        let paths = datagrip::discover_datagrip_xmls();
+        if paths.is_empty() {
+            bail!("DataGrip / JetBrains dataSources.xml not found on this machine");
+        }
+        let mut names = Vec::new();
+        for xml in &paths {
+            if let Ok(srcs) = datagrip::parse_datagrip_xml(xml) {
+                for s in srcs {
+                    names.push(format!("{} · {}", s.driver.label(), s.name));
+                }
+            }
+        }
+        let total = names.len();
+        let mut lines = vec![format!(
+            "Import {total} connection(s) from {} DataGrip/IDE project(s)?\n\
+             Passwords are NOT copied (OS keychain) — set them after import.\n",
+            paths.len()
+        )];
+        for n in names.iter().take(max) {
+            lines.push(format!("  · {n}"));
+        }
+        if total > max {
+            lines.push(format!("  … +{} more", total - max));
+        }
+        Ok((total, lines.join("\n"), paths))
     }
 
     /// Import datasources from a pack file.
