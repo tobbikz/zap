@@ -9676,6 +9676,12 @@ impl DbWorkspace {
                 }
                 let out = out_dir.join(format!("{db}-{stamp}.sql"));
                 let mut cmd = Command::new("mysqldump");
+                // Never put the password on argv (visible in ps/audit); MYSQL_PWD is the
+                // documented env channel for the MySQL client tools (#100).
+                let password = src.resolved_password();
+                if !password.is_empty() {
+                    cmd.env("MYSQL_PWD", password);
+                }
                 cmd.args([
                     "-h",
                     &src.host,
@@ -9684,9 +9690,6 @@ impl DbWorkspace {
                     "-u",
                     &src.user,
                 ]);
-                if !src.password.is_empty() {
-                    cmd.arg(format!("-p{}", src.password));
-                }
                 cmd.arg(&db)
                     .stdout(std::fs::File::create(&out).context("create dump file")?);
                 let status = cmd.status().context("spawn mysqldump (is it on PATH?)")?;
@@ -9801,6 +9804,12 @@ impl DbWorkspace {
                     bail!("select a MySQL database first");
                 }
                 let mut cmd = Command::new("mysql");
+                // Keep the password off argv (ps/audit exposure); MYSQL_PWD is the
+                // documented env channel for the MySQL client tools (#171).
+                let password = src.resolved_password();
+                if !password.is_empty() {
+                    cmd.env("MYSQL_PWD", password);
+                }
                 cmd.args([
                     "-h",
                     &src.host,
@@ -9809,9 +9818,6 @@ impl DbWorkspace {
                     "-u",
                     &src.user,
                 ]);
-                if !src.password.is_empty() {
-                    cmd.arg(format!("-p{}", src.password));
-                }
                 cmd.arg(&db)
                     .stdin(std::fs::File::open(dump_path).context("open dump")?);
                 let status = cmd.status().context("spawn mysql (is it on PATH?)")?;
