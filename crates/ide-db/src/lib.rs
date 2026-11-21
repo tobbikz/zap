@@ -2225,6 +2225,19 @@ impl DbWorkspace {
         if idx >= self.tabs.len() {
             return;
         }
+        // Refuse to swap the console onto a different connection while a TXN is open (#168).
+        if self.in_txn {
+            if let Some(tab) = self.tabs.get(idx) {
+                if let Some(sid) = &tab.source_id {
+                    let key = Self::pool_key(sid, tab.database.as_deref());
+                    if self.txn_pool_key.as_deref() != Some(key.as_str()) {
+                        self.status =
+                            "transaction open — COMMIT or ROLLBACK before switching tabs".into();
+                        return;
+                    }
+                }
+            }
+        }
         self.flush_active_tab();
         self.active_tab = idx;
         self.load_active_tab();
@@ -2349,6 +2362,31 @@ impl DbWorkspace {
         }
         self.load_active_tab();
         true
+    }
+
+    /// Human-readable warning when quitting would lose DB work (open TXN / edits).
+    pub fn quit_warning(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.in_txn {
+            parts.push("open transaction".to_string());
+        }
+        let dirty: usize = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.result.as_ref())
+            .map(|r| r.dirty_rows().len())
+            .sum();
+        if dirty > 0 {
+            parts.push(format!("{dirty} dirty result cell(s)"));
+        }
+        if !self.pending_row_deletes.is_empty() {
+            parts.push(format!("{} pending delete(s)", self.pending_row_deletes.len()));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
     }
 
     pub fn toggle_pin_active_tab(&mut self) -> bool {
@@ -4435,6 +4473,10 @@ impl DbWorkspace {
         database: Option<&str>,
     ) -> Result<()> {
         let key = Self::pool_key(source_id, database);
+        // Do not silently move an open transaction onto another connection (#168).
+        if self.in_txn && self.txn_pool_key.as_deref() != Some(key.as_str()) {
+            bail!("transaction open on another connection — COMMIT or ROLLBACK before switching");
+        }
         if self.pools.contains_key(&key) {
             self.active_source = Some(source_id.to_string());
             self.active_database = database.map(|s| s.to_string());
@@ -4588,20 +4630,25 @@ impl DbWorkspace {
         .await
         .context("connection test timed out (8s)")?
         .context("connection test failed")?;
-        let is_bq = ws
+        let driver = ws
             .sources
             .first()
-            .map(|s| s.driver == DbDriver::Bigquery)
-            .unwrap_or(false);
-        if is_bq {
-            let db = ws.active_database.clone();
-            let key = Self::pool_key(&id, db.as_deref());
-            let _ = ws
-                .exec_statement(&key, DbDriver::Bigquery, db.as_deref(), "SELECT 1 AS ok")
-                .await
-                .context("BigQuery SELECT 1")?;
-        }
-        Ok(ws.status.clone())
+            .map(|s| s.driver)
+            .unwrap_or_default();
+        let db = ws.active_database.clone();
+        let key = Self::pool_key(&id, db.as_deref());
+        // Prove the connection with a real driver-specific probe; lazy/stub clients
+        // must not report OK until they answer (#64).
+        let probe = match driver {
+            DbDriver::Redis => "PING",
+            DbDriver::Mongo => "ping",
+            DbDriver::Elasticsearch => "GET /",
+            _ => "SELECT 1 AS ok",
+        };
+        ws.exec_statement(&key, driver, db.as_deref(), probe)
+            .await
+            .with_context(|| format!("{} probe `{probe}`", driver.label()))?;
+        Ok(format!("ok · {}", driver.label()))
     }
 
     /// ASCII ER edges for the active schema (PG/MySQL/SQLite FKs).
@@ -4722,18 +4769,17 @@ impl DbWorkspace {
 
     /// Start (or reuse) `ssh -L local:host:port` for this source. Returns local port.
     fn ensure_ssh_tunnel(&mut self, src: &DataSource) -> Result<u16> {
+        let mut stale = false;
         if let Some(t) = self.ssh_tunnels.get_mut(&src.id) {
             // Reuse if child still alive.
             match t.child.try_wait() {
                 Ok(None) => return Ok(t.local_port),
-                Ok(Some(status)) => {
-                    bail!(
-                        "SSH tunnel to {} exited ({status})",
-                        src.ssh_host
-                    );
-                }
-                Err(e) => bail!("SSH tunnel status: {e}"),
+                Ok(Some(_)) | Err(_) => stale = true,
             }
+        }
+        if stale {
+            // Dead/failed tunnel must not poison every later reconnect (#58).
+            self.ssh_tunnels.remove(&src.id);
         }
 
         // OpenSSH cannot take `-L 0:…`, so we still probe an ephemeral port then hand it to
@@ -4824,8 +4870,17 @@ impl DbWorkspace {
                 Ok(None) if std::time::Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(100));
                 }
-                Ok(None) => bail!("SSH tunnel timed out waiting for local port {local_port}"),
-                Err(e) => bail!("SSH tunnel wait: {e}"),
+                Ok(None) => {
+                    // Do not leak a half-open ssh process on timeout (#58).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("SSH tunnel timed out waiting for local port {local_port}");
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("SSH tunnel wait: {e}");
+                }
             }
         }
     }
@@ -5241,7 +5296,7 @@ impl DbWorkspace {
             if self.query_cancel.load(Ordering::Relaxed) {
                 self.query_running = false;
                 let _ = self.cancel_backend_best_effort(&key, driver).await;
-                self.disconnect_active_pool();
+                self.disconnect_active_pool().await;
                 bail!("query cancelled");
             }
             self.guard_writable(&source_id, stmt)?;
@@ -5281,7 +5336,7 @@ impl DbWorkspace {
                     if msg.contains("cancelled") || msg.contains("timed out") {
                         let _ = self.cancel_backend_best_effort(&key, driver).await;
                         if msg.contains("cancelled") {
-                            self.disconnect_active_pool();
+                            self.disconnect_active_pool().await;
                         }
                     }
                     return Err(e);
@@ -5841,12 +5896,17 @@ impl DbWorkspace {
         self.jump_to_table(parts[1], parts[2])
     }
 
-    fn disconnect_active_pool(&mut self) {
+    async fn disconnect_active_pool(&mut self) {
         let Some(source_id) = self.active_source.clone() else {
             return;
         };
         let database = self.active_database.clone();
         let key = Self::pool_key(&source_id, database.as_deref());
+        // A dropped pool must not leave a dangling server-side transaction (#168).
+        if self.in_txn && self.txn_pool_key.as_deref() == Some(key.as_str()) {
+            let _ = self.rollback_transaction_inner().await;
+            self.clear_txn();
+        }
         if let Some(pool) = self.pools.remove(&key) {
             match pool {
                 LivePool::Pg(p) => {
@@ -7300,6 +7360,7 @@ impl DbWorkspace {
     pub fn import_connection_pack(&mut self, path: &std::path::Path) -> Result<usize> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let text = persona::verify_signed_pack(&text)?;
         let file: SourcesFile = toml::from_str(&text).context("parse connection pack")?;
         let mut added = 0usize;
         for mut s in file.sources {
@@ -9249,19 +9310,20 @@ fn load_query_bookmarks() -> Vec<String> {
 }
 
 impl DbWorkspace {
-    fn persist_history(&self) {
+    fn persist_history(&mut self) {
         let Some(path) = history_path() else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let file = QueryMemoryFile {
             history: self.history.clone(),
             bookmarks: self.bookmarks.clone(),
         };
-        if let Ok(text) = serde_json::to_string_pretty(&file) {
-            let _ = std::fs::write(path, text);
+        let saved = serde_json::to_string_pretty(&file)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| ide_core::write_atomic(&path, text).map_err(anyhow::Error::from));
+        if let Err(e) = saved {
+            // Surface the failure instead of silently losing history (#162).
+            self.status = format!("query history save failed: {e:#}");
         }
     }
 
@@ -9695,6 +9757,12 @@ impl DbWorkspace {
                 }
                 let out = out_dir.join(format!("{db}-{stamp}.sql"));
                 let mut cmd = Command::new("mysqldump");
+                // Never put the password on argv (visible in ps/audit); MYSQL_PWD is the
+                // documented env channel for the MySQL client tools (#100).
+                let password = src.resolved_password();
+                if !password.is_empty() {
+                    cmd.env("MYSQL_PWD", password);
+                }
                 cmd.args([
                     "-h",
                     &src.host,
@@ -9703,9 +9771,6 @@ impl DbWorkspace {
                     "-u",
                     &src.user,
                 ]);
-                if !src.password.is_empty() {
-                    cmd.arg(format!("-p{}", src.password));
-                }
                 cmd.arg(&db)
                     .stdout(std::fs::File::create(&out).context("create dump file")?);
                 let status = cmd.status().context("spawn mysqldump (is it on PATH?)")?;
@@ -9820,6 +9885,12 @@ impl DbWorkspace {
                     bail!("select a MySQL database first");
                 }
                 let mut cmd = Command::new("mysql");
+                // Keep the password off argv (ps/audit exposure); MYSQL_PWD is the
+                // documented env channel for the MySQL client tools (#171).
+                let password = src.resolved_password();
+                if !password.is_empty() {
+                    cmd.env("MYSQL_PWD", password);
+                }
                 cmd.args([
                     "-h",
                     &src.host,
@@ -9828,9 +9899,6 @@ impl DbWorkspace {
                     "-u",
                     &src.user,
                 ]);
-                if !src.password.is_empty() {
-                    cmd.arg(format!("-p{}", src.password));
-                }
                 cmd.arg(&db)
                     .stdin(std::fs::File::open(dump_path).context("open dump")?);
                 let status = cmd.status().context("spawn mysql (is it on PATH?)")?;
@@ -11779,5 +11847,61 @@ mod close_tab_dirty_tests {
         assert!(!ws.close_active_tab());
         assert!(ws.status.contains("transaction open"), "{}", ws.status);
         assert_eq!(ws.tabs.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod quit_warning_tests {
+    use super::DbWorkspace;
+
+    #[test]
+    fn quit_warning_reports_txn_and_pending_deletes() {
+        let mut ws = DbWorkspace::default();
+        assert!(ws.quit_warning().is_none());
+        ws.in_txn = true;
+        let w = ws.quit_warning().unwrap();
+        assert!(w.contains("open transaction"), "{w}");
+        ws.pending_row_deletes.push("DELETE FROM t WHERE id=1".into());
+        let w = ws.quit_warning().unwrap();
+        assert!(w.contains("pending delete"), "{w}");
+    }
+}
+
+#[cfg(test)]
+mod txn_switch_tests {
+    use super::{DbWorkspace, SqlTab};
+
+    #[test]
+    fn select_tab_refuses_different_connection_during_txn() {
+        let mut ws = DbWorkspace::default();
+        let mut a = SqlTab::query(1);
+        a.source_id = Some("a".into());
+        let mut b = SqlTab::query(2);
+        b.source_id = Some("b".into());
+        ws.tabs = vec![a, b];
+        ws.active_tab = 0;
+        ws.active_source = Some("a".into());
+        ws.in_txn = true;
+        ws.txn_pool_key = Some("a".into());
+
+        ws.select_tab(1);
+        assert_eq!(ws.active_tab, 0, "switch must be blocked");
+        assert!(ws.status.contains("transaction open"), "{}", ws.status);
+
+        ws.select_tab(0);
+        assert_eq!(ws.active_tab, 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_connected_refuses_different_connection_during_txn() {
+        let mut ws = DbWorkspace::default();
+        ws.in_txn = true;
+        ws.txn_pool_key = Some("a".into());
+        let err = ws
+            .ensure_connected("b", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("transaction open"), "{err}");
     }
 }

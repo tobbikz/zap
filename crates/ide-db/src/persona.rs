@@ -68,18 +68,82 @@ pub fn audit_log_path() -> PathBuf {
         .join("audit.log")
 }
 
+/// Rotate the audit log before it grows past this size (keeps one `.1` backup).
+const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+fn redact_audit_sql(sql: &str) -> String {
+    fn re(cell: &'static std::sync::OnceLock<Regex>, pattern: &str) -> &'static Regex {
+        cell.get_or_init(|| Regex::new(pattern).expect("valid audit redaction regex"))
+    }
+    static ASSIGN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static IDENT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static PASSWORD: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static URL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+    let mut out = re(
+        &URL,
+        r"(?i)(://[^:/@\s]+:)([^@\s]+)(@)",
+    )
+    .replace_all(sql, "$1[redacted]$3")
+    .to_string();
+    out = re(
+        &ASSIGN,
+        r#"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key)\b(\s*=\s*)(['"])[^'"]*"#,
+    )
+    .replace_all(&out, "$1$2$3[redacted]$3")
+    .to_string();
+    out = re(
+        &IDENT,
+        r#"(?i)(IDENTIFIED\s+BY\s+)('[^']*'|"[^"]*")"#,
+    )
+    .replace_all(&out, "$1[redacted]")
+    .to_string();
+    out = re(
+        &PASSWORD,
+        r#"(?i)\b(PASSWORD\s+)('[^']*'|"[^"]*")"#,
+    )
+    .replace_all(&out, "$1[redacted]")
+    .to_string();
+    out
+}
+
 /// Append one DDL/DML audit line (local file).
+///
+/// The log is owner-only on Unix, rotated at 5 MiB, and SQL is redacted for
+/// common credential literals before it is written (#165).
 pub fn audit_append(source: &str, driver: &str, sql: &str) -> Result<()> {
     let path = audit_log_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= AUDIT_MAX_BYTES {
+        let rotated = path.with_extension("log.1");
+        let _ = fs::remove_file(&rotated);
+        let _ = fs::rename(&path, &rotated);
+    }
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?
+    };
+    #[cfg(not(unix))]
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
-    let one_line = sql.replace('\n', " ").chars().take(500).collect::<String>();
+    let redacted = redact_audit_sql(sql);
+    let one_line = redacted
+        .replace('\n', " ")
+        .chars()
+        .take(500)
+        .collect::<String>();
     writeln!(f, "{ts}\t{driver}\t{source}\t{one_line}")?;
     Ok(())
 }
@@ -810,18 +874,49 @@ pub fn post_health_webhook(url: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn signed_pack_export(sources_toml: &str, out: &Path) -> Result<()> {
+/// Deterministic FNV-1a hash used as the signed-pack checksum.
+fn pack_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+fn legacy_pack_hash(text: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    sources_toml.hash(&mut h);
-    let sig = format!("{:x}", h.finish());
+    text.hash(&mut h);
+    format!("{:x}", h.finish())
+}
+
+pub fn signed_pack_export(sources_toml: &str, out: &Path) -> Result<()> {
+    let sig = pack_hash(sources_toml);
     let body = format!("# Zap connection pack · sig={sig}\n{sources_toml}");
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(out, body)?;
     Ok(())
+}
+
+/// Verify a connection pack before import. Unsigned packs pass through unchanged;
+/// signed packs are rejected when the body no longer matches the header checksum (#70).
+pub fn verify_signed_pack(text: &str) -> Result<String> {
+    let Some((first, body)) = text.split_once('\n') else {
+        return Ok(text.to_string());
+    };
+    let Some(sig) = first.strip_prefix("# Zap connection pack · sig=") else {
+        return Ok(text.to_string());
+    };
+    let sig = sig.trim();
+    if pack_hash(body) == sig || legacy_pack_hash(body) == sig {
+        Ok(body.to_string())
+    } else {
+        bail!("connection pack signature mismatch — refusing to import a tampered pack")
+    }
 }
 
 pub fn diagnose_pack_template(schema: &str, table: &str, explain: &str, stats: &str) -> String {
@@ -901,9 +996,42 @@ mod tests {
     }
 
     #[test]
+    fn signed_pack_roundtrip_and_tamper_detection() {
+        let dir = std::env::temp_dir().join(format!(
+            "zap-pack-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let out = dir.join("connections.signed.toml");
+        let body = "active_source = \"a\"\n";
+        signed_pack_export(body, &out).unwrap();
+        let text = fs::read_to_string(&out).unwrap();
+        assert_eq!(verify_signed_pack(&text).unwrap(), body);
+        let tampered = text.replace("active_source", "tampered_source");
+        assert!(verify_signed_pack(&tampered).is_err());
+        assert_eq!(verify_signed_pack("plain = 1\n").unwrap(), "plain = 1\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn audit_csv_quotes_all_fields() {
         assert_eq!(audit_csv_field("plain"), "plain");
         assert_eq!(audit_csv_field("a,b"), "\"a,b\"");
         assert_eq!(audit_csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn audit_redacts_credentials() {
+        let sql = "ALTER ROLE app PASSWORD 'hunter2'; CREATE USER u IDENTIFIED BY 's3cret';";
+        let out = redact_audit_sql(sql);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(!out.contains("s3cret"), "{out}");
+        assert!(out.contains("[redacted]"), "{out}");
+        let url = redact_audit_sql("postgres://alice:topsecret@db:5432/app");
+        assert!(!url.contains("topsecret"), "{url}");
+        assert!(url.contains("postgres://alice:[redacted]@db"), "{url}");
     }
 }
