@@ -24,7 +24,8 @@ pub fn paginate_select_sql(sql: &str, page: usize, page_size: usize) -> String {
 }
 
 pub fn is_paged_query(sql: &str) -> bool {
-    let t = sql.trim_start().to_ascii_lowercase();
+    let stripped = crate::strip_sql_comments(sql);
+    let t = stripped.trim_start().to_ascii_lowercase();
     t.starts_with("select") || t.starts_with("with")
 }
 
@@ -81,6 +82,13 @@ mod tests {
     fn page_size_zero_disables() {
         let sql = "SELECT * FROM t";
         assert_eq!(paginate_select_sql(sql, 0, 0), sql);
+    }
+
+    #[test]
+    fn leading_comments_do_not_hide_select() {
+        assert!(is_paged_query("-- comment\nSELECT 1"));
+        assert!(is_paged_query("/* c */\nWITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!is_paged_query("-- comment\nDELETE FROM t"));
     }
 
     #[test]

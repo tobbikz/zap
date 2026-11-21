@@ -300,13 +300,14 @@ fn parse_json_compact(text: &str) -> Result<QueryResult> {
 }
 
 fn is_query_like(sql: &str) -> bool {
-    let s = sql.trim_start();
+    let stripped = crate::strip_sql_comments(sql);
+    let s = stripped.trim_start();
     let head = s
         .split_whitespace()
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(
+    if matches!(
         head.as_str(),
         "select"
             | "with"
@@ -320,7 +321,12 @@ fn is_query_like(sql: &str) -> bool {
             | "exec"
             | "execute"
             | "sp_help"
-    )
+    ) {
+        return true;
+    }
+    let lower = s.to_ascii_lowercase();
+    matches!(head.as_str(), "insert" | "update" | "delete")
+        && (lower.contains(" returning ") || lower.contains(" output "))
 }
 
 pub async fn mssql_databases(client: &Arc<Mutex<MssqlClient>>, source_id: &str) -> Result<Vec<DbTreeNode>> {
@@ -713,5 +719,19 @@ mod http_client_tests {
         s.ssl_mode = "require".into();
         s.ssl_trust_cert = true;
         assert!(build_http_client(&s).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod query_like_tests {
+    use super::is_query_like;
+
+    #[test]
+    fn comments_and_returning_are_queries() {
+        assert!(is_query_like("-- starter\nSELECT 1 AS ok"));
+        assert!(is_query_like("/* recipe */\nSELECT 1"));
+        assert!(is_query_like("INSERT INTO t VALUES (1) RETURNING id"));
+        assert!(is_query_like("UPDATE t SET x=1 OUTPUT inserted.id"));
+        assert!(!is_query_like("-- comment\nDELETE FROM t"));
     }
 }
