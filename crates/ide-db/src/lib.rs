@@ -1463,8 +1463,12 @@ pub struct DbWorkspace {
     pub connection_health: HashMap<String, ConnHealth>,
     /// Cell edit undo stack, grouped so paste can undo atomically.
     pub cell_undo: Vec<CellUndoBatch>,
-    /// Backend pid/id for the in-flight query connection (PG/MySQL).
+    /// Backend pid/id for the in-flight query connection (PG/MySQL/MSSQL).
     pub query_backend_pid: Arc<AtomicI64>,
+    /// ClickHouse `query_id` (or similar) for Esc cancel (#41).
+    query_cancel_token: Option<String>,
+    /// DuckDB interrupt handle for the in-flight statement (#41).
+    duck_interrupt: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     /// Recent table keys `source|schema|table` (newest first).
     pub recent_tables: Vec<String>,
     /// Optional Results row filter (substring, case-insensitive).
@@ -1601,6 +1605,8 @@ impl Default for DbWorkspace {
             connection_health: HashMap::new(),
             cell_undo: Vec::new(),
             query_backend_pid: Arc::new(AtomicI64::new(0)),
+            query_cancel_token: None,
+            duck_interrupt: None,
             recent_tables: Vec::new(),
             results_filter: String::new(),
             health_activity_auto_refresh: false,
@@ -5303,6 +5309,9 @@ impl DbWorkspace {
         let start = std::time::Instant::now();
         self.query_running = true;
         self.query_cancel.store(false, Ordering::Relaxed);
+        self.query_backend_pid.store(0, Ordering::Relaxed);
+        self.query_cancel_token = None;
+        self.duck_interrupt = None;
         self.status = "running query… Esc cancel".into();
         let mut last = QueryResult::empty();
         let driver = self
@@ -5513,9 +5522,29 @@ impl DbWorkspace {
         match pool {
             LivePool::Pg(_) | LivePool::Mysql(_) => unreachable!("handled above"),
             LivePool::Sqlite(p) => exec_sqlite(p, exec_sql).await,
-            LivePool::Mssql(c) => engines::exec_mssql(c, exec_sql).await,
-            LivePool::Clickhouse(c) => engines::exec_clickhouse(c, exec_sql).await,
-            LivePool::Duckdb(d) => alt_engines::exec_duckdb(d, exec_sql).await,
+            LivePool::Mssql(c) => {
+                let spid = engines::mssql_backend_spid(c).await.unwrap_or(0);
+                self.query_backend_pid.store(spid, Ordering::Relaxed);
+                let result = engines::exec_mssql(c, exec_sql).await;
+                self.query_backend_pid.store(0, Ordering::Relaxed);
+                result
+            }
+            LivePool::Clickhouse(c) => {
+                let qid = uuid::Uuid::new_v4().to_string();
+                self.query_cancel_token = Some(qid.clone());
+                let result = engines::exec_clickhouse(c, exec_sql, Some(&qid)).await;
+                self.query_cancel_token = None;
+                result
+            }
+            LivePool::Duckdb(d) => {
+                {
+                    let guard = d.lock().await;
+                    self.duck_interrupt = Some(guard.interrupt_handle());
+                }
+                let result = alt_engines::exec_duckdb(d, exec_sql).await;
+                self.duck_interrupt = None;
+                result
+            }
             LivePool::Http(h) => http_engines::exec_http(h, exec_sql).await,
             LivePool::CloudStub(DbDriver::Bigquery) => {
                 let src = self
@@ -5562,25 +5591,66 @@ impl DbWorkspace {
         self.query_cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Cancel the dedicated in-flight backend (pid captured on query connection).
+    /// Cancel the dedicated in-flight backend (pid / query_id / DuckDB interrupt).
     async fn cancel_backend_best_effort(&mut self, key: &str, driver: DbDriver) -> Result<()> {
-        let pid = self.query_backend_pid.load(Ordering::Relaxed);
-        if pid <= 0 {
-            // Never broadcast-cancel by usename/database — that kills other sessions (#62).
+        if let Some(handle) = self.duck_interrupt.take() {
+            handle.interrupt();
             return Ok(());
         }
-        let pool = self.pools.get(key).context("not connected")?;
-        match (driver, pool) {
-            (DbDriver::Postgres, LivePool::Pg(p)) => {
-                let _ = sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
-                    .bind(pid as i32)
-                    .fetch_one(p)
-                    .await;
+        let pid = self.query_backend_pid.load(Ordering::Relaxed);
+        let token = self.query_cancel_token.clone();
+        match driver {
+            DbDriver::Postgres if pid > 0 => {
+                let pool = self.pools.get(key).context("not connected")?;
+                if let LivePool::Pg(p) = pool {
+                    let _ = sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
+                        .bind(pid as i32)
+                        .fetch_one(p)
+                        .await;
+                }
             }
-            (DbDriver::Mysql, LivePool::Mysql(p)) => {
-                let _ = sqlx::query(&format!("KILL QUERY {pid}")).execute(p).await;
+            DbDriver::Mysql if pid > 0 => {
+                let pool = self.pools.get(key).context("not connected")?;
+                if let LivePool::Mysql(p) = pool {
+                    let _ = sqlx::query(&format!("KILL QUERY {pid}")).execute(p).await;
+                }
             }
-            _ => {}
+            DbDriver::Mssql if pid > 0 => {
+                // Side-channel KILL — the query holds the shared client mutex (#41).
+                let source_id = key.split('#').next().unwrap_or(key);
+                if let Some(src) = self.source_cfg(source_id).cloned() {
+                    let local = self.ssh_tunnels.get(&src.id).map(|t| t.local_port);
+                    if let Ok(side) = engines::connect_mssql(&src, local).await {
+                        let sql = format!("KILL {pid}");
+                        let _ = engines::exec_mssql(&side, &sql).await;
+                    } else {
+                        self.status =
+                            format!("cancel: could not open side session to KILL {pid}");
+                    }
+                }
+            }
+            DbDriver::Clickhouse => {
+                if let Some(qid) = token {
+                    let pool = self.pools.get(key).context("not connected")?;
+                    if let LivePool::Clickhouse(c) = pool {
+                        let sql = format!("KILL QUERY WHERE query_id = '{}'", qid.replace('\'', "''"));
+                        let _ = engines::exec_clickhouse(c, &sql, None).await;
+                    }
+                }
+            }
+            DbDriver::Duckdb => {
+                // Interrupt handle already tried above; nothing else to do.
+            }
+            DbDriver::Postgres | DbDriver::Mysql => {
+                // pid == 0 → no-op (never broadcast-cancel; #62).
+            }
+            other => {
+                // Honest status when we cannot cancel the server-side statement (#41).
+                self.status = format!(
+                    "cancel not supported for {} — waiting for timeout/finish",
+                    other.label()
+                );
+            }
         }
         Ok(())
     }
@@ -6627,7 +6697,7 @@ impl DbWorkspace {
             LivePool::Mysql(p) => exec_mysql(p, &explain).await?,
             LivePool::Sqlite(p) => exec_sqlite(p, &explain).await?,
             LivePool::Mssql(c) => engines::exec_mssql(c, &explain).await?,
-            LivePool::Clickhouse(c) => engines::exec_clickhouse(c, &explain).await?,
+            LivePool::Clickhouse(c) => engines::exec_clickhouse(c, &explain, None).await?,
             LivePool::Duckdb(d) => alt_engines::exec_duckdb(d, &explain).await?,
             LivePool::Redis(r) => alt_engines::exec_redis(r, &explain).await?,
             LivePool::Mongo(m) => alt_engines::exec_mongo(m, &explain, database.as_deref()).await?,
@@ -6811,7 +6881,7 @@ impl DbWorkspace {
                 let _ = engines::exec_mssql(c, stmt).await?;
             }
             LivePool::Clickhouse(c) => {
-                let _ = engines::exec_clickhouse(c, stmt).await?;
+                let _ = engines::exec_clickhouse(c, stmt, None).await?;
             }
             LivePool::Duckdb(d) => {
                 let _ = alt_engines::exec_duckdb(d, stmt).await?;
@@ -7560,7 +7630,7 @@ impl DbWorkspace {
                     let _ = engines::exec_mssql(c, &sql).await?;
                 }
                 LivePool::Clickhouse(c) => {
-                    let _ = engines::exec_clickhouse(c, &sql).await?;
+                    let _ = engines::exec_clickhouse(c, &sql, None).await?;
                 }
                 LivePool::Duckdb(d) => {
                     let _ = alt_engines::exec_duckdb(d, &sql).await?;
@@ -7643,7 +7713,7 @@ impl DbWorkspace {
                     let _ = engines::exec_mssql(c, &sql).await?;
                 }
                 LivePool::Clickhouse(c) => {
-                    let _ = engines::exec_clickhouse(c, &sql).await?;
+                    let _ = engines::exec_clickhouse(c, &sql, None).await?;
                 }
                 LivePool::Duckdb(d) => {
                     let _ = alt_engines::exec_duckdb(d, &sql).await?;
@@ -10148,7 +10218,7 @@ impl DbWorkspace {
             }
             (DbDriver::Clickhouse, LivePool::Clickhouse(c)) => {
                 let sql = format!("KILL QUERY WHERE query_id = '{pid}'");
-                let _ = engines::exec_clickhouse(c, &sql).await?;
+                let _ = engines::exec_clickhouse(c, &sql, None).await?;
                 self.audit_sql(&sql);
                 self.status = format!("killed query {pid}");
             }
@@ -10681,7 +10751,7 @@ impl DbWorkspace {
                     db.replace('`', "``"),
                     side.table.replace('`', "``")
                 );
-                engines::exec_clickhouse(&ch.with_database(db), &q).await?
+                engines::exec_clickhouse(&ch.with_database(db), &q, None).await?
             }
             LivePool::Duckdb(d) => alt_engines::exec_duckdb(d, &sql).await?,
             LivePool::Redis(_) | LivePool::Mongo(_) | LivePool::CloudStub(_) | LivePool::Http(_) => {
@@ -11962,6 +12032,19 @@ mod cancel_tests {
         ws.in_txn = true;
         ws.abort_txn_after_cancel().await;
         assert!(!ws.in_txn);
+    }
+
+    #[tokio::test]
+    async fn unsupported_driver_cancel_sets_honest_status() {
+        let mut ws = DbWorkspace::default();
+        ws.cancel_backend_best_effort("x", DbDriver::Redis)
+            .await
+            .unwrap();
+        assert!(
+            ws.status.contains("cancel not supported"),
+            "{}",
+            ws.status
+        );
     }
 }
 
