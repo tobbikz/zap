@@ -373,7 +373,10 @@ impl Keymap {
                 (false, true, KeyCode::BackTab) => Some(Action::PrevTab),
                 // Space = discover in Studio; Code mode remaps via app when needed.
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
-                (false, true, KeyCode::Char('T')) => Some(Action::CycleTheme),
+                // Uppercase after normalize_typed_key may arrive with shift stripped (#85).
+                (false, true, KeyCode::Char('T')) | (false, false, KeyCode::Char('T')) => {
+                    Some(Action::CycleTheme)
+                }
                 (false, false, KeyCode::Char('g')) => Some(Action::GotoDefinition),
                 (false, true, KeyCode::Char('K')) | (false, false, KeyCode::Char('K')) => {
                     Some(Action::Hover)
@@ -388,7 +391,9 @@ impl Keymap {
                 (false, false, KeyCode::Char('8')) => Some(Action::OpenDatabase),
                 (false, false, KeyCode::Char('9')) => Some(Action::FocusResults),
                 (false, false, KeyCode::Char('n')) => Some(Action::FindNext),
-                (false, true, KeyCode::Char('N')) => Some(Action::FindPrev),
+                (false, true, KeyCode::Char('N')) | (false, false, KeyCode::Char('N')) => {
+                    Some(Action::FindPrev)
+                }
                 (false, false, KeyCode::Char('w')) if !ctrl => Some(Action::FocusOtherSplit),
                 (false, false, KeyCode::Esc) => Some(Action::ClearExtraCursors),
                 (false, false, KeyCode::Char(']')) => Some(Action::NextProblem),
@@ -532,7 +537,9 @@ impl Keymap {
                 (false, false, KeyCode::Char('o')) => Some(Action::OpenDbObjectPalette),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
-                (false, true, KeyCode::Char('T')) => Some(Action::CycleTheme),
+                (false, true, KeyCode::Char('T')) | (false, false, KeyCode::Char('T')) => {
+                    Some(Action::CycleTheme)
+                }
                 (false, false, KeyCode::Delete)
                 | (false, false, KeyCode::Backspace)
                 | (false, false, KeyCode::Char('x'))
@@ -602,13 +609,17 @@ impl Keymap {
                 (false, false, KeyCode::Enter) => Some(Action::OpenCellModal),
                 (false, false, KeyCode::Char('i')) => Some(Action::EditCell),
                 (false, false, KeyCode::Char('y')) => Some(Action::YankResultCell),
-                (false, true, KeyCode::Char('Y')) => Some(Action::YankResultRow),
+                (false, true, KeyCode::Char('Y')) | (false, false, KeyCode::Char('Y')) => {
+                    Some(Action::YankResultRow)
+                }
                 (true, false, KeyCode::Char('c') | KeyCode::Char('C')) => {
                     Some(Action::YankResultCell)
                 }
                 (false, false, KeyCode::Char('m')) => Some(Action::OpenResultsActions),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
-                (false, true, KeyCode::Char('T')) => Some(Action::CycleTheme),
+                (false, true, KeyCode::Char('T')) | (false, false, KeyCode::Char('T')) => {
+                    Some(Action::CycleTheme)
+                }
                 (true, true, KeyCode::Char('p') | KeyCode::Char('P')) => {
                     Some(Action::OpenDbObjectPalette)
                 }
@@ -640,7 +651,7 @@ impl Keymap {
                 (false, KeyCode::Char('b')) => Some(Action::Blame),
                 (false, KeyCode::Char('c')) => Some(Action::GitCommit),
                 (false, KeyCode::Char('p')) => Some(Action::GitPush),
-                (true, KeyCode::Char('P')) => Some(Action::GitPull),
+                (true, KeyCode::Char('P')) | (false, KeyCode::Char('P')) => Some(Action::GitPull),
                 (false, KeyCode::Char('[')) => Some(Action::PrevBranch),
                 (false, KeyCode::Char(']')) => Some(Action::NextBranch),
                 (false, KeyCode::Char('o')) => Some(Action::CheckoutBranch),
@@ -668,7 +679,9 @@ impl Keymap {
                 (_, _, KeyCode::Up) => Some(Action::MoveUp),
                 (_, _, KeyCode::Enter) => Some(Action::SessionConnect),
                 (_, _, KeyCode::Char('a')) => Some(Action::SessionAddSsh),
-                (_, true, KeyCode::Char('A')) => Some(Action::SessionAddRdp),
+                (_, true, KeyCode::Char('A')) | (false, false, KeyCode::Char('A')) => {
+                    Some(Action::SessionAddRdp)
+                }
                 (_, _, KeyCode::Char('e')) => Some(Action::SessionEdit),
                 (_, _, KeyCode::Char('x') | KeyCode::Delete) => Some(Action::SessionDelete),
                 (_, _, KeyCode::Char(']')) => Some(Action::SessionNextTab),

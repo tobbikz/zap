@@ -709,6 +709,12 @@ pub struct SqlTab {
     pub order_by: String,
     /// SQL text as of the last successful run (None = never run / generated).
     pub last_run_sql: Option<String>,
+    /// Per-tab paging / edit / filter state (#83).
+    pub last_page_sql: Option<String>,
+    pub result_page: usize,
+    pub cell_undo: Vec<CellUndoBatch>,
+    pub pending_row_deletes: Vec<String>,
+    pub results_filter: String,
 }
 
 impl SqlTab {
@@ -730,6 +736,11 @@ impl SqlTab {
             where_clause: String::new(),
             order_by: String::new(),
             last_run_sql: Some("SELECT 1;".into()),
+            last_page_sql: None,
+            result_page: 0,
+            cell_undo: Vec::new(),
+            pending_row_deletes: Vec::new(),
+            results_filter: String::new(),
         }
     }
 
@@ -853,15 +864,58 @@ impl QueryResult {
     }
 
     pub fn move_cell(&mut self, d_row: isize, d_col: isize) {
+        self.move_cell_filtered(d_row, d_col, "");
+    }
+
+    /// Move cursor; when `filter` is set, vertical steps skip non-matching rows (#94).
+    pub fn move_cell_filtered(&mut self, d_row: isize, d_col: isize, filter: &str) {
         if self.rows.is_empty() || self.columns.is_empty() {
             return;
         }
-        let nr = self.rows.len() as isize;
         let nc = self.columns.len() as isize;
-        let r = (self.cursor_row as isize + d_row).clamp(0, nr - 1);
         let c = (self.cursor_col as isize + d_col).clamp(0, nc - 1);
-        self.cursor_row = r as usize;
         self.cursor_col = c as usize;
+        if d_row == 0 {
+            return;
+        }
+        let filt = filter.trim();
+        if filt.is_empty() {
+            let nr = self.rows.len() as isize;
+            let r = (self.cursor_row as isize + d_row).clamp(0, nr - 1);
+            self.cursor_row = r as usize;
+            return;
+        }
+        let step = if d_row < 0 { -1 } else { 1 };
+        let mut r = self.cursor_row as isize;
+        let nr = self.rows.len() as isize;
+        loop {
+            r += step;
+            if r < 0 || r >= nr {
+                break;
+            }
+            if row_matches_filter(&self.rows[r as usize], filt) {
+                self.cursor_row = r as usize;
+                break;
+            }
+        }
+    }
+
+    /// Snap cursor onto a filtered row (or first match) when the filter changes (#94).
+    pub fn snap_cursor_to_filter(&mut self, filter: &str) {
+        let filt = filter.trim();
+        if filt.is_empty() || self.rows.is_empty() {
+            return;
+        }
+        if row_matches_filter(&self.rows[self.cursor_row.min(self.rows.len() - 1)], filt) {
+            return;
+        }
+        if let Some(i) = self
+            .rows
+            .iter()
+            .position(|row| row_matches_filter(row, filt))
+        {
+            self.cursor_row = i;
+        }
     }
 
     pub fn set_cell(&mut self, value: String) -> Option<String> {
@@ -1782,11 +1836,36 @@ impl DbWorkspace {
             .cloned()
             .context("unknown data source")?;
         let orig_name = src.name.clone();
+        let old_id = src.id.clone();
+        let old_password = src.password.clone();
         let mut copy = src;
         copy.id = uuid::Uuid::new_v4().to_string();
         copy.name = format!("{orig_name} (copy)");
+        // Copy vault / env password onto the new id (#71).
+        let resolved = secrets::resolve_password(&old_id, &old_password);
+        let vault_note = if old_password.trim().starts_with("env:") {
+            copy.password = old_password;
+            " · env: ref kept"
+        } else if !resolved.is_empty() {
+            match secrets::store_password_for_save(&copy.id, &resolved) {
+                Ok(stored) => {
+                    copy.password = stored;
+                    " · password copied from vault"
+                }
+                Err(_) => {
+                    copy.password.clear();
+                    " · set password"
+                }
+            }
+        } else if !old_password.is_empty() {
+            copy.password = old_password;
+            " · password copied"
+        } else {
+            copy.password.clear();
+            " · set password"
+        };
         self.add_source(copy.clone());
-        self.status = format!("duplicated → \"{}\"", copy.name);
+        self.status = format!("duplicated → \"{}\"{vault_note}", copy.name);
         Ok(copy)
     }
 
@@ -2056,6 +2135,11 @@ impl DbWorkspace {
             where_clause: String::new(),
             order_by: String::new(),
             last_run_sql: None,
+            last_page_sql: None,
+            result_page: 0,
+            cell_undo: Vec::new(),
+            pending_row_deletes: Vec::new(),
+            results_filter: String::new(),
         });
         self.active_tab = self.tabs.len() - 1;
         self.sql = entry.sql;
@@ -2144,6 +2228,12 @@ impl DbWorkspace {
             tab.source_id = self.active_source.clone();
             tab.database = self.active_database.clone();
             tab.schema = self.active_schema.clone();
+            // Per-tab edit/page/filter bag (#83).
+            tab.last_page_sql = self.last_page_sql.clone();
+            tab.result_page = self.result_page;
+            tab.cell_undo = self.cell_undo.clone();
+            tab.pending_row_deletes = self.pending_row_deletes.clone();
+            tab.results_filter = self.results_filter.clone();
         }
     }
 
@@ -2156,6 +2246,11 @@ impl DbWorkspace {
             }
             self.active_database = tab.database.clone();
             self.active_schema = tab.schema.clone();
+            self.last_page_sql = tab.last_page_sql.clone();
+            self.result_page = tab.result_page;
+            self.cell_undo = tab.cell_undo.clone();
+            self.pending_row_deletes = tab.pending_row_deletes.clone();
+            self.results_filter = tab.results_filter.clone();
         }
     }
 
@@ -2297,6 +2392,11 @@ impl DbWorkspace {
                     }
                 }
             }
+        }
+        // Armed deletes stay with this tab — Apply/Undo before switching (#83).
+        if idx != self.active_tab && !self.pending_row_deletes.is_empty() {
+            self.status = "pending deletes — Apply or Undo before switching tabs".into();
+            return;
         }
         self.flush_active_tab();
         self.active_tab = idx;
@@ -2666,6 +2766,11 @@ impl DbWorkspace {
                 where_clause: String::new(),
                 order_by: String::new(),
                 last_run_sql: None,
+                last_page_sql: None,
+                result_page: 0,
+                cell_undo: Vec::new(),
+                pending_row_deletes: Vec::new(),
+                results_filter: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -2782,6 +2887,11 @@ impl DbWorkspace {
                 where_clause: String::new(),
                 order_by: String::new(),
                 last_run_sql: None,
+                last_page_sql: None,
+                result_page: 0,
+                cell_undo: Vec::new(),
+                pending_row_deletes: Vec::new(),
+                results_filter: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -2976,6 +3086,11 @@ impl DbWorkspace {
                 where_clause: String::new(),
                 order_by: String::new(),
                 last_run_sql: None,
+                last_page_sql: None,
+                result_page: 0,
+                cell_undo: Vec::new(),
+                pending_row_deletes: Vec::new(),
+                results_filter: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
             self.sql = sql;
@@ -3066,6 +3181,11 @@ impl DbWorkspace {
                 where_clause: String::new(),
                 order_by: String::new(),
                 last_run_sql: None,
+                last_page_sql: None,
+                result_page: 0,
+                cell_undo: Vec::new(),
+                pending_row_deletes: Vec::new(),
+                results_filter: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
             self.sql = sql;
@@ -5440,9 +5560,6 @@ impl DbWorkspace {
             last.page = page;
             last.has_more = self.select_limit > 0 && last.rows.len() >= self.select_limit;
             last.elapsed_ms = stmt_start.elapsed().as_millis();
-            if self.persona.mask_pii {
-                last = mask_result(&last);
-            }
             if !is_read_only_sql(stmt) {
                 let _ = audit_append(
                     source_id.as_str(),
@@ -5489,6 +5606,10 @@ impl DbWorkspace {
             Vec::new()
         };
         last = last.with_meta(schema, table, pks);
+        // Mask display after meta so original_rows stay plaintext for Apply (#59).
+        if self.persona.mask_pii {
+            last = mask_result(&last);
+        }
         last.elapsed_ms = elapsed_ms;
         let page_tag = if page > 0 {
             format!(
@@ -5528,6 +5649,7 @@ impl DbWorkspace {
         }
         self.last_result = Some(last);
         self.pending_row_deletes.clear();
+        self.cell_undo.clear();
         self.flush_active_tab();
         Ok(())
     }
@@ -5923,7 +6045,13 @@ impl DbWorkspace {
     }
 
     pub async fn refresh_connection_health(&mut self, source_id: &str) -> Result<()> {
-        match self.ensure_connected(source_id, None).await {
+        // Health probes must not retarget Studio's active source/db (#72).
+        let prev_source = self.active_source.clone();
+        let prev_db = self.active_database.clone();
+        let result = self.ensure_connected(source_id, None).await;
+        self.active_source = prev_source;
+        self.active_database = prev_db;
+        match result {
             Ok(()) => {
                 self.connection_health
                     .insert(source_id.to_string(), ConnHealth::ok_now());
@@ -6138,15 +6266,19 @@ impl DbWorkspace {
     pub fn toggle_mask_pii(&mut self) -> bool {
         self.persona.mask_pii = !self.persona.mask_pii;
         let _ = self.persona.save();
-        if self.persona.mask_pii {
-            if let Some(r) = self.last_result.take() {
-                self.last_result = Some(mask_result(&r));
+        if let Some(r) = self.last_result.as_mut() {
+            if self.persona.mask_pii {
+                let masked = mask_result(r);
+                *r = masked;
+            } else if !r.original_rows.is_empty() {
+                // Restore plaintext from baseline without re-query (#59).
+                r.rows = r.original_rows.clone();
             }
         }
         self.status = if self.persona.mask_pii {
             "PII mask ON".into()
         } else {
-            "PII mask OFF (re-run query to restore)".into()
+            "PII mask OFF".into()
         };
         self.persona.mask_pii
     }
@@ -10644,6 +10776,11 @@ impl DbWorkspace {
                 where_clause: String::new(),
                 order_by: String::new(),
                 last_run_sql: None,
+                last_page_sql: None,
+                result_page: 0,
+                cell_undo: Vec::new(),
+                pending_row_deletes: Vec::new(),
+                results_filter: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -10783,6 +10920,11 @@ impl DbWorkspace {
                 where_clause: String::new(),
                 order_by: String::new(),
                 last_run_sql: None,
+                last_page_sql: None,
+                result_page: 0,
+                cell_undo: Vec::new(),
+                pending_row_deletes: Vec::new(),
+                results_filter: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -10934,6 +11076,11 @@ impl DbWorkspace {
                 where_clause: String::new(),
                 order_by: String::new(),
                 last_run_sql: None,
+                last_page_sql: None,
+                result_page: 0,
+                cell_undo: Vec::new(),
+                pending_row_deletes: Vec::new(),
+                results_filter: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
