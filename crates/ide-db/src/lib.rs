@@ -2347,6 +2347,31 @@ impl DbWorkspace {
         true
     }
 
+    /// Human-readable warning when quitting would lose DB work (open TXN / edits).
+    pub fn quit_warning(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.in_txn {
+            parts.push("open transaction".to_string());
+        }
+        let dirty: usize = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.result.as_ref())
+            .map(|r| r.dirty_rows().len())
+            .sum();
+        if dirty > 0 {
+            parts.push(format!("{dirty} dirty result cell(s)"));
+        }
+        if !self.pending_row_deletes.is_empty() {
+            parts.push(format!("{} pending delete(s)", self.pending_row_deletes.len()));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
+
     pub fn toggle_pin_active_tab(&mut self) -> bool {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return false;
@@ -11765,6 +11790,23 @@ mod ssl_trust_tests {
         s.driver = DbDriver::Mysql;
         let mysql_t = s.url_via(Some(13306));
         assert!(mysql_t.contains("ssl-mode=VERIFY_CA"), "{mysql_t}");
+    }
+}
+
+#[cfg(test)]
+mod quit_warning_tests {
+    use super::DbWorkspace;
+
+    #[test]
+    fn quit_warning_reports_txn_and_pending_deletes() {
+        let mut ws = DbWorkspace::default();
+        assert!(ws.quit_warning().is_none());
+        ws.in_txn = true;
+        let w = ws.quit_warning().unwrap();
+        assert!(w.contains("open transaction"), "{w}");
+        ws.pending_row_deletes.push("DELETE FROM t WHERE id=1".into());
+        let w = ws.quit_warning().unwrap();
+        assert!(w.contains("pending delete"), "{w}");
     }
 }
 
