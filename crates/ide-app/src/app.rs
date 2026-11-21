@@ -6909,13 +6909,17 @@ impl App {
                     .map(|s| s.driver)
                     .unwrap_or(DbDriver::Bigquery);
                 match ide_db::authorize_url(driver) {
-                    Some(url) => match ide_db::open_browser(url) {
+                    Some(url) => match ide_db::open_browser(&url) {
                         Ok(()) => self.set_status(
                             format!("opened OAuth · {} — then palette OAuth paste token", driver.label()),
                             false,
                         ),
                         Err(e) => self.set_status(format!("oauth open: {e:#}"), true),
                     },
+                    None if driver == DbDriver::Bigquery => self.set_status(
+                        "BigQuery OAuth needs ZAP_GOOGLE_CLIENT_ID (installed-app client) and optionally ZAP_OAUTH_REDIRECT_URI",
+                        true,
+                    ),
                     None => self.set_status(
                         "OAuth browser MVP for BigQuery/Snowflake — set active cloud source",
                         true,
