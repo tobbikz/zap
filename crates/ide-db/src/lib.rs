@@ -2892,9 +2892,27 @@ impl DbWorkspace {
             .query_sql
             .clone()
             .context("admin query missing SQL")?;
+        let slug = entry.table.as_deref().unwrap_or("");
+        // History / bookmarks / saved files: load into Console — never auto-run (#89).
+        let user_sql_leaf = slug.starts_with("bookmark-")
+            || slug.starts_with("hist-")
+            || slug.starts_with("file-")
+            || slug.ends_with("-empty");
         self.ensure_connected(&entry.source_id, None).await?;
 
-        let tab_key = format!("admin::{}::{}", entry.source_id, entry.label);
+        let (tab_key, title, should_run) = if user_sql_leaf {
+            (
+                format!("query::{}", self.tabs.len() + 1),
+                truncate_sql_label(&sql, 28),
+                false,
+            )
+        } else {
+            (
+                format!("admin::{}::{}", entry.source_id, entry.label),
+                format!("Admin · {}", entry.label),
+                true,
+            )
+        };
         self.flush_active_tab();
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_key) {
             self.active_tab = idx;
@@ -2904,11 +2922,13 @@ impl DbWorkspace {
                 tab.database = None;
             }
             self.sql = sql;
-            self.last_result = None;
+            if should_run {
+                self.last_result = None;
+            }
         } else {
             self.tabs.push(SqlTab {
                 id: tab_key,
-                title: format!("Admin · {}", entry.label),
+                title,
                 sql: sql.clone(),
                 result: None,
                 table_key: None,
@@ -2922,17 +2942,24 @@ impl DbWorkspace {
             });
             self.active_tab = self.tabs.len() - 1;
             self.sql = sql;
-            self.last_result = None;
+            if should_run {
+                self.last_result = None;
+            }
         }
-        self.structure_title = format!("Admin · {}", entry.label);
-        self.structure_lines = vec![
-            StructureLine::section("ADMIN QUERY"),
-            StructureLine::item(entry.label.clone()),
-            StructureLine::ddl("Enter / F5 runs the canned admin SELECT."),
-        ];
-        self.structure_scroll = 0;
-        self.status = format!("admin: {}", entry.label);
-        Ok(true)
+        self.active_source = Some(entry.source_id.clone());
+        if should_run {
+            self.structure_title = format!("Admin · {}", entry.label);
+            self.structure_lines = vec![
+                StructureLine::section("ADMIN QUERY"),
+                StructureLine::item(entry.label.clone()),
+                StructureLine::ddl("Enter / F5 runs the canned admin SELECT."),
+            ];
+            self.structure_scroll = 0;
+            self.status = format!("admin: {}", entry.label);
+        } else {
+            self.status = "loaded into Console · F5 to run".into();
+        }
+        Ok(should_run)
     }
 
     /// DataGrip-style: open (or focus) a table data tab. Does not expand columns in-tree.
@@ -5385,10 +5412,13 @@ impl DbWorkspace {
                     stmt,
                 );
             }
-            self.history.push(QueryHistoryEntry {
-                sql: stmt.clone(),
-                elapsed_ms: last.elapsed_ms,
-            });
+            // Health · Activity auto-refresh must not fill the 80-entry history cap (#89).
+            if !self.active_tab_is_health_activity() {
+                self.history.push(QueryHistoryEntry {
+                    sql: stmt.clone(),
+                    elapsed_ms: last.elapsed_ms,
+                });
+            }
             // Multi-statement: park intermediate result sets in new tabs.
             if statements.len() > 1 && si + 1 < statements.len() && !last.columns.is_empty() {
                 result_tab_n += 1;
@@ -5407,6 +5437,7 @@ impl DbWorkspace {
             self.history.drain(0..drop_n);
         }
         self.persist_history();
+        self.refresh_history_bookmarks_in_tree();
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.last_run_sql = Some(sql.to_string());
         }
@@ -9514,6 +9545,24 @@ impl DbWorkspace {
         self.rebuild_flat();
     }
 
+    /// Refresh Explorer History/Bookmarks folders after run/bookmark (#89).
+    pub fn refresh_history_bookmarks_in_tree(&mut self) {
+        fn walk(nodes: &mut [DbTreeNode], history: &[QueryHistoryEntry], bookmarks: &[String]) {
+            for n in nodes {
+                if n.kind == DbNodeKind::Admin && n.id.ends_with("::admin::history") {
+                    let expanded = n.expanded;
+                    let source_id = n.source_id.clone();
+                    *n = history_folder(&source_id, history, bookmarks);
+                    n.expanded = expanded;
+                } else if !n.children.is_empty() {
+                    walk(&mut n.children, history, bookmarks);
+                }
+            }
+        }
+        walk(&mut self.tree, &self.history, &self.bookmarks);
+        self.rebuild_flat();
+    }
+
     pub fn bookmark_current_sql(&mut self) {
         let sql = self.sql.trim().to_string();
         if sql.is_empty() {
@@ -9530,6 +9579,7 @@ impl DbWorkspace {
             self.bookmarks.drain(0..drop_n);
         }
         self.persist_history();
+        self.refresh_history_bookmarks_in_tree();
         // Persist as a file so it can sync via GitHub/GitLab (skip on re-bookmark, #192).
         match self.save_query_file(None, &sql) {
             Ok(p) => {
