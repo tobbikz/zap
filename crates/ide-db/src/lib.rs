@@ -2221,6 +2221,19 @@ impl DbWorkspace {
         if idx >= self.tabs.len() {
             return;
         }
+        // Refuse to swap the console onto a different connection while a TXN is open (#168).
+        if self.in_txn {
+            if let Some(tab) = self.tabs.get(idx) {
+                if let Some(sid) = &tab.source_id {
+                    let key = Self::pool_key(sid, tab.database.as_deref());
+                    if self.txn_pool_key.as_deref() != Some(key.as_str()) {
+                        self.status =
+                            "transaction open — COMMIT or ROLLBACK before switching tabs".into();
+                        return;
+                    }
+                }
+            }
+        }
         self.flush_active_tab();
         self.active_tab = idx;
         self.load_active_tab();
@@ -4414,6 +4427,10 @@ impl DbWorkspace {
         database: Option<&str>,
     ) -> Result<()> {
         let key = Self::pool_key(source_id, database);
+        // Do not silently move an open transaction onto another connection (#168).
+        if self.in_txn && self.txn_pool_key.as_deref() != Some(key.as_str()) {
+            bail!("transaction open on another connection — COMMIT or ROLLBACK before switching");
+        }
         if self.pools.contains_key(&key) {
             self.active_source = Some(source_id.to_string());
             self.active_database = database.map(|s| s.to_string());
@@ -5225,7 +5242,7 @@ impl DbWorkspace {
             if self.query_cancel.load(Ordering::Relaxed) {
                 self.query_running = false;
                 let _ = self.cancel_backend_best_effort(&key, driver).await;
-                self.disconnect_active_pool();
+                self.disconnect_active_pool().await;
                 bail!("query cancelled");
             }
             self.guard_writable(&source_id, stmt)?;
@@ -5265,7 +5282,7 @@ impl DbWorkspace {
                     if msg.contains("cancelled") || msg.contains("timed out") {
                         let _ = self.cancel_backend_best_effort(&key, driver).await;
                         if msg.contains("cancelled") {
-                            self.disconnect_active_pool();
+                            self.disconnect_active_pool().await;
                         }
                     }
                     return Err(e);
@@ -5822,12 +5839,17 @@ impl DbWorkspace {
         self.jump_to_table(parts[1], parts[2])
     }
 
-    fn disconnect_active_pool(&mut self) {
+    async fn disconnect_active_pool(&mut self) {
         let Some(source_id) = self.active_source.clone() else {
             return;
         };
         let database = self.active_database.clone();
         let key = Self::pool_key(&source_id, database.as_deref());
+        // A dropped pool must not leave a dangling server-side transaction (#168).
+        if self.in_txn && self.txn_pool_key.as_deref() == Some(key.as_str()) {
+            let _ = self.rollback_transaction_inner().await;
+            self.clear_txn();
+        }
         if let Some(pool) = self.pools.remove(&key) {
             match pool {
                 LivePool::Pg(p) => {
@@ -11734,5 +11756,44 @@ mod ssl_trust_tests {
         s.driver = DbDriver::Mysql;
         let mysql_t = s.url_via(Some(13306));
         assert!(mysql_t.contains("ssl-mode=VERIFY_CA"), "{mysql_t}");
+    }
+}
+
+#[cfg(test)]
+mod txn_switch_tests {
+    use super::{DbWorkspace, SqlTab};
+
+    #[test]
+    fn select_tab_refuses_different_connection_during_txn() {
+        let mut ws = DbWorkspace::default();
+        let mut a = SqlTab::query(1);
+        a.source_id = Some("a".into());
+        let mut b = SqlTab::query(2);
+        b.source_id = Some("b".into());
+        ws.tabs = vec![a, b];
+        ws.active_tab = 0;
+        ws.active_source = Some("a".into());
+        ws.in_txn = true;
+        ws.txn_pool_key = Some("a".into());
+
+        ws.select_tab(1);
+        assert_eq!(ws.active_tab, 0, "switch must be blocked");
+        assert!(ws.status.contains("transaction open"), "{}", ws.status);
+
+        ws.select_tab(0);
+        assert_eq!(ws.active_tab, 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_connected_refuses_different_connection_during_txn() {
+        let mut ws = DbWorkspace::default();
+        ws.in_txn = true;
+        ws.txn_pool_key = Some("a".into());
+        let err = ws
+            .ensure_connected("b", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("transaction open"), "{err}");
     }
 }
