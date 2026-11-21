@@ -4567,20 +4567,25 @@ impl DbWorkspace {
         .await
         .context("connection test timed out (8s)")?
         .context("connection test failed")?;
-        let is_bq = ws
+        let driver = ws
             .sources
             .first()
-            .map(|s| s.driver == DbDriver::Bigquery)
-            .unwrap_or(false);
-        if is_bq {
-            let db = ws.active_database.clone();
-            let key = Self::pool_key(&id, db.as_deref());
-            let _ = ws
-                .exec_statement(&key, DbDriver::Bigquery, db.as_deref(), "SELECT 1 AS ok")
-                .await
-                .context("BigQuery SELECT 1")?;
-        }
-        Ok(ws.status.clone())
+            .map(|s| s.driver)
+            .unwrap_or_default();
+        let db = ws.active_database.clone();
+        let key = Self::pool_key(&id, db.as_deref());
+        // Prove the connection with a real driver-specific probe; lazy/stub clients
+        // must not report OK until they answer (#64).
+        let probe = match driver {
+            DbDriver::Redis => "PING",
+            DbDriver::Mongo => "ping",
+            DbDriver::Elasticsearch => "GET /",
+            _ => "SELECT 1 AS ok",
+        };
+        ws.exec_statement(&key, driver, db.as_deref(), probe)
+            .await
+            .with_context(|| format!("{} probe `{probe}`", driver.label()))?;
+        Ok(format!("ok · {}", driver.label()))
     }
 
     /// ASCII ER edges for the active schema (PG/MySQL/SQLite FKs).
