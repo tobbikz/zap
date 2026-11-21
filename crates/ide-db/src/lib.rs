@@ -4701,18 +4701,17 @@ impl DbWorkspace {
 
     /// Start (or reuse) `ssh -L local:host:port` for this source. Returns local port.
     fn ensure_ssh_tunnel(&mut self, src: &DataSource) -> Result<u16> {
+        let mut stale = false;
         if let Some(t) = self.ssh_tunnels.get_mut(&src.id) {
             // Reuse if child still alive.
             match t.child.try_wait() {
                 Ok(None) => return Ok(t.local_port),
-                Ok(Some(status)) => {
-                    bail!(
-                        "SSH tunnel to {} exited ({status})",
-                        src.ssh_host
-                    );
-                }
-                Err(e) => bail!("SSH tunnel status: {e}"),
+                Ok(Some(_)) | Err(_) => stale = true,
             }
+        }
+        if stale {
+            // Dead/failed tunnel must not poison every later reconnect (#58).
+            self.ssh_tunnels.remove(&src.id);
         }
 
         // OpenSSH cannot take `-L 0:…`, so we still probe an ephemeral port then hand it to
@@ -4803,8 +4802,17 @@ impl DbWorkspace {
                 Ok(None) if std::time::Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(100));
                 }
-                Ok(None) => bail!("SSH tunnel timed out waiting for local port {local_port}"),
-                Err(e) => bail!("SSH tunnel wait: {e}"),
+                Ok(None) => {
+                    // Do not leak a half-open ssh process on timeout (#58).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("SSH tunnel timed out waiting for local port {local_port}");
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("SSH tunnel wait: {e}");
+                }
             }
         }
     }
