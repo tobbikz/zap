@@ -810,18 +810,49 @@ pub fn post_health_webhook(url: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn signed_pack_export(sources_toml: &str, out: &Path) -> Result<()> {
+/// Deterministic FNV-1a hash used as the signed-pack checksum.
+fn pack_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+fn legacy_pack_hash(text: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    sources_toml.hash(&mut h);
-    let sig = format!("{:x}", h.finish());
+    text.hash(&mut h);
+    format!("{:x}", h.finish())
+}
+
+pub fn signed_pack_export(sources_toml: &str, out: &Path) -> Result<()> {
+    let sig = pack_hash(sources_toml);
     let body = format!("# Zap connection pack · sig={sig}\n{sources_toml}");
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(out, body)?;
     Ok(())
+}
+
+/// Verify a connection pack before import. Unsigned packs pass through unchanged;
+/// signed packs are rejected when the body no longer matches the header checksum (#70).
+pub fn verify_signed_pack(text: &str) -> Result<String> {
+    let Some((first, body)) = text.split_once('\n') else {
+        return Ok(text.to_string());
+    };
+    let Some(sig) = first.strip_prefix("# Zap connection pack · sig=") else {
+        return Ok(text.to_string());
+    };
+    let sig = sig.trim();
+    if pack_hash(body) == sig || legacy_pack_hash(body) == sig {
+        Ok(body.to_string())
+    } else {
+        bail!("connection pack signature mismatch — refusing to import a tampered pack")
+    }
 }
 
 pub fn diagnose_pack_template(schema: &str, table: &str, explain: &str, stats: &str) -> String {
@@ -898,6 +929,27 @@ mod tests {
         assert!(s.contains("PASS"));
         let f = fanout_rowcount_assert(&[("a".into(), 3), ("b".into(), 4)]);
         assert!(f.contains("FAIL"));
+    }
+
+    #[test]
+    fn signed_pack_roundtrip_and_tamper_detection() {
+        let dir = std::env::temp_dir().join(format!(
+            "zap-pack-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let out = dir.join("connections.signed.toml");
+        let body = "active_source = \"a\"\n";
+        signed_pack_export(body, &out).unwrap();
+        let text = fs::read_to_string(&out).unwrap();
+        assert_eq!(verify_signed_pack(&text).unwrap(), body);
+        let tampered = text.replace("active_source", "tampered_source");
+        assert!(verify_signed_pack(&tampered).is_err());
+        assert_eq!(verify_signed_pack("plain = 1\n").unwrap(), "plain = 1\n");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

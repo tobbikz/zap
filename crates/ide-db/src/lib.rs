@@ -7276,6 +7276,7 @@ impl DbWorkspace {
     pub fn import_connection_pack(&mut self, path: &std::path::Path) -> Result<usize> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let text = persona::verify_signed_pack(&text)?;
         let file: SourcesFile = toml::from_str(&text).context("parse connection pack")?;
         let mut added = 0usize;
         for mut s in file.sources {
