@@ -6,7 +6,7 @@ A truecolor terminal studio — Explorer · Structure · Console · Results — 
 [![Release](https://img.shields.io/github/v/release/tobbikz/zap)](https://github.com/tobbikz/zap/releases)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-**v0.6.1** · Linux & Windows · Postgres · MySQL · MSSQL · SQLite · DuckDB · ClickHouse · Redis · Mongo · Snowflake · BigQuery · Elasticsearch · Trino
+**v0.6.3** · Linux & Windows · Postgres · MySQL · MSSQL · SQLite · DuckDB · ClickHouse · Redis · Mongo · Snowflake · BigQuery · Elasticsearch · Trino
 
 ---
 
@@ -133,7 +133,7 @@ zap
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/tobbikz/zap/v0.6.1/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/tobbikz/zap/v0.6.3/scripts/install.ps1 | iex
 zap
 ```
 
