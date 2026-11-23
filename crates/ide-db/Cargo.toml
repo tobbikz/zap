@@ -24,6 +24,7 @@ futures-util.workspace = true
 duckdb.workspace = true
 redis.workspace = true
 mongodb.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

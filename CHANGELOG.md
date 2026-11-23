@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Create Table: AddBtn prev-field, Tab wraps, Delete guarded while typing, scroll (#149).
+- Trino: nextUri Basic Auth, DELETE on early stop, `OFFSET…LIMIT` paging (#155).
+- Elasticsearch: Explorer → `_search`; METHOD+body; tabular JSON arrays; unwrap `_id` (#156).
+- DuckDB dates/decimals/timestamps render as ISO/decimal (not Debug) (#159).
+- CSV/JSON import: driver-aware quoting + batched multi-row INSERT (#130).
+- ER canvas: Unicode width + aligned box borders (#115).
 - MSSQL ALTER ADD omits illegal `COLUMN`; `sp_rename` includes table (#127).
 - Trino sends Console schema as `X-Trino-Schema` (#129).
 - Admin Blocking resolves columns by name; scroll in card line units (#132).

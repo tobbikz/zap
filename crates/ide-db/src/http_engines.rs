@@ -58,22 +58,38 @@ pub async fn exec_http(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
     }
 }
 
-/// Elasticsearch: `GET index/_search` JSON body, or `GET /_cat/indices`.
+/// Elasticsearch: `METHOD path` + optional JSON body, or shorthand index/_search.
 async fn exec_elasticsearch(conn: &HttpSqlConn, line: &str) -> Result<QueryResult> {
     let line = line.trim();
     let client = conn.client.clone();
-    let mut req = if line.to_ascii_lowercase().starts_with("get ")
-        || line.to_ascii_lowercase().starts_with("post ")
-    {
-        let (method, path) = line.split_once(char::is_whitespace).unwrap_or(("GET", "/"));
-        let url = format!("{}{}", conn.base, if path.starts_with('/') { path.to_string() } else { format!("/{path}") });
-        match method.to_ascii_uppercase().as_str() {
-            "POST" => client.post(url),
+    let mut req = if let Some((method, rest)) = split_es_method_line(line) {
+        let (path, body) = split_es_path_body(rest);
+        let url = format!(
+            "{}{}",
+            conn.base,
+            if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!("/{path}")
+            }
+        );
+        let r = match method.as_str() {
+            "POST" | "PUT" => client.post(url),
+            "DELETE" => client.delete(url),
             _ => client.get(url),
+        };
+        if let Some(b) = body {
+            r.header("Content-Type", "application/json").body(b)
+        } else {
+            r
         }
     } else if line.starts_with('{') {
         // treat as _search body against database=index
-        let index = if conn.database.is_empty() { "_all" } else { conn.database.as_str() };
+        let index = if conn.database.is_empty() {
+            "_all"
+        } else {
+            conn.database.as_str()
+        };
         client
             .post(format!("{}/{}/_search", conn.base, index))
             .header("Content-Type", "application/json")
@@ -81,7 +97,11 @@ async fn exec_elasticsearch(conn: &HttpSqlConn, line: &str) -> Result<QueryResul
     } else {
         // shorthand: index name → _search match_all
         let index = if line.is_empty() {
-            if conn.database.is_empty() { "_all" } else { conn.database.as_str() }
+            if conn.database.is_empty() {
+                "_all"
+            } else {
+                conn.database.as_str()
+            }
         } else {
             line
         };
@@ -103,6 +123,40 @@ async fn exec_elasticsearch(conn: &HttpSqlConn, line: &str) -> Result<QueryResul
     json_to_result(&text)
 }
 
+fn split_es_method_line(line: &str) -> Option<(String, &str)> {
+    let lower = line.to_ascii_lowercase();
+    for m in ["get ", "post ", "put ", "delete ", "head "] {
+        if lower.starts_with(m) {
+            let method = m.trim().to_ascii_uppercase();
+            return Some((method, line[m.len()..].trim_start()));
+        }
+    }
+    None
+}
+
+/// Split `path` + optional JSON body (newline or inline `{…}`).
+fn split_es_path_body(rest: &str) -> (String, Option<String>) {
+    let rest = rest.trim();
+    if let Some((path, body)) = rest.split_once('\n') {
+        let body = body.trim();
+        if body.is_empty() {
+            (path.trim().to_string(), None)
+        } else {
+            (path.trim().to_string(), Some(body.to_string()))
+        }
+    } else if let Some(i) = rest.find('{') {
+        let path = rest[..i].trim().to_string();
+        let body = rest[i..].trim().to_string();
+        if path.is_empty() {
+            ("/".into(), Some(body))
+        } else {
+            (path, Some(body))
+        }
+    } else {
+        (rest.to_string(), None)
+    }
+}
+
 async fn exec_trino(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
     let client = conn.client.clone();
     let catalog = if conn.database.is_empty() {
@@ -115,17 +169,24 @@ async fn exec_trino(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
     } else {
         conn.schema.trim()
     };
-    let mut req = client
+    let req = client
         .post(format!("{}/v1/statement", conn.base))
         .header("X-Trino-Catalog", catalog)
         .header("X-Trino-Schema", schema)
         .header("X-Trino-User", if conn.user.is_empty() { "zap" } else { &conn.user })
         .header("Content-Type", "text/plain")
         .body(sql.to_string());
-    if !conn.password.is_empty() {
-        req = req.basic_auth(&conn.user, Some(&conn.password));
-    }
-    let mut next = Some(req.send().await.context("trino statement")?);
+    let apply_auth = |mut r: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
+        // Same Basic Auth on POST and nextUri (#155).
+        if !conn.password.is_empty() || !conn.user.is_empty() {
+            r = r.basic_auth(
+                if conn.user.is_empty() { "zap" } else { &conn.user },
+                Some(&conn.password),
+            );
+        }
+        r
+    };
+    let mut next = Some(apply_auth(req).send().await.context("trino statement")?);
     let mut columns: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
     while let Some(resp) = next.take() {
@@ -173,11 +234,15 @@ async fn exec_trino(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
         }
         if let Some(n) = v.get("nextUri").and_then(|u| u.as_str()) {
             if rows.len() < 500 {
-                let mut r = client.get(n);
-                if !conn.user.is_empty() {
-                    r = r.basic_auth(&conn.user, Some(&conn.password));
-                }
-                next = Some(r.send().await.context("trino nextUri")?);
+                next = Some(
+                    apply_auth(client.get(n))
+                        .send()
+                        .await
+                        .context("trino nextUri")?,
+                );
+            } else {
+                // Early stop — cancel the cluster query (#155).
+                let _ = apply_auth(client.delete(n)).send().await;
             }
         }
     }
@@ -195,13 +260,23 @@ async fn exec_trino(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
     Ok(q)
 }
 
+fn json_cell(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn json_to_result(text: &str) -> Result<QueryResult> {
     let v: Value = serde_json::from_str(text).context("parse JSON")?;
     // ES hits
     if let Some(hits) = v.pointer("/hits/hits").and_then(|h| h.as_array()) {
         let mut rows = Vec::new();
         for h in hits.iter().take(500) {
-            let id = h.get("_id").map(|x| x.to_string()).unwrap_or_default();
+            let id = h.get("_id").map(json_cell).unwrap_or_default();
             let src = h.get("_source").cloned().unwrap_or(Value::Null);
             rows.push(vec![id, src.to_string()]);
         }
@@ -210,6 +285,29 @@ fn json_to_result(text: &str) -> Result<QueryResult> {
         q.rows = rows;
         q.original_rows = q.rows.clone();
         return Ok(q);
+    }
+    // JSON array of objects (e.g. /_cat/indices?format=json) (#156).
+    if let Some(arr) = v.as_array() {
+        if let Some(Value::Object(first)) = arr.first() {
+            let columns: Vec<String> = first.keys().cloned().collect();
+            let mut rows = Vec::new();
+            for item in arr.iter().take(500) {
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                rows.push(
+                    columns
+                        .iter()
+                        .map(|c| obj.get(c).map(json_cell).unwrap_or_default())
+                        .collect(),
+                );
+            }
+            let mut q = QueryResult::empty();
+            q.columns = columns;
+            q.rows = rows;
+            q.original_rows = q.rows.clone();
+            return Ok(q);
+        }
     }
     // generic object/array
     let mut q = QueryResult::empty();

@@ -402,8 +402,10 @@ AS $$ SELECT 1; $$".into(),
                     if self.columns.is_empty() {
                         self.field = 4;
                     } else {
+                        // Set field to column zone before sync — otherwise zone stays AddBtn (#149).
                         self.col_idx = self.columns.len() - 1;
                         self.col_sub = ColSub::Ident;
+                        self.field = 5 + self.col_idx;
                         self.sync_table_field();
                     }
                 }
@@ -493,7 +495,20 @@ AS $$ SELECT 1; $$".into(),
             return;
         }
         let n = self.columns.len() + 1;
-        self.columns.push(ColumnDraft::new(&format!("col{n}"), "text"));
+        let types = create_dialect::column_types(self.driver);
+        let typ = types
+            .iter()
+            .find(|t| {
+                let u = t.to_ascii_lowercase();
+                u.contains("text")
+                    || u.contains("varchar")
+                    || u.contains("string")
+                    || u.contains("nvarchar")
+            })
+            .or_else(|| types.get(1))
+            .copied()
+            .unwrap_or(types.first().copied().unwrap_or("TEXT"));
+        self.columns.push(ColumnDraft::new(&format!("col{n}"), typ));
         self.col_idx = self.columns.len() - 1;
         self.col_sub = ColSub::Name;
         self.sync_table_field();
@@ -775,7 +790,16 @@ pub fn render_create_object_form(frame: &mut Frame, screen: Rect, form: &CreateO
     } else {
         render_simple_lines(form)
     };
-    frame.render_widget(Paragraph::new(lines), inner[0]);
+    // Keep focused row visible when the column list is long (#149).
+    let view_h = inner[0].height as usize;
+    let focus_line = form.field.min(lines.len().saturating_sub(1));
+    let scroll = focus_line
+        .saturating_sub(view_h.saturating_sub(2))
+        .min(lines.len().saturating_sub(view_h));
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll as u16, 0)),
+        inner[0],
+    );
 
     if let Some((msg, err)) = &form.feedback {
         let style = if *err {

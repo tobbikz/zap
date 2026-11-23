@@ -1,5 +1,7 @@
 //! Result paging: LIMIT/OFFSET wrapper for SELECT queries.
 
+use crate::DbDriver;
+
 /// Default auto-LIMIT when the user omits LIMIT (config override via `select_limit`).
 pub const RESULT_PAGE_SIZE: usize = 50;
 
@@ -11,7 +13,17 @@ pub const SELECT_LIMIT_PRESETS: &[usize] = &[50, 100, 200, 500, 0];
 
 /// Append LIMIT/OFFSET when the statement looks like a plain SELECT/WITH (no existing LIMIT).
 /// `page_size == 0` disables auto-paging (run as written).
+/// Trino requires `OFFSET n LIMIT m` (#155).
 pub fn paginate_select_sql(sql: &str, page: usize, page_size: usize) -> String {
+    paginate_select_sql_for(DbDriver::Postgres, sql, page, page_size)
+}
+
+pub fn paginate_select_sql_for(
+    driver: DbDriver,
+    sql: &str,
+    page: usize,
+    page_size: usize,
+) -> String {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return sql.to_string();
@@ -20,7 +32,10 @@ pub fn paginate_select_sql(sql: &str, page: usize, page_size: usize) -> String {
         return sql.to_string();
     }
     let offset = page.saturating_mul(page_size);
-    format!("{trimmed} LIMIT {page_size} OFFSET {offset}")
+    match driver {
+        DbDriver::Trino => format!("{trimmed} OFFSET {offset} LIMIT {page_size}"),
+        _ => format!("{trimmed} LIMIT {page_size} OFFSET {offset}"),
+    }
 }
 
 pub fn is_paged_query(sql: &str) -> bool {
@@ -69,6 +84,12 @@ mod tests {
     fn page_two_uses_offset() {
         let out = paginate_select_sql("select 1", 2, 50);
         assert_eq!(out, "select 1 LIMIT 50 OFFSET 100");
+    }
+
+    #[test]
+    fn trino_offset_before_limit() {
+        let out = paginate_select_sql_for(DbDriver::Trino, "SELECT 1", 1, 50);
+        assert_eq!(out, "SELECT 1 OFFSET 50 LIMIT 50");
     }
 
     #[test]
