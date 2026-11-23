@@ -2172,7 +2172,7 @@ impl App {
                 true
             }
             Mode::Settings => {
-                self.ui.settings_draft.push_str(text);
+                self.settings_insert_str(text);
                 true
             }
             Mode::OpenFolder => {
@@ -3293,6 +3293,7 @@ impl App {
         if self.ui.oauth_paste_pending {
             self.ui.oauth_paste_pending = false;
             self.ui.rename_tab_pending = false;
+            self.ui.rename_bookmark_idx = None;
             if q.is_empty() {
                 self.set_status("OAuth paste cancelled", false);
                 return Ok(());
@@ -3317,6 +3318,15 @@ impl App {
             } else {
                 self.set_status(self.db.status.clone(), true);
             }
+            return Ok(());
+        }
+        if let Some(idx) = self.ui.rename_bookmark_idx.take() {
+            if q.is_empty() {
+                self.set_status("rename bookmark cancelled", false);
+                return Ok(());
+            }
+            let ok = self.db.rename_bookmark(idx, &q);
+            self.set_status(self.db.status.clone(), !ok);
             return Ok(());
         }
         if q.is_empty() {
@@ -3592,7 +3602,160 @@ impl App {
         self.ui.settings_draft = IdeConfig::config_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_else(|| "# config path unavailable\n".into());
+        self.ui.settings_cursor = self.ui.settings_draft.chars().count();
         self.ui.mode = Mode::Settings;
+    }
+
+    fn settings_char_len(&self) -> usize {
+        self.ui.settings_draft.chars().count()
+    }
+
+    fn settings_clamp_cursor(&mut self) {
+        let n = self.settings_char_len();
+        if self.ui.settings_cursor > n {
+            self.ui.settings_cursor = n;
+        }
+    }
+
+    fn settings_insert_str(&mut self, text: &str) {
+        self.settings_clamp_cursor();
+        let mut chars: Vec<char> = self.ui.settings_draft.chars().collect();
+        let i = self.ui.settings_cursor;
+        for (j, c) in text.chars().enumerate() {
+            chars.insert(i + j, c);
+        }
+        self.ui.settings_cursor = i + text.chars().count();
+        self.ui.settings_draft = chars.into_iter().collect();
+    }
+
+    fn settings_backspace(&mut self) {
+        self.settings_clamp_cursor();
+        if self.ui.settings_cursor == 0 {
+            return;
+        }
+        let mut chars: Vec<char> = self.ui.settings_draft.chars().collect();
+        let i = self.ui.settings_cursor - 1;
+        chars.remove(i);
+        self.ui.settings_cursor = i;
+        self.ui.settings_draft = chars.into_iter().collect();
+    }
+
+    fn settings_move_left(&mut self) {
+        self.settings_clamp_cursor();
+        self.ui.settings_cursor = self.ui.settings_cursor.saturating_sub(1);
+    }
+
+    fn settings_move_right(&mut self) {
+        self.settings_clamp_cursor();
+        let n = self.settings_char_len();
+        if self.ui.settings_cursor < n {
+            self.ui.settings_cursor += 1;
+        }
+    }
+
+    fn settings_move_line_start(&mut self) {
+        self.settings_clamp_cursor();
+        let prefix: String = self
+            .ui
+            .settings_draft
+            .chars()
+            .take(self.ui.settings_cursor)
+            .collect();
+        let col = prefix.rsplit('\n').next().map(|s| s.chars().count()).unwrap_or(0);
+        self.ui.settings_cursor -= col;
+    }
+
+    fn settings_move_line_end(&mut self) {
+        self.settings_clamp_cursor();
+        let rest: String = self
+            .ui
+            .settings_draft
+            .chars()
+            .skip(self.ui.settings_cursor)
+            .collect();
+        let col = rest.split('\n').next().map(|s| s.chars().count()).unwrap_or(0);
+        self.ui.settings_cursor += col;
+    }
+
+    fn settings_move_up(&mut self) {
+        self.settings_clamp_cursor();
+        let prefix: String = self
+            .ui
+            .settings_draft
+            .chars()
+            .take(self.ui.settings_cursor)
+            .collect();
+        let col = prefix.rsplit('\n').next().map(|s| s.chars().count()).unwrap_or(0);
+        let line_start = self.ui.settings_cursor - col;
+        if line_start == 0 {
+            self.ui.settings_cursor = 0;
+            return;
+        }
+        let before: String = self.ui.settings_draft.chars().take(line_start - 1).collect();
+        let prev_col = before.rsplit('\n').next().map(|s| s.chars().count()).unwrap_or(0);
+        let prev_start = (line_start - 1) - prev_col;
+        self.ui.settings_cursor = prev_start + col.min(prev_col);
+    }
+
+    fn settings_move_down(&mut self) {
+        self.settings_clamp_cursor();
+        let prefix: String = self
+            .ui
+            .settings_draft
+            .chars()
+            .take(self.ui.settings_cursor)
+            .collect();
+        let col = prefix.rsplit('\n').next().map(|s| s.chars().count()).unwrap_or(0);
+        let rest: String = self
+            .ui
+            .settings_draft
+            .chars()
+            .skip(self.ui.settings_cursor)
+            .collect();
+        let Some(nl) = rest.find('\n') else {
+            self.settings_move_line_end();
+            return;
+        };
+        let next_start = self.ui.settings_cursor + nl + 1;
+        let next_rest: String = self.ui.settings_draft.chars().skip(next_start).collect();
+        let next_len = next_rest.split('\n').next().map(|s| s.chars().count()).unwrap_or(0);
+        self.ui.settings_cursor = next_start + col.min(next_len);
+    }
+
+    fn open_manage_bookmarks(&mut self) {
+        if self.db.bookmarks.is_empty() {
+            self.set_status("no bookmarks — Ctrl-P · Bookmark current SQL", false);
+            return;
+        }
+        let items: Vec<(String, String)> = self
+            .db
+            .bookmarks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, sql)| {
+                let preview = {
+                    let one = sql.lines().next().unwrap_or(sql).trim();
+                    let mut s = one.chars().take(48).collect::<String>();
+                    if one.chars().count() > 48 {
+                        s.push('…');
+                    }
+                    s
+                };
+                [
+                    (
+                        format!("Delete bookmark · {preview}"),
+                        format!("bm_del:{i}"),
+                    ),
+                    (
+                        format!("Rename bookmark · {preview}"),
+                        format!("bm_ren:{i}"),
+                    ),
+                ]
+            })
+            .collect();
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_actions(items);
+        self.set_status("bookmarks · delete / rename", false);
     }
 
     /// Zap: Ctrl-1…4 map to studio panes (not Code/Sessions products).
@@ -5359,6 +5522,8 @@ impl App {
                     self.ui.cell_edit_input.clear();
                     self.ui.table_filter_draft.clear();
                     self.ui.settings_draft.clear();
+                    self.ui.settings_cursor = 0;
+                    self.ui.rename_bookmark_idx = None;
                     self.ui.confirm_delete_source_id = None;
                     self.ui.confirm_delete_label.clear();
                     self.ui.confirm_quit_label.clear();
@@ -5532,6 +5697,7 @@ impl App {
                 _ => {}
             },
             Action::MoveUp => match self.ui.mode {
+                Mode::Settings => self.settings_move_up(),
                 Mode::Palette => {
                     self.ui.palette.move_up();
                     self.preview_palette_theme();
@@ -5590,6 +5756,7 @@ impl App {
                 },
             },
             Action::MoveDown => match self.ui.mode {
+                Mode::Settings => self.settings_move_down(),
                 Mode::Palette => {
                     self.ui.palette.move_down();
                     self.preview_palette_theme();
@@ -5657,7 +5824,9 @@ impl App {
                 },
             },
             Action::MoveLeft => {
-                if self.ui.focus == Focus::Results {
+                if self.ui.mode == Mode::Settings {
+                    self.settings_move_left();
+                } else if self.ui.focus == Focus::Results {
                     if let Some(result) = self.db.last_result.as_mut() {
                         result.move_cell(0, -1);
                     }
@@ -5669,7 +5838,9 @@ impl App {
                 }
             }
             Action::MoveRight => {
-                if self.ui.focus == Focus::Results {
+                if self.ui.mode == Mode::Settings {
+                    self.settings_move_right();
+                } else if self.ui.focus == Focus::Results {
                     if let Some(result) = self.db.last_result.as_mut() {
                         result.move_cell(0, 1);
                     }
@@ -5681,14 +5852,18 @@ impl App {
                 }
             }
             Action::MoveLineStart => {
-                if self.editing_db_sql() {
+                if self.ui.mode == Mode::Settings {
+                    self.settings_move_line_start();
+                } else if self.editing_db_sql() {
                     self.db_move_line_start();
                 } else if let Some(b) = self.active_buffer_mut() {
                     b.move_line_start();
                 }
             }
             Action::MoveLineEnd => {
-                if self.editing_db_sql() {
+                if self.ui.mode == Mode::Settings {
+                    self.settings_move_line_end();
+                } else if self.editing_db_sql() {
                     self.db_move_line_end();
                 } else if let Some(b) = self.active_buffer_mut() {
                     b.move_line_end();
@@ -5721,7 +5896,9 @@ impl App {
                 }
             }
             Action::InsertNewline => {
-                if self.ui.show_completions {
+                if self.ui.mode == Mode::Settings {
+                    self.settings_insert_str("\n");
+                } else if self.ui.show_completions {
                     self.accept_completion();
                     self.sync_lsp_change().await;
                 } else if self.editing_db_sql() {
@@ -5778,7 +5955,7 @@ impl App {
                     self.ui.cell_edit_input.pop();
                 }
                 Mode::Settings => {
-                    self.ui.settings_draft.pop();
+                    self.settings_backspace();
                 }
                 Mode::SessionForm => self.session_form_pop_char(),
                 Mode::AgentForm => self.agent_form_pop_char(),
@@ -7875,6 +8052,35 @@ impl App {
             "bookmark_sql" => {
                 self.db.bookmark_current_sql();
                 self.set_status(self.db.status.clone(), false);
+            }
+            "manage_bookmarks" => self.open_manage_bookmarks(),
+            id if id.starts_with("bm_del:") => {
+                let idx_str = id.trim_start_matches("bm_del:");
+                match idx_str.parse::<usize>() {
+                    Ok(idx) => {
+                        let ok = self.db.delete_bookmark(idx);
+                        self.set_status(self.db.status.clone(), !ok);
+                    }
+                    Err(_) => self.set_status("bad bookmark index", true),
+                }
+            }
+            id if id.starts_with("bm_ren:") => {
+                let idx_str = id.trim_start_matches("bm_ren:");
+                match idx_str.parse::<usize>() {
+                    Ok(idx) if idx < self.db.bookmarks.len() => {
+                        self.ui.rename_bookmark_idx = Some(idx);
+                        self.ui.rename_tab_pending = false;
+                        self.ui.oauth_paste_pending = false;
+                        self.ui.confirm_run_sql = None;
+                        self.ui.import_csv_input = self.db.bookmarks[idx].clone();
+                        self.ui.prompt_modal_title = " Rename bookmark ".into();
+                        self.ui.prompt_modal_hint =
+                            "  edit SQL text · Enter save · Esc cancel".into();
+                        self.ui.mode = Mode::BrainAsk;
+                        self.set_status("rename bookmark · Enter", false);
+                    }
+                    _ => self.set_status("bookmark not found", true),
+                }
             }
             "save_query" => match self.db.save_query_file(None, &self.db.sql.clone()) {
                 Ok(p) => self.set_status(format!("saved {}", p.display()), false),
@@ -10063,7 +10269,7 @@ async fn event_loop(
                                     if !key.modifiers.contains(KeyModifiers::CONTROL)
                                         && !key.modifiers.contains(KeyModifiers::SUPER)
                                     {
-                                        app.ui.settings_draft.push(c);
+                                        app.settings_insert_str(&c.to_string());
                                     }
                                 }
                             }

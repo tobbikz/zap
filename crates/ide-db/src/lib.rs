@@ -1320,8 +1320,13 @@ fn sql_literal(v: &str) -> String {
     if t == "NULL" || t.eq_ignore_ascii_case("<null>") {
         "NULL".into()
     } else {
-        format!("'{}'", v.replace('\'', "''"))
+        sql_string_literal(v)
     }
+}
+
+/// Quote a value as a SQL string literal (always quoted; escapes `'`).
+fn sql_string_literal(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "''"))
 }
 
 fn csv_escape(v: &str) -> String {
@@ -4799,7 +4804,7 @@ impl DbWorkspace {
                 LivePool::CloudStub(DbDriver::Bigquery)
             }
             DbDriver::Elasticsearch | DbDriver::Trino => {
-                LivePool::Http(http_engines::connect_http(&src)?)
+                LivePool::Http(http_engines::connect_http(&src, local_port)?)
             }
         };
         self.pools.insert(key, pool);
@@ -6444,19 +6449,23 @@ impl DbWorkspace {
             .map(|s| s.driver)
             .unwrap_or_default();
         self.guard_writable(&source_id, "CREATE")?;
+        // Permanent views land in the Console schema chip when set (#125).
+        let schema = self
+            .active_schema_name()
+            .filter(|s| !s.is_empty() && s != "main");
+        let qname = |n: &str| quote_ident(driver, n);
+        let view_target = match (as_temp, schema.as_deref()) {
+            (true, _) => qname(name),
+            (false, Some(sch)) => format!("{}.{}", qname(sch), qname(name)),
+            (false, None) => qname(name),
+        };
         let ddl = match driver {
-            DbDriver::Postgres | DbDriver::Duckdb => {
+            DbDriver::Postgres | DbDriver::Duckdb | DbDriver::Sqlite => {
                 if as_temp {
-                    format!("CREATE TEMP TABLE \"{name}\" AS {base}")
+                    format!("CREATE TEMP TABLE {view_target} AS {base}")
                 } else {
-                    format!("CREATE VIEW \"{name}\" AS {base}")
-                }
-            }
-            DbDriver::Sqlite => {
-                if as_temp {
-                    format!("CREATE TEMP TABLE \"{name}\" AS {base}")
-                } else {
-                    format!("CREATE VIEW \"{name}\" AS {base}")
+                    // OR REPLACE avoids silent public/search_path surprises when re-saving.
+                    format!("CREATE OR REPLACE VIEW {view_target} AS {base}")
                 }
             }
             _ => bail!("save as view/temp table supported for Postgres, SQLite, DuckDB first"),
@@ -6850,22 +6859,25 @@ impl DbWorkspace {
             .unwrap_or_default();
         self.ensure_connected(&source_id, database.as_deref())
             .await?;
+        // Never interpolate raw explorer labels — quote as SQL string literals (#122).
+        let s = sql_string_literal(&schema);
+        let t = sql_string_literal(&table);
         let sql = match driver {
             DbDriver::Postgres => format!(
-                "SELECT grantee, privilege_type, is_grantable\n\
-                 FROM information_schema.role_table_grants\n\
-                 WHERE table_schema = '{schema}' AND table_name = '{table}'\n\
-                 ORDER BY grantee, privilege_type;"
+                "SELECT grantee, privilege_type, is_grantable \
+                 FROM information_schema.role_table_grants \
+                 WHERE table_schema = {s} AND table_name = {t} \
+                 ORDER BY grantee, privilege_type"
             ),
             DbDriver::Mysql => format!(
                 "SELECT * FROM ( \
                    SELECT GRANTEE, PRIVILEGE_TYPE, IS_GRANTABLE \
                    FROM information_schema.SCHEMA_PRIVILEGES \
-                   WHERE TABLE_SCHEMA = '{schema}' \
+                   WHERE TABLE_SCHEMA = {s} \
                    UNION ALL \
                    SELECT GRANTEE, PRIVILEGE_TYPE, IS_GRANTABLE \
                    FROM information_schema.TABLE_PRIVILEGES \
-                   WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}' \
+                   WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {t} \
                  ) AS grants_u ORDER BY 1, 2"
             ),
             DbDriver::Mssql => format!(
@@ -6874,32 +6886,30 @@ impl DbWorkspace {
                  JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id \
                  JOIN sys.objects o ON p.major_id = o.object_id \
                  JOIN sys.schemas s ON o.schema_id = s.schema_id \
-                 WHERE s.name = N'{schema}' AND o.name = N'{table}'"
+                 WHERE s.name = N{s} AND o.name = N{t}"
             ),
             DbDriver::Sqlite | DbDriver::Duckdb => {
                 // No GRANT catalog — surface table ownership metadata.
                 format!(
-                    "SELECT 'local-file-engine' AS note, '{schema}' AS schema, '{table}' AS table_name, \
+                    "SELECT 'local-file-engine' AS note, {s} AS schema, {t} AS table_name, \
                      'SQLite/DuckDB use file OS permissions; SQL GRANT is limited' AS detail"
                 )
             }
             DbDriver::Clickhouse => format!(
                 "SELECT access_type, user_name, role_name, database, table \
                  FROM system.grants \
-                 WHERE database = '{schema}' AND (table = '{table}' OR table = '') \
+                 WHERE database = {s} AND (table = {t} OR table = '') \
                  ORDER BY access_type"
             ),
             DbDriver::Snowflake | DbDriver::Bigquery | DbDriver::Trino => format!(
                 "SELECT 'use warehouse IAM / GRANT catalog in Console' AS note, \
-                 '{schema}' AS schema_name, '{table}' AS table_name"
+                 {s} AS schema_name, {t} AS table_name"
             ),
             _ => bail!(
                 "privilege inspect not applicable for {}",
                 driver.label()
             ),
         };
-        // Escape single quotes already in ident_ok names from explorer.
-        let sql = sql.replace('\n', " ");
         self.execute_sql_text(&sql).await?;
         self.status = format!("privileges · {schema}.{table}");
         Ok(())
@@ -6919,6 +6929,8 @@ impl DbWorkspace {
         }
         self.ensure_connected(&source_id, database.as_deref())
             .await?;
+        let s = sql_string_literal(&schema);
+        let t = sql_string_literal(&table);
         let sql = format!(
             "SELECT pol.polname AS policy, \
                     CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT' \
@@ -6929,8 +6941,8 @@ impl DbWorkspace {
              FROM pg_policy pol \
              JOIN pg_class c ON c.oid = pol.polrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = '{schema}' AND c.relname = '{table}' \
-             ORDER BY 1;"
+             WHERE n.nspname = {s} AND c.relname = {t} \
+             ORDER BY 1"
         );
         self.execute_sql_text(&sql).await?;
         self.status = format!("RLS policies · {schema}.{table}");
@@ -9979,21 +9991,74 @@ impl DbWorkspace {
             return;
         }
         self.bookmarks.push(sql.clone());
+        let mut dropped = 0usize;
         if self.bookmarks.len() > 40 {
-            let drop_n = self.bookmarks.len() - 40;
-            self.bookmarks.drain(0..drop_n);
+            dropped = self.bookmarks.len() - 40;
+            self.bookmarks.drain(0..dropped);
         }
         self.persist_history();
         self.refresh_history_bookmarks_in_tree();
         // Persist as a file so it can sync via GitHub/GitLab (skip on re-bookmark, #192).
+        let drop_note = if dropped > 0 {
+            format!(" · dropped {dropped} oldest (cap 40)")
+        } else {
+            String::new()
+        };
         match self.save_query_file(None, &sql) {
             Ok(p) => {
-                self.status = format!("bookmarked → {}", p.display());
+                self.status = format!("bookmarked → {}{drop_note}", p.display());
             }
             Err(e) => {
-                self.status = format!("bookmarked in memory, file save failed: {e:#}");
+                self.status =
+                    format!("bookmarked in memory, file save failed: {e:#}{drop_note}");
             }
         }
+    }
+
+    /// Remove bookmark by index (0 = oldest). Returns false if out of range (#163).
+    pub fn delete_bookmark(&mut self, idx: usize) -> bool {
+        if idx >= self.bookmarks.len() {
+            self.status = "bookmark not found".into();
+            return false;
+        }
+        let removed = self.bookmarks.remove(idx);
+        self.persist_history();
+        self.refresh_history_bookmarks_in_tree();
+        self.status = format!(
+            "deleted bookmark · {}",
+            truncate_sql_label(&removed, 40)
+        );
+        true
+    }
+
+    /// Replace bookmark SQL text by index (#163 rename).
+    pub fn rename_bookmark(&mut self, idx: usize, new_sql: &str) -> bool {
+        let new_sql = new_sql.trim();
+        if new_sql.is_empty() {
+            self.status = "bookmark text empty".into();
+            return false;
+        }
+        if idx >= self.bookmarks.len() {
+            self.status = "bookmark not found".into();
+            return false;
+        }
+        if self
+            .bookmarks
+            .iter()
+            .enumerate()
+            .any(|(i, b)| i != idx && b == new_sql)
+        {
+            self.status = "already bookmarked".into();
+            return false;
+        }
+        self.bookmarks[idx] = new_sql.to_string();
+        self.persist_history();
+        self.refresh_history_bookmarks_in_tree();
+        self.status = format!(
+            "renamed bookmark · {}",
+            truncate_sql_label(new_sql, 40)
+        );
+        true
     }
 
     /// Save SQL to `queries_dir/{name}.sql`. Auto-names if `name` is None.
@@ -12370,6 +12435,53 @@ mod bookmark_dedupe_tests {
         let count_after_second = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(count_after_first, count_after_second);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_and_rename_bookmark() {
+        let mut ws = DbWorkspace::default();
+        ws.bookmarks = vec!["SELECT 1;".into(), "SELECT 2;".into()];
+        assert!(ws.rename_bookmark(1, "SELECT 2b;"));
+        assert_eq!(ws.bookmarks[1], "SELECT 2b;");
+        assert!(ws.delete_bookmark(0));
+        assert_eq!(ws.bookmarks, vec!["SELECT 2b;".to_string()]);
+    }
+
+    #[test]
+    fn bookmark_cap_warns_when_dropping_oldest() {
+        let dir = std::env::temp_dir().join(format!(
+            "zap-bm-cap-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ws = DbWorkspace::default();
+        ws.set_queries_dir(dir.clone());
+        for i in 0..40 {
+            ws.sql = format!("SELECT {i};");
+            ws.bookmark_current_sql();
+        }
+        assert_eq!(ws.bookmarks.len(), 40);
+        ws.sql = "SELECT 999;".into();
+        ws.bookmark_current_sql();
+        assert_eq!(ws.bookmarks.len(), 40);
+        assert!(ws.status.contains("dropped"), "{}", ws.status);
+        assert_eq!(ws.bookmarks.last().map(|s| s.as_str()), Some("SELECT 999;"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod sql_string_literal_tests {
+    use super::sql_string_literal;
+
+    #[test]
+    fn escapes_embedded_quotes() {
+        assert_eq!(sql_string_literal("O'Brien"), "'O''Brien'");
+        assert_eq!(sql_string_literal("a'; DROP"), "'a''; DROP'");
+        assert_eq!(sql_string_literal("plain"), "'plain'");
     }
 }
 

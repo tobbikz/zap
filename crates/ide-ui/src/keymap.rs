@@ -434,13 +434,27 @@ impl Keymap {
                 (true, false, KeyCode::Char('z')) => Some(Action::Undo),
                 _ => None,
             },
+            KeyContext::Settings => match (ctrl, key.code) {
+                (_, KeyCode::Esc) => Some(Action::Cancel),
+                // Enter inserts a newline; Ctrl-S saves (#148).
+                (_, KeyCode::Enter) => Some(Action::InsertNewline),
+                (true, KeyCode::Char('s') | KeyCode::Char('S')) => Some(Action::Confirm),
+                (_, KeyCode::Backspace) => Some(Action::Backspace),
+                (_, KeyCode::Left) => Some(Action::MoveLeft),
+                (_, KeyCode::Right) => Some(Action::MoveRight),
+                (_, KeyCode::Home) => Some(Action::MoveLineStart),
+                (_, KeyCode::End) => Some(Action::MoveLineEnd),
+                (_, KeyCode::Up) => Some(Action::MoveUp),
+                (_, KeyCode::Down) => Some(Action::MoveDown),
+                (true, KeyCode::Char('v') | KeyCode::Char('V')) => Some(Action::ClipboardPaste),
+                _ => None,
+            },
             KeyContext::Command
             | KeyContext::Rename
             | KeyContext::Find
             | KeyContext::Replace
             | KeyContext::Commit
             | KeyContext::EditCell
-            | KeyContext::Settings
             | KeyContext::OpenFolder
             | KeyContext::ImportCsv
             | KeyContext::RestoreDump
@@ -813,6 +827,23 @@ mod tests {
                 "{ctx:?}"
             );
         }
+    }
+
+    #[test]
+    fn settings_enter_is_newline_ctrl_s_saves() {
+        let ctx = KeyContext::Settings;
+        assert_eq!(
+            Keymap::map(ctx, KeyEvent::from(KeyCode::Enter)),
+            Some(Action::InsertNewline)
+        );
+        assert_eq!(
+            Keymap::map(ctx, ctrl(KeyCode::Char('s'))),
+            Some(Action::Confirm)
+        );
+        assert_eq!(
+            Keymap::map(ctx, KeyEvent::from(KeyCode::Left)),
+            Some(Action::MoveLeft)
+        );
     }
 
     fn ctrl_shift(code: KeyCode) -> KeyEvent {

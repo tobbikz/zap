@@ -137,6 +137,8 @@ pub struct UiState {
     pub debug_frame_selected: usize,
     pub variables: Vec<VariableView>,
     pub settings_draft: String,
+    /// Char index into `settings_draft` (#148).
+    pub settings_cursor: usize,
     /// After QueryParams confirm, run EXPLAIN instead of execute.
     pub query_params_for_explain: bool,
     /// Source id pending delete confirmation.
@@ -173,6 +175,8 @@ pub struct UiState {
     pub prompt_modal_hint: String,
     /// BrainAsk / rename prompt collecting a SQL tab title.
     pub rename_tab_pending: bool,
+    /// When set, Mode::Rename / BrainAsk renames this bookmark index (#163).
+    pub rename_bookmark_idx: Option<usize>,
     /// ConfirmQuit dialog message (Wave 3).
     pub confirm_quit_label: String,
     /// SessionForm field index: 0 name … 5 jump/gateway.
@@ -272,6 +276,7 @@ impl Default for UiState {
             debug_frame_selected: 0,
             variables: Vec::new(),
             settings_draft: String::new(),
+            settings_cursor: 0,
             query_params_for_explain: false,
             confirm_delete_source_id: None,
             confirm_delete_label: String::new(),
@@ -291,6 +296,7 @@ impl Default for UiState {
             prompt_modal_title: String::new(),
             prompt_modal_hint: String::new(),
             rename_tab_pending: false,
+            rename_bookmark_idx: None,
             confirm_quit_label: String::new(),
             session_form_field: 0,
             agent_form_field: 0,
@@ -705,7 +711,12 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
             );
         }
         if ctx.ui.mode == Mode::Settings {
-            palette::render_settings_modal(frame, size, &ctx.ui.settings_draft);
+            palette::render_settings_modal(
+                frame,
+                size,
+                &ctx.ui.settings_draft,
+                ctx.ui.settings_cursor,
+            );
         }
         if ctx.ui.mode == Mode::OpenFolder {
             palette::render_open_folder(frame, size, &ctx.ui.open_folder_input);

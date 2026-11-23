@@ -1,6 +1,6 @@
 # Feature inventory — Zap
 
-Complete map of what ships in **v0.6.1**. Companion to the [README](../README.md).
+Complete map of what ships in **v0.6.3**. Companion to the [README](../README.md).
 
 <p align="center">
   <img src="assets/hero-results-hover.png" alt="Results hover preview" width="860" />
@@ -186,7 +186,7 @@ Palette recipes (seed / gallery):
 | **OS** | Linux · Windows ([INSTALL.md](INSTALL.md)) |
 | **Config** | `~/.config/zap/` · `%APPDATA%\zap\` |
 | **License** | Apache-2.0 |
-| **Release** | [v0.6.1](https://github.com/tobbikz/zap/releases/tag/v0.6.1) |
+| **Release** | [v0.6.3](https://github.com/tobbikz/zap/releases/tag/v0.6.3) |
 
 ---
 

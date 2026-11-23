@@ -15,27 +15,33 @@ pub struct HttpSqlConn {
     pub client: reqwest::Client,
 }
 
-pub fn connect_http(src: &DataSource) -> Result<HttpSqlConn> {
+pub fn connect_http(src: &DataSource, local_port: Option<u16>) -> Result<HttpSqlConn> {
     let scheme = if src.tls_required() { "https" } else { "http" };
-    let host = if src.host.is_empty() {
-        "127.0.0.1"
-    } else {
-        src.host.as_str()
-    };
-    let port = if src.port == 0 {
-        match src.driver {
-            DbDriver::Elasticsearch => 9200,
-            DbDriver::Trino => 8080,
-            _ => 8080,
-        }
-    } else {
-        src.port
+    let (host, port) = match local_port {
+        Some(lp) => ("127.0.0.1".to_string(), lp),
+        None => (
+            if src.host.is_empty() {
+                "127.0.0.1".into()
+            } else {
+                src.host.clone()
+            },
+            if src.port == 0 {
+                match src.driver {
+                    DbDriver::Elasticsearch => 9200,
+                    DbDriver::Trino => 8080,
+                    _ => 8080,
+                }
+            } else {
+                src.port
+            },
+        ),
     };
     Ok(HttpSqlConn {
         driver: src.driver,
         base: format!("{scheme}://{host}:{port}"),
         user: src.user.clone(),
-        password: src.password.clone(),
+        // Resolve env:/vault even if caller skipped for_connect() (#128).
+        password: src.resolved_password(),
         database: src.database.clone(),
         client: crate::engines::build_http_client(src)?,
     })
