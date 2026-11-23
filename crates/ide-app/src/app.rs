@@ -821,10 +821,13 @@ impl App {
             self.set_status("WHERE / ORDER BY only on table data tabs", true);
             return;
         }
+        // Snapshot both wells — Esc discards without mutating tab state (#152).
+        self.ui.table_filter_where_edit = self.db.active_table_where().to_string();
+        self.ui.table_filter_order_edit = self.db.active_table_order_by().to_string();
         self.ui.table_filter_field = field;
         self.ui.table_filter_draft = match field {
-            TableFilterField::Where => self.db.active_table_where().to_string(),
-            TableFilterField::OrderBy => self.db.active_table_order_by().to_string(),
+            TableFilterField::Where => self.ui.table_filter_where_edit.clone(),
+            TableFilterField::OrderBy => self.ui.table_filter_order_edit.clone(),
         };
         self.ui.focus = Focus::Results;
         self.ui.mode = Mode::EditTableFilter;
@@ -834,13 +837,23 @@ impl App {
     }
 
     async fn confirm_table_filter(&mut self) -> Result<()> {
-        let draft = self.ui.table_filter_draft.clone();
+        // Sync active draft into its edit buffer, then commit both wells.
         match self.ui.table_filter_field {
-            TableFilterField::Where => self.db.set_active_table_where(draft),
-            TableFilterField::OrderBy => self.db.set_active_table_order_by(draft),
+            TableFilterField::Where => {
+                self.ui.table_filter_where_edit = self.ui.table_filter_draft.clone();
+            }
+            TableFilterField::OrderBy => {
+                self.ui.table_filter_order_edit = self.ui.table_filter_draft.clone();
+            }
         }
+        self.db
+            .set_active_table_where(self.ui.table_filter_where_edit.clone());
+        self.db
+            .set_active_table_order_by(self.ui.table_filter_order_edit.clone());
         self.ui.mode = Mode::Normal;
         self.ui.table_filter_draft.clear();
+        self.ui.table_filter_where_edit.clear();
+        self.ui.table_filter_order_edit.clear();
         self.ui.show_completions = false;
         self.ui.completions.clear();
         self.ui.focus = Focus::Results;
@@ -858,11 +871,11 @@ impl App {
         if self.ui.mode != Mode::EditTableFilter {
             return;
         }
-        // Persist current draft into the active field before switching.
+        // Stash draft in the local edit buffer only — never mutate tab until Enter (#152).
         let draft = self.ui.table_filter_draft.clone();
         match self.ui.table_filter_field {
-            TableFilterField::Where => self.db.set_active_table_where(draft),
-            TableFilterField::OrderBy => self.db.set_active_table_order_by(draft),
+            TableFilterField::Where => self.ui.table_filter_where_edit = draft,
+            TableFilterField::OrderBy => self.ui.table_filter_order_edit = draft,
         }
         self.ui.table_filter_field = if forward {
             match self.ui.table_filter_field {
@@ -876,8 +889,8 @@ impl App {
             }
         };
         self.ui.table_filter_draft = match self.ui.table_filter_field {
-            TableFilterField::Where => self.db.active_table_where().to_string(),
-            TableFilterField::OrderBy => self.db.active_table_order_by().to_string(),
+            TableFilterField::Where => self.ui.table_filter_where_edit.clone(),
+            TableFilterField::OrderBy => self.ui.table_filter_order_edit.clone(),
         };
         self.refresh_table_filter_completions();
     }
@@ -963,8 +976,12 @@ impl App {
     }
 
     fn accept_table_filter_completion(&mut self) {
-        if !self.ui.show_completions || self.ui.completions.is_empty() {
-            // No suggestions → Tab switches WHERE ↔ ORDER BY.
+        let (_, token) = Self::table_filter_token(&self.ui.table_filter_draft);
+        // Empty token / no popup → Tab switches wells (don't insert first column) (#152).
+        if token.is_empty()
+            || !self.ui.show_completions
+            || self.ui.completions.is_empty()
+        {
             self.cycle_table_filter_field(true);
             return;
         }
@@ -5521,6 +5538,8 @@ impl App {
                     self.ui.query_params_for_explain = false;
                     self.ui.cell_edit_input.clear();
                     self.ui.table_filter_draft.clear();
+                    self.ui.table_filter_where_edit.clear();
+                    self.ui.table_filter_order_edit.clear();
                     self.ui.settings_draft.clear();
                     self.ui.settings_cursor = 0;
                     self.ui.rename_bookmark_idx = None;
@@ -6122,7 +6141,7 @@ impl App {
             Action::NextCompletion => {
                 if self.ui.completions.is_empty() {
                     // nothing
-                } else if self.ui.completion_idx + 1 < self.ui.completions.len().min(10) {
+                } else if self.ui.completion_idx + 1 < self.ui.completions.len() {
                     self.ui.completion_idx += 1;
                 }
             }
