@@ -5716,6 +5716,16 @@ impl DbWorkspace {
             self.query_backend_pid.store(0, Ordering::Relaxed);
             return result;
         }
+        // Refresh Trino schema from Console chip before exec (#129).
+        let trino_schema = self
+            .active_schema_name()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".into());
+        if let Some(LivePool::Http(h)) = self.pools.get_mut(key) {
+            if h.driver == DbDriver::Trino {
+                h.schema = trino_schema;
+            }
+        }
         let pool = self.pools.get(key).context("not connected")?;
         match pool {
             LivePool::Pg(_) | LivePool::Mysql(_) => unreachable!("handled above"),
@@ -9174,24 +9184,18 @@ FROM pg_stat_user_indexes
 ORDER BY idx_scan ASC, pg_relation_size(indexrelid) DESC
 LIMIT 40;";
 
+// Prefer information_schema — works on MariaDB and MySQL with performance_schema=OFF (#133).
 pub const MYSQL_HEALTH_OVERVIEW: &str = "\
-SELECT 'threads_connected' AS metric, VARIABLE_VALUE AS value
-FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Threads_connected'
+SELECT VARIABLE_NAME AS metric, VARIABLE_VALUE AS value
+FROM information_schema.GLOBAL_STATUS
+WHERE VARIABLE_NAME IN (
+  'Threads_connected','Threads_running','Uptime','Questions','Slow_queries'
+)
 UNION ALL
-SELECT 'threads_running', VARIABLE_VALUE
-FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Threads_running'
-UNION ALL
-SELECT 'uptime', VARIABLE_VALUE
-FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Uptime'
-UNION ALL
-SELECT 'questions', VARIABLE_VALUE
-FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Questions'
-UNION ALL
-SELECT 'slow_queries', VARIABLE_VALUE
-FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Slow_queries'
-UNION ALL
-SELECT 'max_connections', VARIABLE_VALUE
-FROM performance_schema.global_variables WHERE VARIABLE_NAME = 'max_connections';";
+SELECT VARIABLE_NAME, VARIABLE_VALUE
+FROM information_schema.GLOBAL_VARIABLES
+WHERE VARIABLE_NAME = 'max_connections'
+ORDER BY metric;";
 
 pub const MYSQL_HEALTH_ACTIVITY: &str = "\
 SELECT id, user, host, db, command, time, state, left(info, 160) AS info
@@ -9199,14 +9203,18 @@ FROM information_schema.processlist
 ORDER BY time DESC;";
 
 pub const MYSQL_HEALTH_LOCKS: &str = "\
-SELECT ENGINE_LOCK_ID, ENGINE_TRANSACTION_ID, THREAD_ID, OBJECT_SCHEMA, OBJECT_NAME,
-  INDEX_NAME, LOCK_TYPE, LOCK_MODE, LOCK_STATUS, LOCK_DATA
-FROM performance_schema.data_locks
+SELECT id AS session_id, user, host, db, command, time, state,
+  left(info, 160) AS query
+FROM information_schema.processlist
+WHERE (state IS NOT NULL AND (
+  state LIKE '%lock%' OR state LIKE '%Lock%' OR state LIKE 'Waiting%'
+)) OR (command <> 'Sleep' AND info IS NOT NULL AND time > 5)
+ORDER BY time DESC
 LIMIT 100;";
 
 pub const MYSQL_HEALTH_INNODB: &str = "\
 SELECT VARIABLE_NAME AS metric, VARIABLE_VALUE AS value
-FROM performance_schema.global_status
+FROM information_schema.GLOBAL_STATUS
 WHERE VARIABLE_NAME IN (
   'Innodb_buffer_pool_read_requests','Innodb_buffer_pool_reads',
   'Innodb_buffer_pool_pages_dirty','Innodb_row_lock_current_waits',
@@ -9216,13 +9224,11 @@ WHERE VARIABLE_NAME IN (
 ORDER BY VARIABLE_NAME;";
 
 pub const MYSQL_HEALTH_EXPENSIVE: &str = "\
-SELECT DIGEST_TEXT AS query,
-  COUNT_STAR AS exec_count,
-  ROUND(SUM_TIMER_WAIT/1e12, 3) AS total_sec,
-  ROUND(AVG_TIMER_WAIT/1e12, 6) AS avg_sec,
-  SUM_ROWS_EXAMINED AS rows_examined
-FROM performance_schema.events_statements_summary_by_digest
-ORDER BY SUM_TIMER_WAIT DESC
+SELECT id AS session_id, user, host, db, time AS sec,
+  left(info, 200) AS query
+FROM information_schema.processlist
+WHERE command <> 'Sleep' AND info IS NOT NULL
+ORDER BY time DESC
 LIMIT 25;";
 
 pub const CH_HEALTH_OVERVIEW: &str = "\
@@ -11813,11 +11819,26 @@ fn ddl_drop_table(driver: DbDriver, schema: &str, table: &str) -> String {
 fn ddl_add_column(driver: DbDriver, schema: &str, table: &str, col: &str, ty: &str) -> String {
     let qual = table_qual(driver, schema, table);
     let ty = ty.trim();
-    let ty = if ty.is_empty() { "text" } else { ty };
-    format!(
-        "ALTER TABLE {qual} ADD COLUMN {} {ty};",
-        ident_quote(driver, col)
-    )
+    let ty = if ty.is_empty() {
+        match driver {
+            DbDriver::Mssql => "nvarchar(max)",
+            DbDriver::Mysql => "TEXT",
+            _ => "text",
+        }
+    } else {
+        ty
+    };
+    // T-SQL: ADD col ty — the COLUMN keyword is illegal on ADD (#127).
+    match driver {
+        DbDriver::Mssql => format!(
+            "ALTER TABLE {qual} ADD {} {ty};",
+            ident_quote(driver, col)
+        ),
+        _ => format!(
+            "ALTER TABLE {qual} ADD COLUMN {} {ty};",
+            ident_quote(driver, col)
+        ),
+    }
 }
 
 fn ddl_drop_column(driver: DbDriver, schema: &str, table: &str, col: &str) -> String {
@@ -11848,8 +11869,9 @@ fn ddl_rename_column(
             ident_quote(driver, new)
         ),
         DbDriver::Mssql => format!(
-            "EXEC sp_rename N'{}.{}', N'{}', N'COLUMN';",
+            "EXEC sp_rename N'{}.{}.{}', N'{}', N'COLUMN';",
             schema.replace('\'', "''"),
+            table.replace('\'', "''"),
             old.replace('\'', "''"),
             new.replace('\'', "''")
         ),
@@ -12754,5 +12776,32 @@ mod txn_switch_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("transaction open"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod mssql_alter_ddl_tests {
+    use super::{ddl_add_column, ddl_rename_column, DbDriver};
+
+    #[test]
+    fn mssql_add_omits_column_keyword() {
+        let sql = ddl_add_column(DbDriver::Mssql, "dbo", "t", "c", "int");
+        assert!(sql.contains("ADD [c] int"), "{sql}");
+        assert!(!sql.contains("ADD COLUMN"), "{sql}");
+    }
+
+    #[test]
+    fn mssql_rename_includes_table() {
+        let sql = ddl_rename_column(DbDriver::Mssql, "dbo", "orders", "old", "new");
+        assert!(
+            sql.contains("N'dbo.orders.old'") && sql.contains("N'new'"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn postgres_add_keeps_column_keyword() {
+        let sql = ddl_add_column(DbDriver::Postgres, "public", "t", "c", "int");
+        assert!(sql.contains("ADD COLUMN"), "{sql}");
     }
 }

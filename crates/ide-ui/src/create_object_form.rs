@@ -313,6 +313,7 @@ AS $$ SELECT 1; $$".into(),
             CreateObjectKind::Role => match self.driver {
                 DbDriver::Mysql => 6,
                 DbDriver::Mssql => 3,
+                DbDriver::Clickhouse => 3, // name, password, admin (#150)
                 _ => 12, // Postgres full attrs
             },
             CreateObjectKind::Table => 5 + self.columns.len().max(1) + 1,
@@ -436,7 +437,7 @@ AS $$ SELECT 1; $$".into(),
                     4 => self.can_create_db = !self.can_create_db,
                     _ => {}
                 },
-                DbDriver::Mssql => {
+                DbDriver::Mssql | DbDriver::Clickhouse => {
                     if self.field == 2 {
                         self.superuser = !self.superuser;
                     }
@@ -592,6 +593,11 @@ AS $$ SELECT 1; $$".into(),
                     1 => Some(&mut self.password),
                     _ => None,
                 },
+                DbDriver::Clickhouse => match self.field {
+                    0 => Some(&mut self.name),
+                    1 => Some(&mut self.password),
+                    _ => None, // field 2 = superuser toggle
+                },
                 _ => match self.field {
                     0 => Some(&mut self.name),
                     2 => Some(&mut self.password),
@@ -684,7 +690,7 @@ AS $$ SELECT 1; $$".into(),
                     4 => self.can_create_db = yes,
                     _ => {}
                 },
-                DbDriver::Mssql => {
+                DbDriver::Mssql | DbDriver::Clickhouse => {
                     if self.field == 2 {
                         self.superuser = yes;
                     }
@@ -816,6 +822,14 @@ fn yn(v: bool) -> &'static str {
     }
 }
 
+fn mask_pw(pw: &str) -> String {
+    if pw.is_empty() {
+        String::new()
+    } else {
+        "•".repeat(pw.chars().count())
+    }
+}
+
 fn render_simple_lines(form: &CreateObjectForm) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let fields: Vec<(&str, String, bool)> = match form.kind {
@@ -877,20 +891,25 @@ fn render_simple_lines(form: &CreateObjectForm) -> Vec<Line<'static>> {
             DbDriver::Mysql => vec![
                 ("Name", form.name.clone(), false),
                 ("Host", form.template.clone(), false),
-                ("Password", form.password.clone(), false),
+                ("Password", mask_pw(&form.password), false),
                 ("Superuser", yn(form.superuser).into(), true),
                 ("CreateDB", yn(form.can_create_db).into(), true),
                 ("Member of", form.body.clone(), false),
             ],
             DbDriver::Mssql => vec![
                 ("Name", form.name.clone(), false),
-                ("Password", form.password.clone(), false),
+                ("Password", mask_pw(&form.password), false),
                 ("Sysadmin", yn(form.superuser).into(), true),
+            ],
+            DbDriver::Clickhouse => vec![
+                ("Name", form.name.clone(), false),
+                ("Password", mask_pw(&form.password), false),
+                ("Admin", yn(form.superuser).into(), true),
             ],
             _ => vec![
                 ("Name", form.name.clone(), false),
                 ("Login", yn(form.flag).into(), true),
-                ("Password", form.password.clone(), false),
+                ("Password", mask_pw(&form.password), false),
                 ("Inherit", yn(form.inherit).into(), true),
                 ("CreateDB", yn(form.can_create_db).into(), true),
                 ("CreateRole", yn(form.can_create_role).into(), true),
@@ -913,12 +932,16 @@ fn render_simple_lines(form: &CreateObjectForm) -> Vec<Line<'static>> {
             theme::style_faint()
         };
         let value_style = if focused {
-            if (*label == "Superuser" || *label == "Sysadmin") && form.superuser {
+            if (*label == "Superuser" || *label == "Sysadmin" || *label == "Admin")
+                && form.superuser
+            {
                 theme::style_err_badge()
             } else {
                 theme::style_text().add_modifier(Modifier::BOLD)
             }
-        } else if (*label == "Superuser" || *label == "Sysadmin") && form.superuser {
+        } else if (*label == "Superuser" || *label == "Sysadmin" || *label == "Admin")
+            && form.superuser
+        {
             theme::style_err_badge()
         } else {
             theme::style_muted()
@@ -1248,5 +1271,27 @@ mod tests {
             .to_sql()
             .unwrap()
             .contains("CREATE TABLESPACE fast LOCATION '/data/pg_tspace'"));
+    }
+
+    #[test]
+    fn clickhouse_role_has_three_fields() {
+        let form =
+            CreateObjectForm::fresh_with_owner(CreateObjectKind::Role, "", "", DbDriver::Clickhouse);
+        assert_eq!(form.field_count(), 3);
+    }
+
+    #[test]
+    fn mssql_function_uses_body() {
+        let mut form = CreateObjectForm::fresh_with_owner(
+            CreateObjectKind::Function,
+            "dbo",
+            "",
+            DbDriver::Mssql,
+        );
+        form.name = "ping".into();
+        form.body = "RETURN 42".into();
+        let sql = form.to_sql().unwrap();
+        assert!(sql.contains("RETURN 42"), "{sql}");
+        assert!(!sql.contains("RETURN 1"), "{sql}");
     }
 }

@@ -205,6 +205,10 @@ pub struct UiState {
     pub resume_console_insert: bool,
     /// EditTableFilter: which bar (WHERE vs ORDER BY).
     pub table_filter_field: TableFilterField,
+    /// Working WHERE draft while EditTableFilter is open (#152).
+    pub table_filter_where_edit: String,
+    /// Working ORDER BY draft while EditTableFilter is open (#152).
+    pub table_filter_order_edit: String,
     /// Draft text while editing a table filter bar.
     pub table_filter_draft: String,
 }
@@ -312,6 +316,8 @@ impl Default for UiState {
             resume_console_insert: false,
             table_filter_field: TableFilterField::Where,
             table_filter_draft: String::new(),
+            table_filter_where_edit: String::new(),
+            table_filter_order_edit: String::new(),
         }
     }
 }
@@ -2401,7 +2407,12 @@ fn filter_field_span(label: &str, value: &str, focused: bool, field_w: usize) ->
     let inner = if empty && !focused {
         truncate_chars("—", well_w)
     } else if value.chars().count() > well_w {
-        truncate_chars(value, well_w)
+        // Focused draft: keep caret/end visible so typing isn't blind (#152).
+        if focused {
+            truncate_chars_end(value, well_w)
+        } else {
+            truncate_chars(value, well_w)
+        }
     } else {
         format!(
             "{value}{}",
@@ -3033,28 +3044,42 @@ fn render_filter_column_popup(frame: &mut Frame, screen: Rect, ui: &UiState) {
     if ui.completions.is_empty() {
         return;
     }
-    let height = (ui.completions.len().min(10) as u16)
+    let visible = 10usize;
+    let height = (ui.completions.len().min(visible) as u16)
         .saturating_add(2)
         .min(screen.height.saturating_sub(4))
         .max(3);
     let width = 40u16.min(screen.width.saturating_sub(4)).max(22);
-    // Sit in the upper Results region (below meta / filter strip).
+    // Anchor near the active well: WHERE ≈ mid-left, ORDER ≈ mid-right (#152).
+    let order_well = matches!(ui.table_filter_field, TableFilterField::OrderBy);
     let y = screen
         .y
-        .saturating_add(screen.height.saturating_mul(45) / 100)
+        .saturating_add(screen.height.saturating_mul(42) / 100)
         .min(screen.y.saturating_add(screen.height.saturating_sub(height).saturating_sub(2)));
-    let x = screen.x.saturating_add(4);
+    let x = if order_well {
+        screen
+            .x
+            .saturating_add(screen.width.saturating_div(2))
+            .min(screen.x.saturating_add(screen.width.saturating_sub(width).saturating_sub(2)))
+    } else {
+        screen.x.saturating_add(4)
+    };
     let area = Rect {
         x,
         y,
         width,
         height,
     };
+    let scroll = ui
+        .completion_idx
+        .saturating_sub(visible.saturating_sub(1) / 2)
+        .min(ui.completions.len().saturating_sub(visible));
     let items: Vec<ListItem> = ui
         .completions
         .iter()
         .enumerate()
-        .take(10)
+        .skip(scroll)
+        .take(visible)
         .map(|(i, c)| {
             let detail = c.detail.as_deref().unwrap_or("column");
             let selected = i == ui.completion_idx;
@@ -5249,7 +5274,8 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     };
     let view = ctx.ui.admin_modal_view.to_ascii_lowercase();
     let is_overview = view.contains("overview");
-    let is_blocking = view.contains("blocking") || view.contains("lock");
+    // Chain cards only for true blocking queries — not generic "Locks" grids (#132).
+    let is_blocking = view.contains("blocking");
 
     let width = screen.width.saturating_sub(4).clamp(56, 120);
     let height = screen.height.saturating_sub(2).clamp(14, 36);
@@ -5379,13 +5405,25 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         Some(result) if is_overview && admin_is_metric_value(result) => {
             admin_overview_kpi_lines(result, body_w)
         }
-        Some(result) if is_blocking => admin_blocking_lines(result, ctx.ui.admin_modal_row, body_w),
+        Some(result) if is_blocking => {
+            match admin_blocking_lines(result, ctx.ui.admin_modal_row, body_w) {
+                Some(l) => l,
+                None => admin_ops_table_lines(result, ctx.ui.admin_modal_row, body_w),
+            }
+        }
         Some(result) => admin_ops_table_lines(result, ctx.ui.admin_modal_row, body_w),
     };
 
     let scroll = {
         let sel = ctx.ui.admin_modal_row;
-        sel.saturating_sub(body_h.saturating_sub(1) / 2)
+        // Blocking cards are ~3 rendered lines each — scroll in line units (#132).
+        let approx = if is_blocking {
+            sel.saturating_mul(3)
+        } else {
+            sel
+        };
+        approx
+            .saturating_sub(body_h.saturating_sub(1) / 2)
             .min(lines.len().saturating_sub(body_h))
     };
     frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
@@ -5477,13 +5515,20 @@ fn admin_overview_kpi_lines(result: &ide_db::QueryResult, width: usize) -> Vec<L
     lines
 }
 
+fn admin_col_idx(columns: &[String], names: &[&str]) -> Option<usize> {
+    columns
+        .iter()
+        .position(|c| names.iter().any(|n| c.eq_ignore_ascii_case(n)))
+}
+
+/// Chain-card layout when blocked/blocker columns exist; `None` → fall back to table (#132).
 fn admin_blocking_lines(
     result: &ide_db::QueryResult,
     sel: usize,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> Option<Vec<Line<'static>>> {
     if result.rows.is_empty() {
-        return vec![
+        return Some(vec![
             Line::from(Span::styled(
                 " no blockers ",
                 Style::default()
@@ -5496,8 +5541,35 @@ fn admin_blocking_lines(
                 " Nothing waiting on locks right now.",
                 theme::style_faint(),
             )),
-        ];
+        ]);
     }
+    let blocked_i = admin_col_idx(
+        &result.columns,
+        &["blocked_pid", "session_id", "waiting_pid", "blocked"],
+    )?;
+    let blocker_i = admin_col_idx(
+        &result.columns,
+        &[
+            "blocking_pid",
+            "blocking_session_id",
+            "blocking_pid",
+            "blocker",
+        ],
+    )?;
+    let wait_i = admin_col_idx(
+        &result.columns,
+        &[
+            "wait_event_type",
+            "wait_event",
+            "wait_type",
+            "wait_time",
+            "state",
+        ],
+    );
+    let query_i = admin_col_idx(
+        &result.columns,
+        &["blocked_query", "query", "blocking_query", "info"],
+    );
     let mut lines = Vec::new();
     for (ri, row) in result.rows.iter().enumerate() {
         let selected = ri == sel;
@@ -5506,18 +5578,16 @@ fn admin_blocking_lines(
         } else {
             theme::style_text()
         };
-        let blocked = row.first().map(|s| s.as_str()).unwrap_or("?");
-        let blocker = row.get(2).map(|s| s.as_str()).unwrap_or("?");
-        let wait = row
-            .get(4)
-            .or_else(|| row.get(5))
+        let blocked = row.get(blocked_i).map(|s| s.as_str()).unwrap_or("?");
+        let blocker = row.get(blocker_i).map(|s| s.as_str()).unwrap_or("?");
+        let wait = wait_i
+            .and_then(|i| row.get(i))
             .map(|s| s.as_str())
             .unwrap_or("");
-        let q = row
-            .iter()
-            .rev()
-            .find(|c| c.len() > 12)
+        let q = query_i
+            .and_then(|i| row.get(i))
             .map(|s| s.as_str())
+            .filter(|s| s.len() > 4)
             .unwrap_or("");
         let head = format!(" {blocked}  ←blocked by←  {blocker}  {wait}");
         lines.push(Line::from(Span::styled(
@@ -5536,7 +5606,7 @@ fn admin_blocking_lines(
         }
         lines.push(Line::from(""));
     }
-    lines
+    Some(lines)
 }
 
 fn admin_ops_table_lines(
@@ -5701,6 +5771,20 @@ fn wrap_value(text: &str, width: usize) -> Vec<String> {
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     truncate_display(s, max_chars)
+}
+
+/// Keep the end of `s` visible (prefix ellipsis) for focused input wells (#152).
+fn truncate_chars_end(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let start = chars.len().saturating_sub(keep);
+    format!("…{}", chars[start..].iter().collect::<String>())
 }
 
 fn display_width(s: &str) -> usize {

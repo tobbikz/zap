@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- MSSQL ALTER ADD omits illegal `COLUMN`; `sp_rename` includes table (#127).
+- Trino sends Console schema as `X-Trino-Schema` (#129).
+- Admin Blocking resolves columns by name; scroll in card line units (#132).
+- MySQL/MariaDB Health uses `information_schema` (no `performance_schema` required) (#133).
+- CreateObject: mask Role passwords; ClickHouse Role fields; MSSQL Function uses Body (#150).
+- WHERE/ORDER wells: Esc restores snapshot; caret stays visible; empty Tab switches wells (#152).
 - CLI `--version` / `--help` exit cleanly; FEATURES docs pin **v0.6.3** (#141).
 - Privilege / RLS inspect quotes schema/table as SQL literals (#122).
 - Save as view qualifies with Console schema and uses `CREATE OR REPLACE` (#125).

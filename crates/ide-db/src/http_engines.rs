@@ -12,6 +12,8 @@ pub struct HttpSqlConn {
     pub user: String,
     pub password: String,
     pub database: String,
+    /// Trino schema (`X-Trino-Schema`); ignored for Elasticsearch (#129).
+    pub schema: String,
     pub client: reqwest::Client,
 }
 
@@ -43,6 +45,7 @@ pub fn connect_http(src: &DataSource, local_port: Option<u16>) -> Result<HttpSql
         // Resolve env:/vault even if caller skipped for_connect() (#128).
         password: src.resolved_password(),
         database: src.database.clone(),
+        schema: "default".into(),
         client: crate::engines::build_http_client(src)?,
     })
 }
@@ -107,10 +110,15 @@ async fn exec_trino(conn: &HttpSqlConn, sql: &str) -> Result<QueryResult> {
     } else {
         conn.database.as_str()
     };
+    let schema = if conn.schema.trim().is_empty() {
+        "default"
+    } else {
+        conn.schema.trim()
+    };
     let mut req = client
         .post(format!("{}/v1/statement", conn.base))
         .header("X-Trino-Catalog", catalog)
-        .header("X-Trino-Schema", "default")
+        .header("X-Trino-Schema", schema)
         .header("X-Trino-User", if conn.user.is_empty() { "zap" } else { &conn.user })
         .header("Content-Type", "text/plain")
         .body(sql.to_string());

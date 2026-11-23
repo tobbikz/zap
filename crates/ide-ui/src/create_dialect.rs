@@ -520,14 +520,21 @@ fn emit_function(
             "DELIMITER //\nCREATE FUNCTION {}() RETURNS INT DETERMINISTIC\nBEGIN\n  {body};\nEND //\nDELIMITER ;",
             q(driver, name)
         )),
-        DbDriver::Mssql => Ok(format!(
-            "CREATE OR ALTER FUNCTION {}()\nRETURNS int\nAS\nBEGIN\n  RETURN 1;\nEND;",
-            if schema.is_empty() {
+        DbDriver::Mssql => {
+            let qual_name = if schema.is_empty() {
                 q(driver, name)
             } else {
                 qual(driver, schema, name)
+            };
+            // Prefer full RETURNS…AS body; otherwise wrap expression (#150).
+            if body.to_ascii_uppercase().contains("RETURNS") {
+                Ok(format!("CREATE OR ALTER FUNCTION {qual_name}\n{body};"))
+            } else {
+                Ok(format!(
+                    "CREATE OR ALTER FUNCTION {qual_name}()\nRETURNS int\nAS\nBEGIN\n  {body};\nEND;"
+                ))
             }
-        )),
+        }
         DbDriver::Clickhouse | DbDriver::Snowflake | DbDriver::Bigquery | DbDriver::Trino => {
             Ok(format!(
                 "-- Adjust signature for {}\nCREATE FUNCTION {} AS {};",
