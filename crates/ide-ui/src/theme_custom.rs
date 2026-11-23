@@ -213,7 +213,9 @@ pub fn create_custom_theme(name: &str, extends: &str) -> Result<PathBuf> {
     }
     let body = format!(
         r#"# Zap custom theme — edit colours, then : Theme: reload customs
-# or restart. Use theme = "{name}" in config.toml
+# or restart. In config.toml use:
+# [theme]
+# name = "{name}"
 extends = "{ext}"
 label = "{name}"
 

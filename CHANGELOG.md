@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- CLI `--version` / `--help` exit cleanly; FEATURES docs pin **v0.6.3** (#141).
+- Privilege / RLS inspect quotes schema/table as SQL literals (#122).
+- Save as view qualifies with Console schema and uses `CREATE OR REPLACE` (#125).
+- Elasticsearch/Trino HTTP honors SSH `local_port` and resolves vault passwords (#128).
+- Settings editor: cursor navigation, Enter = newline, Ctrl-S saves (#148).
+- Bookmarks: manage/delete/rename from palette; warn when FIFO-dropping past 40 (#163).
+
 ## [0.6.2] - 2026-11-19
 
 ### Added

@@ -207,6 +207,7 @@ impl Palette {
             item("Rollback transaction", "txn_rollback"),
             item("Kill session (results row)", "kill_session"),
             item("Bookmark current SQL", "bookmark_sql"),
+            item("Manage bookmarks…", "manage_bookmarks"),
             item("Save SQL to queries/", "save_query"),
             item("Sync queries push (git)", "sync_queries_push"),
             item("Sync queries pull (git)", "sync_queries_pull"),
@@ -1148,7 +1149,7 @@ pub fn render_open_folder(frame: &mut Frame, screen: Rect, input: &str) {
 }
 
 /// Centered settings editor (mono, same family as other modals).
-pub fn render_settings_modal(frame: &mut Frame, screen: Rect, draft: &str) {
+pub fn render_settings_modal(frame: &mut Frame, screen: Rect, draft: &str, cursor: usize) {
     let width = screen.width.min(78).max(48);
     let height = screen.height.min(20).max(12);
     let x = screen.x + (screen.width.saturating_sub(width)) / 2;
@@ -1193,10 +1194,44 @@ pub fn render_settings_modal(frame: &mut Frame, screen: Rect, draft: &str) {
         )),
         inner[1],
     );
+    let cursor = cursor.min(draft.chars().count());
+    let (cur_line, cur_col) = {
+        let prefix: String = draft.chars().take(cursor).collect();
+        let line = prefix.matches('\n').count();
+        let col = prefix.rsplit('\n').next().map(|s| s.chars().count()).unwrap_or(0);
+        (line, col)
+    };
+    let view_h = inner[2].height as usize;
+    let scroll = cur_line.saturating_sub(view_h.saturating_sub(1));
     let lines: Vec<Line> = draft
         .lines()
-        .take(inner[2].height as usize)
-        .map(|l| Line::from(Span::styled(format!("  {l}"), theme::style_text())))
+        .enumerate()
+        .skip(scroll)
+        .take(view_h)
+        .map(|(li, l)| {
+            if li != cur_line {
+                return Line::from(Span::styled(format!("  {l}"), theme::style_text()));
+            }
+            let mut spans = vec![Span::styled("  ", theme::style_text())];
+            let chars: Vec<char> = l.chars().collect();
+            let col = cur_col.min(chars.len());
+            if col > 0 {
+                let before: String = chars[..col].iter().collect();
+                spans.push(Span::styled(before, theme::style_text()));
+            }
+            let caret = chars.get(col).copied().unwrap_or(' ');
+            spans.push(Span::styled(
+                caret.to_string(),
+                theme::style_text().add_modifier(Modifier::REVERSED),
+            ));
+            if col < chars.len() {
+                let after: String = chars[col + 1..].iter().collect();
+                if !after.is_empty() {
+                    spans.push(Span::styled(after, theme::style_text()));
+                }
+            }
+            Line::from(spans)
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(theme::surface_2())),
@@ -1211,9 +1246,11 @@ pub fn render_settings_modal(frame: &mut Frame, screen: Rect, draft: &str) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("  type to edit · ", theme::style_faint()),
+            Span::styled("  ←→ Home/End · ", theme::style_faint()),
             Span::styled("Enter", theme::style_pill_off()),
-            Span::styled(" save   ", theme::style_faint()),
+            Span::styled(" newline · ", theme::style_faint()),
+            Span::styled("Ctrl-S", theme::style_pill_off()),
+            Span::styled(" save · ", theme::style_faint()),
             Span::styled("Esc", theme::style_pill_off()),
             Span::styled(" cancel", theme::style_faint()),
         ])),
