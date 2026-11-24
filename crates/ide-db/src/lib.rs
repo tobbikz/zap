@@ -5654,14 +5654,17 @@ impl DbWorkspace {
         }
         let elapsed_ms = start.elapsed().as_millis();
         let (schema, table) = parse_select_target(statements.last().map(|s| s.as_str()).unwrap_or(""));
-        let pks = if let (Some(ref sch), Some(ref tbl)) = (&schema, &table) {
-            self.fetch_primary_keys(&source_id, sch, tbl)
-                .await
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        last = last.with_meta(schema, table, pks);
+        // Never attach table meta to a still-headerless result (#43).
+        if !last.columns.is_empty() {
+            let pks = if let (Some(ref sch), Some(ref tbl)) = (&schema, &table) {
+                self.fetch_primary_keys(&source_id, sch, tbl)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            last = last.with_meta(schema, table, pks);
+        }
         // Mask display after meta so original_rows stay plaintext for Apply (#59).
         if self.persona.mask_pii {
             last = mask_result(&last);
@@ -5746,7 +5749,20 @@ impl DbWorkspace {
                 .await
                 .unwrap_or(0);
             self.query_backend_pid.store(pid, Ordering::Relaxed);
-            let result = exec_pg_conn(&mut *conn, exec_sql).await;
+            let mut result = exec_pg_conn(&mut *conn, exec_sql).await;
+            // Empty SELECT → 0 rows still needs column metadata (#43).
+            if let Ok(ref mut q) = result {
+                if q.columns.is_empty() && is_query(exec_sql) {
+                    if let Ok(stmt) = conn.prepare(exec_sql).await {
+                        q.columns = stmt
+                            .columns()
+                            .iter()
+                            .map(|c| c.name().to_string())
+                            .collect();
+                        q.affected = Some(0);
+                    }
+                }
+            }
             self.query_backend_pid.store(0, Ordering::Relaxed);
             return result;
         }
@@ -10921,33 +10937,31 @@ impl DbWorkspace {
         Ok(())
     }
 
-    /// Kill the session/process identified by the current results cursor row.
-    pub async fn kill_session_at_cursor(&mut self) -> Result<()> {
-        let Some(result) = &self.last_result else {
-            bail!("open Admin → Sessions/Processlist first");
-        };
-        let pid_col = result
-            .columns
-            .iter()
-            .position(|c| {
-                let l = c.to_ascii_lowercase();
-                l == "pid"
-                    || l == "id"
-                    || l == "session_id"
-                    || l == "spid"
-                    || l == "query_id"
-            })
-            .context("no pid/session_id column in results")?;
+    /// Pid/session id under the Results cursor (Admin grid), if any.
+    pub fn peek_kill_session_pid(&self) -> Option<String> {
+        let result = self.last_result.as_ref()?;
+        let pid_col = result.columns.iter().position(|c| {
+            let l = c.to_ascii_lowercase();
+            l == "pid" || l == "id" || l == "session_id" || l == "spid" || l == "query_id"
+        })?;
         let pid = result
             .rows
-            .get(result.cursor_row)
-            .and_then(|r| r.get(pid_col))
-            .cloned()
-            .context("no row selected")?;
-        let pid = pid.trim().to_string();
+            .get(result.cursor_row)?
+            .get(pid_col)?
+            .trim()
+            .to_string();
         if pid.is_empty() || pid == "NULL" {
-            bail!("invalid pid");
+            None
+        } else {
+            Some(pid)
         }
+    }
+
+    /// Kill the session/process identified by the current results cursor row.
+    pub async fn kill_session_at_cursor(&mut self) -> Result<()> {
+        let pid = self
+            .peek_kill_session_pid()
+            .context("open Admin → Sessions/Processlist and select a pid row")?;
         let Some(source_id) = self.active_source.clone() else {
             bail!("no active source");
         };

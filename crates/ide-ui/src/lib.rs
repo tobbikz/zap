@@ -2602,6 +2602,9 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     if db.select_limit > 0 {
         secondary.push(format!("lim {}", db.select_limit));
     }
+    if db.query_timeout_secs > 0 {
+        secondary.push(format!("to {}s", db.query_timeout_secs));
+    }
     if !db.results_filter.trim().is_empty() {
         secondary.push(format!("/{}", db.results_filter.trim()));
     }
@@ -3491,6 +3494,8 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("w  o", "WHERE · ORDER BY"),
             ("y  Y", "yank cell · row"),
             ("a", "apply Changes"),
+            ("Esc", "cancel running query (not kill)"),
+            ("K", "kill session at cursor (confirm)"),
             ("Shift-T", "cycle theme"),
         ],
         Focus::Editor => &[
@@ -3649,31 +3654,31 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
         ],
         DbSurface::Studio => vec![
             Line::from(Span::styled(
-                "1–4 panes · Tab cycle · f fullscreen",
+                "1–4 panes · Tab cycle · f fullscreen · Esc Home",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Explorer: Enter open · d Go to DDL · n Create menu",
+                "Explorer: Enter open · d DDL · n Create · e edit conn",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Table data: w WHERE · o ORDER BY · Enter apply",
+                "Results: Enter inspect · a / Ctrl-S apply · w/o WHERE/ORDER",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Super-⇧A Search Everywhere · Super-` Terminal",
+                "Esc cancel running query · K kill session (confirm)",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Super-⇧O Hierarchy · F7 Debug · Super-⇧F Search",
+                "F5 run · Ctrl-E explain · Ctrl-` terminal · Alt-L lim",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Ctrl+arrows resize focused pane · Esc Home",
+                "Ctrl-P palette · Ctrl-Shift-A search · b/s/o db·schema·table",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "F5 run · b/s/o db·schema·table · Alt-L lim · D density",
+                "Ctrl+arrows resize pane · D density · Space discover",
                 theme::style_muted(),
             )),
             Line::from(""),
@@ -3957,19 +3962,18 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             }
         }
         HomePane::Recents => {
-            let hist = ctx.db.map(|d| d.history.as_slice()).unwrap_or(&[]);
-            if hist.is_empty() {
+            let tables = ctx.db.map(|d| d.recent_tables.as_slice()).unwrap_or(&[]);
+            if !tables.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    "  No recent queries yet",
+                    "  Tables",
                     theme::style_faint(),
                 )));
-            } else {
-                let newest: Vec<_> = hist.iter().rev().take(6).collect();
+                let newest: Vec<_> = tables.iter().take(6).collect();
                 let rsel = ctx
                     .ui
                     .home_recent_selected
                     .min(newest.len().saturating_sub(1));
-                for (i, entry) in newest.iter().enumerate() {
+                for (i, key) in newest.iter().enumerate() {
                     let style = if i == rsel {
                         Style::default()
                             .fg(theme::text())
@@ -3977,8 +3981,50 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     } else {
                         theme::style_text()
                     };
-                    let sql = truncate_chars(entry.sql.trim(), 52);
-                    lines.push(Line::from(Span::styled(format!(" ▸ {sql}"), style)));
+                    // key = source|schema|table
+                    let label = key
+                        .rsplit('|')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let label = if label.is_empty() {
+                        truncate_chars(key, 52)
+                    } else {
+                        truncate_chars(&label, 52)
+                    };
+                    lines.push(Line::from(Span::styled(format!(" ▸ {label}"), style)));
+                }
+            } else {
+                let hist = ctx.db.map(|d| d.history.as_slice()).unwrap_or(&[]);
+                if hist.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  No recent tables or queries yet",
+                        theme::style_faint(),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "  Queries",
+                        theme::style_faint(),
+                    )));
+                    let newest: Vec<_> = hist.iter().rev().take(6).collect();
+                    let rsel = ctx
+                        .ui
+                        .home_recent_selected
+                        .min(newest.len().saturating_sub(1));
+                    for (i, entry) in newest.iter().enumerate() {
+                        let style = if i == rsel {
+                            Style::default()
+                                .fg(theme::text())
+                                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                        } else {
+                            theme::style_text()
+                        };
+                        let sql = truncate_chars(entry.sql.trim(), 52);
+                        lines.push(Line::from(Span::styled(format!(" ▸ {sql}"), style)));
+                    }
                 }
             }
         }

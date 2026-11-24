@@ -202,6 +202,25 @@ impl App {
         self.set_status(msg, false);
     }
 
+    fn cycle_query_timeout(&mut self) {
+        const PRESETS: &[u64] = &[30, 60, 120, 300, 600, 0];
+        let cur = self.db.query_timeout_secs;
+        let next = PRESETS
+            .iter()
+            .position(|&p| p == cur)
+            .map(|i| PRESETS[(i + 1) % PRESETS.len()])
+            .unwrap_or(120);
+        self.db.query_timeout_secs = next;
+        self.config.database.query_timeout_secs = next;
+        let _ = self.config.save();
+        let msg = if next == 0 {
+            "query timeout · off".to_string()
+        } else {
+            format!("query timeout · {next}s · palette: Cycle query timeout")
+        };
+        self.set_status(msg, false);
+    }
+
     /// Ctrl+arrows — resize only the focused pane's divider.
     fn resize_focused_pane(&mut self, code: KeyCode) {
         match self.ui.focus {
@@ -1591,10 +1610,42 @@ impl App {
         self.open_db_source_at(pinned[idx].0).await;
     }
 
-    /// Home Recents: connect last source, load history SQL into console, open Studio.
+    /// Home Recents: reopen recent table, else load history SQL into Studio (#55).
     async fn home_open_recent(&mut self) {
+        if !self.db.recent_tables.is_empty() {
+            let idx = self
+                .ui
+                .home_recent_selected
+                .min(self.db.recent_tables.len().saturating_sub(1).min(5));
+            let key = self.db.recent_tables[idx].clone();
+            let parts: Vec<&str> = key.split('|').collect();
+            if parts.len() >= 3 {
+                let sid = parts[0].to_string();
+                self.set_status("connecting…", false);
+                match self.db.ensure_connected(&sid, None).await {
+                    Ok(()) => {
+                        self.db.active_source = Some(sid);
+                        let _ = self.db.save_sources();
+                        self.enter_db_studio();
+                        if self.db.jump_recent_key(&key) {
+                            self.set_status(
+                                format!("recent table · {}.{}", parts[1], parts[2]),
+                                false,
+                            );
+                        } else {
+                            self.set_status(
+                                format!("recent · {}.{} (not in explorer yet)", parts[1], parts[2]),
+                                true,
+                            );
+                        }
+                    }
+                    Err(e) => self.set_status(format!("connect: {e:#}"), true),
+                }
+                return;
+            }
+        }
         if self.db.history.is_empty() {
-            self.set_status("no recent queries", true);
+            self.set_status("no recent tables or queries", true);
             return;
         }
         let newest_first_idx = self.ui.home_recent_selected.min(5);
@@ -2947,6 +2998,13 @@ impl App {
             }
             return Ok(());
         }
+        if sql == "__kill_session__" {
+            match self.db.kill_session_at_cursor().await {
+                Ok(()) => self.set_status(self.db.status.clone(), false),
+                Err(e) => self.set_status(format!("kill: {e:#}"), true),
+            }
+            return Ok(());
+        }
         if let Some(path_s) = sql.strip_prefix("__restore_dump__") {
             let path = PathBuf::from(path_s);
             match self.db.restore_database(&path).await {
@@ -3230,10 +3288,36 @@ impl App {
     }
 
     async fn kill_session(&mut self) -> Result<()> {
-        match self.db.kill_session_at_cursor().await {
-            Ok(()) => self.set_status(self.db.status.clone(), false),
-            Err(e) => self.set_status(format!("kill: {e:#}"), true),
+        let Some(pid) = self.db.peek_kill_session_pid() else {
+            self.set_status(
+                "kill: open Admin → Sessions and select a pid row (Esc cancels the running query)",
+                true,
+            );
+            return Ok(());
+        };
+        let current = self.db.query_backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let is_current = current != 0 && pid.parse::<i64>().ok() == Some(current);
+        if is_current {
+            match self.db.kill_session_at_cursor().await {
+                Ok(()) => self.set_status(self.db.status.clone(), false),
+                Err(e) => self.set_status(format!("kill: {e:#}"), true),
+            }
+            return Ok(());
         }
+        // Foreign session — confirm (#54). Esc = cancel statement; K = kill session.
+        self.ui.confirm_apply_pending = false;
+        self.ui.confirm_delete_source_id = None;
+        self.ui.confirm_run_sql = Some("__kill_session__".into());
+        self.ui.confirm_run_source_id = None;
+        self.ui.confirm_run_database = None;
+        self.ui.confirm_delete_label = format!("session {pid}");
+        self.ui.confirm_dialog_title = " kill session ".into();
+        self.ui.confirm_action_verb = "kill".into();
+        self.ui.mode = Mode::ConfirmDeleteSource;
+        self.set_status(
+            format!("confirm kill session {pid} — Enter kill · Esc abort (Esc≠cancel query)"),
+            true,
+        );
         Ok(())
     }
 
@@ -8092,6 +8176,7 @@ impl App {
                 self.db.request_query_cancel();
                 self.set_status("cancelling query…", false);
             }
+            "cycle_query_timeout" => self.cycle_query_timeout(),
             "import_csv" => self.start_import_csv(),
             "import_json" => self.start_import_json(),
             "dump_database" => self.dump_database().await?,
@@ -8387,7 +8472,18 @@ impl App {
     }
 
     fn forward_terminal_key(&self, key: KeyEvent) -> Result<()> {
-        let term = if let Some(p) = self.agents.active_pane() {
+        // Prefer the Studio terminal when it owns focus (#145).
+        let term = if self.ui.focus == Focus::Terminal {
+            if let Some(t) = self.terminal.as_ref() {
+                t
+            } else if let Some(p) = self.agents.active_pane() {
+                p
+            } else if let Some(p) = self.sessions.active_ssh_pane() {
+                p
+            } else {
+                return Ok(());
+            }
+        } else if let Some(p) = self.agents.active_pane() {
             p
         } else if let Some(p) = self.sessions.active_ssh_pane() {
             p
@@ -8405,9 +8501,13 @@ impl App {
             KeyCode::Down => term.write_bytes(b"\x1b[B")?,
             KeyCode::Right => term.write_bytes(b"\x1b[C")?,
             KeyCode::Left => term.write_bytes(b"\x1b[D")?,
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                term.write_char(c)?;
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let b = (c.to_ascii_lowercase() as u8) & 0x1f;
+                if b != 0 {
+                    term.write_bytes(&[b])?;
+                }
             }
+            KeyCode::Char(c) => term.write_char(c)?,
             _ => {}
         }
         Ok(())
@@ -9572,7 +9672,11 @@ async fn event_loop(
                         {
                             let n_sources = app.db.sources.len();
                             let n_fav = app.db.sources.iter().filter(|s| s.pinned).count();
-                            let n_recent = app.db.history.len().min(6);
+                            let n_recent = if !app.db.recent_tables.is_empty() {
+                                app.db.recent_tables.len().min(6)
+                            } else {
+                                app.db.history.len().min(6)
+                            };
                             match key.code {
                                 KeyCode::Char('?') => {
                                     app.ui.show_help = !app.ui.show_help;
