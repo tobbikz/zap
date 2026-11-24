@@ -12,30 +12,24 @@ pub fn chart_result_n(result: &QueryResult, col_idx: Option<usize>, limit: usize
     if result.rows.is_empty() || result.columns.is_empty() {
         return None;
     }
-    let ci = col_idx.unwrap_or_else(|| first_numeric_column(result));
+    let ci = resolve_value_col(result, col_idx)?;
     let col_name = result.columns.get(ci)?;
     let values = parse_numeric_column(result, ci)?;
     if values.is_empty() {
         return None;
     }
     let limit = limit.clamp(4, 40);
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let span = (max - min).abs().max(f64::EPSILON);
-    let sparkline: String = values
-        .iter()
-        .map(|v| {
-            let t = ((v - min) / span).clamp(0.0, 1.0);
-            crate::draw_glyphs::spark_at(t)
-        })
-        .collect();
+    let nums: Vec<f64> = values.iter().map(|(_, v)| *v).collect();
+    let min = nums.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = nums.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let sparkline = downsample_spark(&nums, 48);
     let bar_w = 24usize;
     let mut bars = String::new();
-    for (i, v) in values.iter().take(limit).enumerate() {
-        let t = ((v - min) / span).clamp(0.0, 1.0);
+    for (row_idx, v) in values.iter().take(limit) {
+        let t = bar_t(*v, min, max);
         let n = (t * bar_w as f64).round() as usize;
         let bar: String = std::iter::repeat(crate::draw_glyphs::bar()).take(n).collect();
-        bars.push_str(&format!("#{i} {:<width$}  {v:.4}\n", bar, width = bar_w));
+        bars.push_str(&format!("#{row_idx} {:<width$}  {v:.4}\n", bar, width = bar_w));
     }
     let more = if values.len() > limit {
         format!("… +{} more  [ ] rows\n", values.len() - limit)
@@ -46,6 +40,68 @@ pub fn chart_result_n(result: &QueryResult, col_idx: Option<usize>, limit: usize
         "{col_name}  n={}  {min:.4}…{max:.4}\n{sparkline}\n{bars}{more}",
         values.len(),
     ))
+}
+
+/// Prefer cursor column when it is numeric; else first numeric (#119).
+fn resolve_value_col(result: &QueryResult, col_idx: Option<usize>) -> Option<usize> {
+    if let Some(ci) = col_idx {
+        if parse_numeric_column(result, ci)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return Some(ci);
+        }
+    }
+    Some(first_numeric_column(result))
+}
+
+/// Scale factor in `0..=1` for bars. Anchor at 0 when all values are ≥0 so the
+/// minimum is not forced empty; constant series get a mid bar (#119).
+fn bar_t(v: f64, min: f64, max: f64) -> f64 {
+    if (max - min).abs() < f64::EPSILON {
+        return 0.5;
+    }
+    if min >= 0.0 {
+        let span = max.max(f64::EPSILON);
+        return (v / span).clamp(0.0, 1.0);
+    }
+    if max <= 0.0 {
+        let span = (-min).max(f64::EPSILON);
+        return ((v - min) / span).clamp(0.0, 1.0);
+    }
+    let span = (max - min).abs().max(f64::EPSILON);
+    ((v - min) / span).clamp(0.0, 1.0)
+}
+
+fn downsample_spark(values: &[f64], width: usize) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    let width = width.max(1);
+    let sampled: Vec<f64> = if values.len() <= width {
+        values.to_vec()
+    } else {
+        (0..width)
+            .map(|i| {
+                let idx = (i * (values.len() - 1)) / (width - 1).max(1);
+                values[idx]
+            })
+            .collect()
+    };
+    let min = sampled.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = sampled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (max - min).abs().max(f64::EPSILON);
+    sampled
+        .iter()
+        .map(|v| {
+            let t = if (max - min).abs() < f64::EPSILON {
+                0.5
+            } else {
+                ((v - min) / span).clamp(0.0, 1.0)
+            };
+            crate::draw_glyphs::spark_at(t)
+        })
+        .collect()
 }
 
 fn first_numeric_column(result: &QueryResult) -> usize {
@@ -60,15 +116,16 @@ fn first_numeric_column(result: &QueryResult) -> usize {
     0
 }
 
-fn parse_numeric_column(result: &QueryResult, ci: usize) -> Option<Vec<f64>> {
+/// `(grid_row_idx, value)` — skips NULL/non-numeric but keeps original row (#104).
+fn parse_numeric_column(result: &QueryResult, ci: usize) -> Option<Vec<(usize, f64)>> {
     let mut out = Vec::new();
-    for row in &result.rows {
+    for (ri, row) in result.rows.iter().enumerate() {
         let cell = row.get(ci)?;
         if cell == "NULL" {
             continue;
         }
         if let Ok(v) = cell.parse::<f64>() {
-            out.push(v);
+            out.push((ri, v));
         }
     }
     if out.is_empty() {
@@ -111,7 +168,7 @@ pub fn selection_stats(result: &QueryResult, col: Option<usize>) -> String {
     let mut nums = Vec::new();
     for ci in cols {
         if let Some(vs) = parse_numeric_column(result, ci) {
-            nums.extend(vs);
+            nums.extend(vs.into_iter().map(|(_, v)| v));
         }
     }
     if nums.is_empty() {
@@ -137,25 +194,19 @@ pub fn chart_kind_n(
     col_idx: Option<usize>,
     limit: usize,
 ) -> Option<String> {
-    let ci = col_idx.unwrap_or_else(|| first_numeric_column(result));
+    let ci = resolve_value_col(result, col_idx)?;
     let col_name = result.columns.get(ci)?;
     let values = parse_numeric_column(result, ci)?;
     if values.is_empty() {
         return None;
     }
     let limit = limit.clamp(4, 40);
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let span = (max - min).abs().max(f64::EPSILON);
+    let nums: Vec<f64> = values.iter().map(|(_, v)| *v).collect();
+    let min = nums.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = nums.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     match kind {
         "line" => {
-            let spark: String = values
-                .iter()
-                .map(|v| {
-                    let t = ((v - min) / span).clamp(0.0, 1.0);
-                    crate::draw_glyphs::spark_at(t)
-                })
-                .collect();
+            let spark = downsample_spark(&nums, 48);
             Some(format!(
                 "{col_name}  n={}  {min:.4}…{max:.4}\n{spark}\n",
                 values.len()
@@ -163,7 +214,7 @@ pub fn chart_kind_n(
         }
         "pie" => {
             // Abs-normalize so mixed signs cannot make sum≈0 and OOM on ● (#103).
-            let abs: Vec<f64> = values.iter().map(|v| v.abs()).collect();
+            let abs: Vec<f64> = nums.iter().map(|v| v.abs()).collect();
             let sum: f64 = abs.iter().sum();
             if sum < f64::EPSILON {
                 return Some(format!(
@@ -172,11 +223,12 @@ pub fn chart_kind_n(
                 ));
             }
             let mut out = format!("{col_name}  n={}\n", values.len());
-            for (i, v) in abs.iter().take(limit).enumerate() {
+            let wedge = crate::draw_glyphs::pie_wedge();
+            for ((row_idx, _), v) in values.iter().zip(abs.iter()).take(limit) {
                 let pct = (v / sum) * 100.0;
                 let n = ((pct / 5.0).round() as usize).clamp(0, 20);
-                let wedge: String = std::iter::repeat('●').take(n).collect();
-                out.push_str(&format!("#{i} {pct:4.0}% {wedge}\n"));
+                let wedge_s: String = std::iter::repeat(wedge).take(n).collect();
+                out.push_str(&format!("#{row_idx} {pct:4.0}% {wedge_s}\n"));
             }
             if values.len() > limit {
                 out.push_str(&format!("… +{} more  [ ] rows\n", values.len() - limit));
@@ -191,6 +243,40 @@ pub fn chart_kind_n(
 mod tests {
     use super::*;
     use crate::QueryResult;
+
+    #[test]
+    fn bar_labels_use_grid_row_indices() {
+        let qr = QueryResult {
+            columns: vec!["n".into()],
+            rows: vec![
+                vec!["NULL".into()],
+                vec!["10".into()],
+                vec!["x".into()],
+                vec!["20".into()],
+            ],
+            ..QueryResult::empty()
+        };
+        let out = chart_result_n(&qr, Some(0), 12).expect("chart");
+        assert!(out.contains("#1 "), "{out}");
+        assert!(out.contains("#3 "), "{out}");
+        assert!(!out.contains("#0 "), "{out}");
+    }
+
+    #[test]
+    fn bar_anchors_at_zero_when_min_nonneg() {
+        let qr = QueryResult {
+            columns: vec!["n".into()],
+            rows: vec![vec!["10".into()], vec!["20".into()]],
+            ..QueryResult::empty()
+        };
+        let out = chart_result_n(&qr, Some(0), 12).expect("chart");
+        // min=10 must not be an empty bar when anchored at 0.
+        let line10 = out.lines().find(|l| l.starts_with("#0 ")).expect("row0");
+        assert!(
+            line10.contains(crate::draw_glyphs::bar()),
+            "min bar empty:\n{out}"
+        );
+    }
 
     #[test]
     fn pie_mixed_signs_near_zero_does_not_explode() {

@@ -4047,12 +4047,13 @@ impl App {
         self.set_status("editing cell · Enter apply · Esc cancel", false);
     }
 
-    /// Enter on ER sketch line `a.b --> x.y.z` jumps Explorer to a table.
+    /// Enter on ER sketch/canvas line jumps Explorer to a table (#116).
     fn try_er_navigate(&mut self) -> bool {
         let Some(result) = self.db.last_result.as_ref() else {
             return false;
         };
-        if result.source_table.as_deref() != Some("er_sketch") {
+        let src = result.source_table.as_deref();
+        if src != Some("er_sketch") && src != Some("er_canvas") {
             return false;
         }
         let Some(line) = result
@@ -4064,13 +4065,29 @@ impl App {
             return false;
         };
         let line = line.trim();
-        if line.starts_with('#') || line.is_empty() || line.starts_with('(') {
+        if line.starts_with('#')
+            || line.is_empty()
+            || line.starts_with('(')
+            || line.starts_with('═')
+            || line.starts_with('┌')
+            || line.starts_with('└')
+            || line.starts_with('├')
+            || line.starts_with('│')
+        {
             return false;
         }
+        // Prefer the parent (right) side of an edge; else treat the line as table.col.
         let target = line
-            .split_once("-->")
+            .split_once("──►")
+            .or_else(|| line.split_once("-->"))
+            .or_else(|| line.split_once("→"))
             .map(|(_, r)| r.trim())
             .unwrap_or(line);
+        let target = target
+            .split_whitespace()
+            .next()
+            .unwrap_or(target)
+            .trim_end_matches(|c| c == '(' || c == ')');
         let bits: Vec<&str> = target.split('.').collect();
         let (schema, table) = match bits.as_slice() {
             [schema, table, _col, ..] => (*schema, *table),
@@ -6120,7 +6137,8 @@ impl App {
                 if self.ui.focus == Focus::Database {
                     self.activate_db_selection(term_rows).await?;
                 } else if self.ui.focus == Focus::Structure {
-                    // ignore — Structure has no expand action
+                    // Structure shares Database keymap (Enter → ToggleOrOpen); FK jump (#93).
+                    self.structure_confirm(term_rows).await?;
                 } else if let Some(path) = self.workspace.toggle_or_open() {
                     if let Err(e) = self.open_path(path).await {
                         self.set_status(e.to_string(), true);
@@ -7273,6 +7291,13 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("chart: {e:#}"), true),
             },
+            "dismiss_chart" => {
+                if self.db.dismiss_chart() {
+                    self.set_status("chart hidden", false);
+                } else {
+                    self.set_status("no chart to hide", true);
+                }
+            }
             "toggle_results_density" => {
                 self.ui.results_compact = !self.ui.results_compact;
                 let label = if self.ui.results_compact {

@@ -38,3 +38,8 @@ pub fn spark_at(t: f64) -> char {
 pub fn spark_floor() -> char {
     spark()[0]
 }
+
+/// Pie wedge glyph — Safe/Consolas-friendly when rich blocks are off (#119).
+pub fn pie_wedge() -> char {
+    if rich_blocks() { '●' } else { '*' }
+}
