@@ -15,6 +15,7 @@ pub struct ConsoleGuard {
 }
 
 pub fn install_console() -> ConsoleGuard {
+    install_panic_hook();
     #[cfg(windows)]
     {
         ConsoleGuard {
@@ -27,6 +28,22 @@ pub fn install_console() -> ConsoleGuard {
     }
 }
 
+/// Install a panic hook that restores the terminal before printing the panic.
+/// On Windows this also leaves the alternate screen so the user gets a usable
+/// shell back instead of garbled input / wrong code page (#75).
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort: leave raw mode so the panic message is readable.
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::terminal::LeaveAlternateScreen
+        );
+        default_hook(info);
+    }));
+}
+
 pub fn apply_icons(pref: IconPref) {
     let class = theme::classify_font(&console_face());
     let glyphs = resolve_glyphs(pref, class);
@@ -36,6 +53,35 @@ pub fn apply_icons(pref: IconPref) {
     theme::set_rounded_borders(rich);
     theme::set_block_glyphs(rich);
     ide_db::set_rich_blocks(rich);
+    theme::set_truecolor(detect_truecolor());
+}
+
+/// Detect whether the terminal supports 24-bit truecolor (#74).
+/// Returns `true` on most modern terminals; `false` forces 16-color fallback.
+pub fn detect_truecolor() -> bool {
+    // COLORTERM=truecolor / 24bit is the standard signal.
+    if let Ok(ct) = std::env::var("COLORTERM") {
+        let ct = ct.to_ascii_lowercase();
+        if ct.contains("truecolor") || ct.contains("24bit") {
+            return true;
+        }
+    }
+    // Windows Terminal sets WT_SESSION and supports 24-bit natively.
+    #[cfg(windows)]
+    if std::env::var_os("WT_SESSION").is_some() {
+        return true;
+    }
+    // ConPTY / conhost without WT — legacy; fall back to 16-color only
+    // when we're actually on Windows with no other signal.
+    #[cfg(windows)]
+    {
+        return false;
+    }
+    // Linux / macOS: virtually all modern terminals support truecolor.
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 /// Kitty keyboard protocol. Conhost prints or ignores the enable sequence and then

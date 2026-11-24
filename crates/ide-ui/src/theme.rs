@@ -38,6 +38,7 @@ pub enum FontClass {
 static GLYPHS: AtomicU8 = AtomicU8::new(GlyphSet::Nerd as u8);
 static ROUNDED: AtomicBool = AtomicBool::new(true);
 static BLOCKS: AtomicBool = AtomicBool::new(true);
+static TRUECOLOR: AtomicBool = AtomicBool::new(true);
 
 pub fn set_glyph_set(set: GlyphSet) {
     GLYPHS.store(set as u8, Ordering::Relaxed);
@@ -74,6 +75,17 @@ pub fn set_block_glyphs(on: bool) {
 
 pub fn block_glyphs() -> bool {
     BLOCKS.load(Ordering::Relaxed)
+}
+
+/// Set whether the host terminal supports 24-bit truecolor (#74).
+/// When `false`, themes should degrade to 16-color ANSI.
+pub fn set_truecolor(on: bool) {
+    TRUECOLOR.store(on, Ordering::Relaxed);
+}
+
+/// `true` when the host was detected as truecolor-capable.
+pub fn truecolor() -> bool {
+    TRUECOLOR.load(Ordering::Relaxed)
 }
 
 /// Rounded corners need Cascadia / a Nerd Font. Consolas only has square box-drawing.

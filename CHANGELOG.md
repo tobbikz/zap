@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Panic hook restores terminal raw mode and alternate screen on crash; user shell stays usable (#75).
+- Windows truecolor: detect WT_SESSION / COLORTERM and enable full 24-bit palettes instead of forcing 16-color (#74).
+- Agents/Sessions Windows defaults: use `powershell`/`python`/`where.exe`/`mstsc` on Windows; `which()` checks PATHEXT (#65).
+- Default workspace avoids Downloads/Desktop/tmp; strip `\\?\` extended-length prefix from canonicalized paths (#87).
+- Clipboard copy/paste retries on transient `OpenClipboard` failures; OSC 52 fallback for SSH/WSL (#161).
+- Agents/Sessions keep current product mode (Database) instead of forcing Code; `db_agent_seed` always provides DB context when a source is connected (#90).
 - BigQuery: poll `jobComplete` until done (~60 s timeout); fix `test_data_source` pool key mismatch (#157).
 - Snowflake: `snowflake_configured` accepts env-only host/user; `output_format=csv`; CSV fallback; first-seen column order (#158).
 - Redis/Mongo/ES: `guard_writable` allows read commands; Redis keys carry type-aware `query_sql`; `open_selected_table_tab` uses it; driver-specific studio starter (#91).
