@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Terminal forwards Ctrl-* to the focused PTY; Studio terminal preferred (#145).
+- Results meta shows query timeout; palette cycles 30s…off (#50).
+- Kill session confirms foreign pids; help distinguishes Esc cancel vs K (#54).
+- Home Recents lists recent tables (fallback: queries) (#55).
+- Studio `?` help matches live keymap (no Code-only Super chords) (#39).
+- Empty SELECT keeps column headers via PG prepare; no meta on 0-col (#43).
 - MSSQL EXPLAIN streams SHOWPLAN rows and always clears SHOWPLAN_ALL (#57 #52).
 - New connections default `ssl_trust_cert` off; form labels trust as insecure (#48).
 - `split_statements` respects dollar-quotes and SQL comments (#51).
