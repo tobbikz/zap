@@ -110,11 +110,15 @@ pub async fn connect_mongo(src: &DataSource, local_port: Option<u16>) -> Result<
 }
 
 pub fn snowflake_configured(src: &DataSource) -> bool {
-    !src.host.trim().is_empty()
-        && !src.user.trim().is_empty()
-        && std::env::var("SNOWFLAKE_ACCOUNT")
+    let has_host = !src.host.trim().is_empty()
+        || std::env::var("SNOWFLAKE_ACCOUNT")
             .map(|s| !s.is_empty())
-            .unwrap_or(false)
+            .unwrap_or(false);
+    let has_user = !src.user.trim().is_empty()
+        || std::env::var("SNOWFLAKE_USER")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+    has_host && has_user
 }
 
 pub fn bigquery_configured(src: &DataSource) -> bool {
@@ -211,7 +215,7 @@ async fn exec_bigquery_rest(project: &str, sql: &str) -> Result<QueryResult> {
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .json(&body)
         .send()
         .await
@@ -221,9 +225,47 @@ async fn exec_bigquery_rest(project: &str, sql: &str) -> Result<QueryResult> {
     if !status.is_success() {
         bail!("BigQuery HTTP {status}: {text}");
     }
-    let v: serde_json::Value = serde_json::from_str(&text).context("BigQuery JSON")?;
+    let mut v: serde_json::Value = serde_json::from_str(&text).context("BigQuery JSON")?;
     // HTTP 200 can still carry a non-empty `errors[]` (partial/failed job). Fail closed (#203).
     bail_bigquery_errors(&v)?;
+    // Poll until jobComplete or ~60s timeout (#157).
+    if v.get("jobComplete").and_then(|j| j.as_bool()) == Some(false) {
+        let job_id = v
+            .pointer("/jobReference/jobId")
+            .and_then(|j| j.as_str())
+            .context("BigQuery: jobComplete=false but no jobReference.jobId")?
+            .to_string();
+        let poll_url = format!(
+            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries/{}",
+            urlencoding_lite(project),
+            urlencoding_lite(&job_id),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut delay = std::time::Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(delay).await;
+            let resp = client
+                .get(&poll_url)
+                .bearer_auth(&token)
+                .send()
+                .await
+                .context("BigQuery poll HTTP")?;
+            let status = resp.status();
+            let text = resp.text().await.context("BigQuery poll body")?;
+            if !status.is_success() {
+                bail!("BigQuery poll HTTP {status}: {text}");
+            }
+            v = serde_json::from_str(&text).context("BigQuery poll JSON")?;
+            bail_bigquery_errors(&v)?;
+            if v.get("jobComplete").and_then(|j| j.as_bool()) == Some(true) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("BigQuery job {job_id} did not complete within 60 s");
+            }
+            delay = (delay * 2).min(std::time::Duration::from_secs(4));
+        }
+    }
     let schema_fields = v
         .pointer("/schema/fields")
         .and_then(|f| f.as_array())
@@ -302,15 +344,17 @@ async fn exec_bigquery_cli(src: &DataSource, project: &str, sql: &str) -> Result
     }
     let rows_json: Vec<serde_json::Value> =
         serde_json::from_str(trimmed).context("parse bq JSON")?;
-    let mut col_set = std::collections::BTreeSet::new();
+    let mut columns: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for row in &rows_json {
         if let Some(obj) = row.as_object() {
             for k in obj.keys() {
-                col_set.insert(k.clone());
+                if seen.insert(k.clone()) {
+                    columns.push(k.clone());
+                }
             }
         }
     }
-    let columns: Vec<String> = col_set.into_iter().collect();
     let mut rows = Vec::new();
     for row in rows_json {
         let obj = row.as_object();
@@ -371,7 +415,7 @@ pub async fn exec_snowflake(src: &DataSource, sql: &str) -> Result<QueryResult> 
         "-u",
         &user,
         "-o",
-        "output_format=json",
+        "output_format=csv",
         "-o",
         "friendly=false",
         "-o",
@@ -405,17 +449,19 @@ pub async fn exec_snowflake(src: &DataSource, sql: &str) -> Result<QueryResult> 
         q.original_rows = q.rows.clone();
         return Ok(q);
     }
-    // snowsql json may be array of objects or nested
+    // snowsql may return JSON (array of objects) or CSV; try JSON first.
     if let Ok(rows_json) = serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
-        let mut col_set = std::collections::BTreeSet::new();
+        let mut columns: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for row in &rows_json {
             if let Some(obj) = row.as_object() {
                 for k in obj.keys() {
-                    col_set.insert(k.clone());
+                    if seen.insert(k.clone()) {
+                        columns.push(k.clone());
+                    }
                 }
             }
         }
-        let columns: Vec<String> = col_set.into_iter().collect();
         let mut rows = Vec::new();
         for row in rows_json {
             let obj = row.as_object();
@@ -436,8 +482,21 @@ pub async fn exec_snowflake(src: &DataSource, sql: &str) -> Result<QueryResult> 
         q.columns = columns;
         q.rows = rows;
     } else {
-        q.columns = vec!["output".into()];
-        q.rows = trimmed.lines().map(|l| vec![l.to_string()]).collect();
+        // CSV fallback: first line is headers, rest are data.
+        let mut lines = trimmed.lines();
+        if let Some(header) = lines.next() {
+            let columns: Vec<String> = header.split(',').map(|s| s.trim().to_string()).collect();
+            let mut rows = Vec::new();
+            for line in lines {
+                let cells: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
+                rows.push(cells);
+            }
+            q.columns = columns;
+            q.rows = rows;
+        } else {
+            q.columns = vec!["output".into()];
+            q.rows = trimmed.lines().map(|l| vec![l.to_string()]).collect();
+        }
     }
     q.original_rows = q.rows.clone();
     Ok(q)
@@ -757,6 +816,35 @@ fn list_keys_result(keys: Vec<String>) -> Result<QueryResult> {
     Ok(q)
 }
 
+pub fn is_mongo_read_only(line: &str) -> bool {
+    let head = line
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(head.as_str(), "find" | "count" | "ping" | "indexes")
+}
+
+/// Elasticsearch: allow GET/HEAD, or POST with `_search` in the path.
+pub fn is_es_read_only(line: &str) -> bool {
+    let line = line.trim();
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("get ") || lower.starts_with("head ") {
+        return true;
+    }
+    if lower.starts_with("post ") {
+        let rest = line[5..].trim();
+        return rest.contains("_search");
+    }
+    // Bare JSON body → implicit _search, read-only.
+    if line.starts_with('{') {
+        return true;
+    }
+    // Bare index name → _search match_all, read-only.
+    !line.contains(' ')
+}
+
 pub fn is_redis_read_only(line: &str) -> bool {
     let head = line
         .trim()
@@ -959,13 +1047,15 @@ pub async fn mongo_find(
         q.columns = vec!["_id".into()];
         return Ok(q);
     }
-    let mut col_set = std::collections::BTreeSet::new();
+    let mut columns: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for d in &docs {
         for k in d.keys() {
-            col_set.insert(k.clone());
+            if seen.insert(k.clone()) {
+                columns.push(k.clone());
+            }
         }
     }
-    let columns: Vec<String> = col_set.into_iter().collect();
     let rows: Vec<Vec<String>> = docs
         .iter()
         .map(|d| {
@@ -1059,6 +1149,14 @@ pub async fn redis_key_nodes(r: &RedisConn, source_id: &str) -> Result<Vec<DbTre
         } else {
             ttl.to_string()
         };
+        let query_sql = match ty.as_str() {
+            "hash" => Some(format!("HGETALL {key}")),
+            "list" => Some(format!("LRANGE {key} 0 -1")),
+            "set" => Some(format!("SMEMBERS {key}")),
+            "zset" => Some(format!("ZRANGE {key} 0 -1 WITHSCORES")),
+            "string" => Some(format!("GET {key}")),
+            _ => None,
+        };
         out.push(DbTreeNode {
             id: format!("{source_id}::key::{key}"),
             label: format!("{key}  [{ty} ttl={ttl_s}]"),
@@ -1067,7 +1165,7 @@ pub async fn redis_key_nodes(r: &RedisConn, source_id: &str) -> Result<Vec<DbTre
             database: None,
             schema: Some("keys".into()),
             table: Some(key),
-            query_sql: None,
+            query_sql,
             children: Vec::new(),
             expanded: false,
         });

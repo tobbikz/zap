@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- BigQuery: poll `jobComplete` until done (~60 s timeout); fix `test_data_source` pool key mismatch (#157).
+- Snowflake: `snowflake_configured` accepts env-only host/user; `output_format=csv`; CSV fallback; first-seen column order (#158).
+- Redis/Mongo/ES: `guard_writable` allows read commands; Redis keys carry type-aware `query_sql`; `open_selected_table_tab` uses it; driver-specific studio starter (#91).
+- PG ER: join FK columns via `referential_constraints` + `position_in_unique_constraint` for correct composite-FK mapping; ER source_table set to None (#98).
+- `split_sql_script`: skip `--`/`/* */` comments outside strings; backslash-quote in non-MSSQL; track string/comment state for MSSQL `GO` (#120).
+- Schema diff: reject SQLite cross-schema diff; ClickHouse single-part spec treated as database (#135).
 - Airflow/BI/model deep-links use `open_browser` (Windows/macOS/Linux) (#61 #49).
 - Results `P` cycles pinned columns (#44).
 - FEATURES: honest completions/search scope; migration preview (not dry-run) (#47 #142).
