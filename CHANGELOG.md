@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- MSSQL EXPLAIN streams SHOWPLAN rows and always clears SHOWPLAN_ALL (#57 #52).
+- New connections default `ssl_trust_cert` off; form labels trust as insecure (#48).
+- `split_statements` respects dollar-quotes and SQL comments (#51).
+- `parse_select_target` handles quoted ids / subqueries; JOIN still refuses Apply (#53).
+- Fullscreen follows focus or clears on Home / product / non-pane focus (#67).
 - Home/Workspaces open 10th+ connections by unbounded index (#79).
 - Fan-out assert queries pinned sources; tab binding restored (#88).
 - Studio Terminal forwards keys before pane chords (#86).
