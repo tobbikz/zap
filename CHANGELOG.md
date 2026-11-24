@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Results: `m` opens actions; `[`/`]` page; monitor is Shift-M (#80).
+- Host chords skip forms; Ctrl-Shift-A/O wire Search/Outline (#95).
+- Inspect Chart: ↑↓ move rows; header stays pinned (#118).
+- ClickHouse strips trailing `;` and respects explicit `FORMAT` (#66).
+- Query params: bare numbers, no Redis false positives, safer replace (#68).
+- MSSQL grid edit gets primary keys via `sys.indexes` (#60).
 - `split_sql_script` preserves SQL escaped quotes (`O''Brien`) (#97).
 - ER navigate works for canvas; jump scoped to active source Table|View; Structure `… +N more` (#116).
 - Structure Enter jumps FK targets (ToggleOrOpen → structure_confirm) (#93).
