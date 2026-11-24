@@ -1224,6 +1224,7 @@ impl App {
         self.ui.mode = Mode::Normal;
         self.ui.cell_modal = false;
         self.ui.db_monitor = false;
+        self.ui.db_fullscreen = None;
         self.db.rebuild_flat();
         self.set_status("Database Home", false);
     }
@@ -1402,12 +1403,35 @@ impl App {
         self.ui.focus = Focus::Database;
         self.ui.mode = Mode::Normal;
         self.ui.show_sidebar = true;
+        if self.ui.db_fullscreen.is_some() {
+            self.ui.db_fullscreen = Some(Focus::Database);
+        }
+    }
+
+    /// Keep fullscreen paint target aligned with the input owner (#67).
+    fn reconcile_db_fullscreen(&mut self) {
+        let Some(_) = self.ui.db_fullscreen else {
+            return;
+        };
+        if self.ui.product != ProductMode::Database || self.ui.db_surface != DbSurface::Studio {
+            self.ui.db_fullscreen = None;
+            return;
+        }
+        match self.ui.focus {
+            Focus::Database | Focus::Structure | Focus::Editor | Focus::Results => {
+                self.ui.db_fullscreen = Some(self.ui.focus);
+            }
+            _ => {
+                self.ui.db_fullscreen = None;
+            }
+        }
     }
 
     fn go_db_home(&mut self) {
         self.ui.product = ProductMode::Database;
         self.ui.db_surface = DbSurface::Home;
         self.ui.mode = Mode::Normal;
+        self.ui.db_fullscreen = None;
         self.ui.show_completions = false;
         self.ui.completions.clear();
         self.clear_db_sql_all_selected();
@@ -6902,6 +6926,7 @@ impl App {
                 Err(e) => self.set_status(format!("rollback txn: {e:#}"), true),
             },
         }
+        self.reconcile_db_fullscreen();
         Ok(())
     }
 
@@ -8436,7 +8461,7 @@ fn parse_postgres_url(url: &str) -> Result<DataSource> {
         ssh_port: 22,
         ssh_key: String::new(),
         ssl_mode: "prefer".into(),
-        ssl_trust_cert: true,
+        ssl_trust_cert: false,
         ssl_ca: String::new(),
         read_only: false,
         role: ide_db::SourceRole::Admin,

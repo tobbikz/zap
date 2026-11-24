@@ -68,7 +68,7 @@ impl ConnField {
             Self::Database => "Database",
             Self::File => "File",
             Self::SslMode => "SSL mode",
-            Self::SslTrustCert => "Trust cert",
+            Self::SslTrustCert => "Trust server certificate (insecure)",
             Self::SslCa => "SSL CA",
             Self::ReadOnly => "Read-only",
             Self::Role => "Role",
@@ -164,7 +164,7 @@ impl Default for DbConnectForm {
             database: String::new(),
             file: String::new(),
             ssl_mode: "prefer".into(),
-            ssl_trust_cert: true,
+            ssl_trust_cert: false,
             ssl_ca: String::new(),
             read_only: false,
             role: SourceRole::Admin,
@@ -571,7 +571,7 @@ impl DbConnectForm {
             ConnField::SslMode => self.ssl_mode.clone(),
             ConnField::SslTrustCert => {
                 if self.ssl_trust_cert {
-                    "yes".into()
+                    "yes ⚠ insecure".into()
                 } else {
                     "no".into()
                 }

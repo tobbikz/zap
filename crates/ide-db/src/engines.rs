@@ -180,6 +180,45 @@ pub async fn exec_mssql(client: &Arc<Mutex<MssqlClient>>, sql: &str) -> Result<Q
     }
 }
 
+/// SHOWPLAN on a dedicated path: always clear the session flag (#57 #52).
+pub async fn exec_mssql_showplan(
+    client: &Arc<Mutex<MssqlClient>>,
+    stmt: &str,
+) -> Result<QueryResult> {
+    let stmt = stmt.trim();
+    if stmt.is_empty() {
+        bail!("empty SQL");
+    }
+    let mut c = client.lock().await;
+    c.execute("SET SHOWPLAN_ALL ON", &[])
+        .await
+        .context("mssql SHOWPLAN_ALL ON")?;
+    let plan = async {
+        let stream = c
+            .simple_query(stmt)
+            .await
+            .context("mssql SHOWPLAN query")?;
+        let rows = stream
+            .into_first_result()
+            .await
+            .context("mssql SHOWPLAN rows")?;
+        Ok::<_, anyhow::Error>(rows_from_mssql(&rows))
+    }
+    .await;
+    let off = c
+        .execute("SET SHOWPLAN_ALL OFF", &[])
+        .await
+        .context("mssql SHOWPLAN_ALL OFF");
+    match (plan, off) {
+        (Ok(qr), Ok(_)) => Ok(qr),
+        (Ok(_), Err(e)) => Err(e).context("plan ok but failed to clear SHOWPLAN_ALL"),
+        (Err(e), Ok(_)) => Err(e),
+        (Err(e), Err(off_err)) => Err(e).context(format!(
+            "also failed to clear SHOWPLAN_ALL: {off_err:#}"
+        )),
+    }
+}
+
 fn rows_from_mssql(rows: &[tiberius::Row]) -> QueryResult {
     if rows.is_empty() {
         return QueryResult::empty();

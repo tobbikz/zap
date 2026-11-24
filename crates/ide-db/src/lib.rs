@@ -175,8 +175,8 @@ pub struct DataSource {
     /// Postgres/MySQL/ClickHouse: `disable` · `prefer` · `require` · `verify-full`
     #[serde(default = "default_ssl_mode")]
     pub ssl_mode: String,
-    /// MSSQL: trust server certificate (default true for Docker/dev).
-    #[serde(default = "default_true")]
+    /// MSSQL / HTTP TLS: trust server certificate (opt-in; insecure).
+    #[serde(default)]
     pub ssl_trust_cert: bool,
     /// Optional PEM CA for verify modes (Postgres/MySQL/ClickHouse).
     #[serde(default)]
@@ -200,10 +200,6 @@ pub struct DataSource {
 
 fn default_ssl_mode() -> String {
     "prefer".into()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_ssh_port() -> u16 {
@@ -231,7 +227,7 @@ impl DataSource {
             ssh_port: 22,
             ssh_key: String::new(),
             ssl_mode: default_ssl_mode(),
-            ssl_trust_cert: true,
+            ssl_trust_cert: false,
             ssl_ca: String::new(),
             read_only: false,
             role: SourceRole::default(),
@@ -3464,6 +3460,11 @@ impl DbWorkspace {
             )));
             if !src.ssl_mode.is_empty() {
                 lines.push(StructureLine::item(format!("ssl      {}", src.ssl_mode)));
+            }
+            if src.ssl_trust_cert {
+                lines.push(StructureLine::item(
+                    "trust cert yes ⚠ insecure (Trust server certificate)",
+                ));
             }
         }
         if !src.ssh_host.is_empty() {
@@ -7039,7 +7040,7 @@ impl DbWorkspace {
     }
 
     pub async fn explain_sql(&mut self) -> Result<()> {
-        let stmt = split_first_statement(self.sql.trim()).to_string();
+        let stmt = split_first_statement(self.sql.trim());
         self.explain_sql_text(&stmt).await
     }
 
@@ -7054,19 +7055,28 @@ impl DbWorkspace {
         let database = self.active_database.clone();
         self.ensure_connected(&source_id, database.as_deref())
             .await?;
-        let src = self
+        let driver = self
             .sources
             .iter()
             .find(|s| s.id == source_id)
-            .context("missing source")?;
-        let explain = match src.driver {
+            .context("missing source")?
+            .driver;
+        let key = Self::pool_key(&source_id, database.as_deref());
+        // MSSQL SHOWPLAN uses a dedicated path so the plan is query-streamed and
+        // SHOWPLAN_ALL is always cleared (#57 #52).
+        if matches!(driver, DbDriver::Mssql) {
+            let client = match self.pools.get(&key).context("not connected")? {
+                LivePool::Mssql(c) => c.clone(),
+                _ => bail!("mssql pool missing"),
+            };
+            let result = engines::exec_mssql_showplan(&client, stmt).await?;
+            return self.finish_explain_result(driver, result);
+        }
+        let explain = match driver {
             DbDriver::Postgres => format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {stmt}"),
             DbDriver::Mysql => format!("EXPLAIN {stmt}"),
             DbDriver::Sqlite | DbDriver::Duckdb => format!("EXPLAIN {stmt}"),
-            // SHOWPLAN_ALL → tabular plan rows in Results.
-            DbDriver::Mssql => {
-                format!("SET SHOWPLAN_ALL ON; {stmt}; SET SHOWPLAN_ALL OFF;")
-            }
+            DbDriver::Mssql => unreachable!("mssql explain handled above"),
             DbDriver::Clickhouse => format!("EXPLAIN PLAN {stmt}"),
             DbDriver::Redis
             | DbDriver::Mongo
@@ -7074,30 +7084,37 @@ impl DbWorkspace {
             | DbDriver::Bigquery
             | DbDriver::Elasticsearch
             | DbDriver::Trino => {
-                bail!("EXPLAIN not supported for {}", src.driver.label());
+                bail!("EXPLAIN not supported for {}", driver.label());
             }
         };
-        let key = Self::pool_key(&source_id, database.as_deref());
-        let pool = self.pools.get(&key).context("not connected")?;
-        let result = match pool {
-            LivePool::Pg(p) => exec_pg(p, &explain).await?,
-            LivePool::Mysql(p) => exec_mysql(p, &explain).await?,
-            LivePool::Sqlite(p) => exec_sqlite(p, &explain).await?,
-            LivePool::Mssql(c) => engines::exec_mssql(c, &explain).await?,
-            LivePool::Clickhouse(c) => engines::exec_clickhouse(c, &explain, None).await?,
-            LivePool::Duckdb(d) => alt_engines::exec_duckdb(d, &explain).await?,
-            LivePool::Redis(r) => alt_engines::exec_redis(r, &explain).await?,
-            LivePool::Mongo(m) => alt_engines::exec_mongo(m, &explain, database.as_deref()).await?,
-            LivePool::CloudStub(d) => bail!(alt_engines::cloud_not_configured_message(*d)),
-            LivePool::Http(_) => bail!("EXPLAIN not supported for HTTP engines"),
+        let result = {
+            let pool = self.pools.get(&key).context("not connected")?;
+            match pool {
+                LivePool::Pg(p) => exec_pg(p, &explain).await?,
+                LivePool::Mysql(p) => exec_mysql(p, &explain).await?,
+                LivePool::Sqlite(p) => exec_sqlite(p, &explain).await?,
+                LivePool::Mssql(_) => bail!("mssql explain handled above"),
+                LivePool::Clickhouse(c) => engines::exec_clickhouse(c, &explain, None).await?,
+                LivePool::Duckdb(d) => alt_engines::exec_duckdb(d, &explain).await?,
+                LivePool::Redis(r) => alt_engines::exec_redis(r, &explain).await?,
+                LivePool::Mongo(m) => {
+                    alt_engines::exec_mongo(m, &explain, database.as_deref()).await?
+                }
+                LivePool::CloudStub(d) => bail!(alt_engines::cloud_not_configured_message(*d)),
+                LivePool::Http(_) => bail!("EXPLAIN not supported for HTTP engines"),
+            }
         };
+        self.finish_explain_result(driver, result)
+    }
+
+    fn finish_explain_result(&mut self, driver: DbDriver, result: QueryResult) -> Result<()> {
         let text = if result.columns.is_empty() {
             "(empty plan)".into()
         } else {
             let mut lines = Vec::new();
             // Header for non-PG engines so the plan reads clearly in Results.
-            if !matches!(src.driver, DbDriver::Postgres) {
-                lines.push(format!("── EXPLAIN · {} ──", src.driver.label()));
+            if !matches!(driver, DbDriver::Postgres) {
+                lines.push(format!("── EXPLAIN · {} ──", driver.label()));
                 if !result.columns.is_empty() {
                     lines.push(result.columns.join(" │ "));
                     lines.push("─".repeat(result.columns.join(" │ ").len().min(72)));
@@ -7109,7 +7126,7 @@ impl DbWorkspace {
             lines.join("\n")
         };
         self.last_explain = Some(text.clone());
-        let structured = if src.driver == DbDriver::Postgres {
+        let structured = if driver == DbDriver::Postgres {
             explain_format::postgres_explain_grid(&text)
         } else {
             None
@@ -7130,7 +7147,7 @@ impl DbWorkspace {
         let view = if is_structured {
             "structured"
         } else {
-            match src.driver {
+            match driver {
                 DbDriver::Mysql => "mysql",
                 DbDriver::Sqlite => "sqlite",
                 DbDriver::Duckdb => "duckdb",
@@ -8685,36 +8702,112 @@ fn parse_paste_grid(text: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn split_first_statement(sql: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    for (i, c) in sql.char_indices() {
-        match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            ';' if !in_single && !in_double => return sql[..i].trim(),
-            _ => {}
-        }
-    }
-    sql.trim()
+fn split_first_statement(sql: &str) -> String {
+    split_statements(sql)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| sql.trim().to_string())
 }
 
+/// Split on `;` outside strings, dollar-quotes, and SQL comments (#51).
 fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
     let mut in_single = false;
     let mut in_double = false;
-    for c in sql.chars() {
+    let mut dollar_tag: Option<String> = None;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if let Some(ref tag) = dollar_tag {
+            let tag_chars: Vec<char> = tag.chars().collect();
+            if c == '$' && chars[i..].starts_with(&tag_chars) {
+                for ch in &tag_chars {
+                    cur.push(*ch);
+                }
+                i += tag_chars.len();
+                dollar_tag = None;
+                continue;
+            }
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            cur.push(c);
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    cur.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            cur.push(c);
+            if c == '"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // -- line comment (keep text; do not split on ';')
+        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
+            while i < chars.len() && chars[i] != '\n' {
+                cur.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // /* block comment */
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            cur.push(c);
+            cur.push(chars[i + 1]);
+            i += 2;
+            while i < chars.len() {
+                cur.push(chars[i]);
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    cur.push('/');
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Postgres dollar-quote: $tag$ … $tag$
+        if c == '$' {
+            if let Some(tag) = parse_dollar_tag(&chars, i) {
+                for ch in tag.chars() {
+                    cur.push(ch);
+                }
+                i += tag.chars().count();
+                dollar_tag = Some(tag);
+                continue;
+            }
+        }
+
         match c {
-            '\'' if !in_double => {
-                in_single = !in_single;
+            '\'' => {
+                in_single = true;
                 cur.push(c);
             }
-            '"' if !in_single => {
-                in_double = !in_double;
+            '"' => {
+                in_double = true;
                 cur.push(c);
             }
-            ';' if !in_single && !in_double => {
+            ';' => {
                 let t = cur.trim().to_string();
                 if !t.is_empty() {
                     out.push(t);
@@ -8723,6 +8816,7 @@ fn split_statements(sql: &str) -> Vec<String> {
             }
             _ => cur.push(c),
         }
+        i += 1;
     }
     let t = cur.trim().to_string();
     if !t.is_empty() {
@@ -8731,40 +8825,89 @@ fn split_statements(sql: &str) -> Vec<String> {
     out
 }
 
-/// Best-effort single-table `FROM schema.table` extractor for SELECT.
-/// Returns `(None, None)` for JOIN / multi-FROM so Apply cannot invent wrong UPDATEs (#73).
+fn parse_dollar_tag(chars: &[char], start: usize) -> Option<String> {
+    if start >= chars.len() || chars[start] != '$' {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    if end < chars.len() && chars[end] == '$' {
+        Some(chars[start..=end].iter().collect())
+    } else {
+        None
+    }
+}
+
+/// Best-effort primary `FROM` relation for Structure follow / editable meta.
+/// Returns `(None, None)` for subqueries, JOIN / multi-FROM (#73), or no FROM (#53).
 fn parse_select_target(sql: &str) -> (Option<String>, Option<String>) {
-    let lower = sql.to_ascii_lowercase();
+    let cleaned = strip_sql_comments(sql);
+    let lower = cleaned.to_ascii_lowercase();
     let Some(idx) = lower.find(" from ") else {
         return (None, None);
     };
-    // Byte index is safe: the matched needle is ASCII and lower keeps UTF-8 layout.
-    let Some(after) = sql.get(idx + 6..) else {
+    let Some(after) = cleaned.get(idx + 6..) else {
         return (None, None);
     };
     let after = after.trim_start();
-    let token = after
-        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .next()
-        .unwrap_or("")
-        .trim_matches('"')
-        .trim_matches('`');
-    if token.is_empty() {
+    if after.starts_with('(') {
+        // Subquery / table expression — Structure follow unavailable.
         return (None, None);
     }
-    // Multi-table / JOIN — refuse editable provenance (#73).
-    let rest = after.get(token.len()..).unwrap_or("");
+    let (schema, table, rest) = take_relation_name(after);
+    let Some(table) = table.filter(|t| !t.is_empty()) else {
+        return (None, None);
+    };
     if from_list_has_second_table(rest) {
         return (None, None);
     }
-    if let Some((schema, table)) = token.split_once('.') {
-        (
-            Some(schema.trim_matches('"').trim_matches('`').to_string()),
-            Some(table.trim_matches('"').trim_matches('`').to_string()),
-        )
-    } else {
-        (None, Some(token.to_string()))
+    (schema, Some(table))
+}
+
+/// Parse `schema.table` / quoted `"Account Service"."Accounts"` / `` `db`.`t` `` / `[s].[t]`.
+fn take_relation_name(s: &str) -> (Option<String>, Option<String>, &str) {
+    let Some((first, n1)) = take_sql_ident(s) else {
+        return (None, None, s);
+    };
+    let after1 = &s[n1..];
+    if let Some(rest) = after1.strip_prefix('.') {
+        if let Some((second, n2)) = take_sql_ident(rest) {
+            return (Some(first), Some(second), &rest[n2..]);
+        }
     }
+    (None, Some(first), after1)
+}
+
+fn take_sql_ident(s: &str) -> Option<(String, usize)> {
+    let trimmed = s.trim_start();
+    let lead = s.len() - trimmed.len();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let (name, consumed) = match bytes[0] {
+        b'"' | b'`' => {
+            let q = bytes[0];
+            let end = trimmed[1..].find(q as char)? + 1;
+            (trimmed[1..end].to_string(), end + 1)
+        }
+        b'[' => {
+            let end = trimmed[1..].find(']')? + 1;
+            (trimmed[1..end].to_string(), end + 1)
+        }
+        _ => {
+            let end = trimmed
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(trimmed.len());
+            if end == 0 {
+                return None;
+            }
+            (trimmed[..end].to_string(), end)
+        }
+    };
+    Some((name, lead + consumed))
 }
 
 fn from_list_has_second_table(after_first: &str) -> bool {
@@ -12106,7 +12249,7 @@ fn parse_postgres_url(url: &str) -> Option<DataSource> {
         ssh_port: 22,
         ssh_key: String::new(),
         ssl_mode: default_ssl_mode(),
-        ssl_trust_cert: true,
+        ssl_trust_cert: false,
         ssl_ca: String::new(),
         read_only: false,
         role: SourceRole::Admin,
@@ -12377,6 +12520,39 @@ mod dba_engines_tests {
             parse_select_target("SELECT * FROM public.users WHERE id = 1"),
             (Some("public".into()), Some("users".into()))
         );
+    }
+
+    #[test]
+    fn parse_select_target_quoted_and_subquery() {
+        assert_eq!(
+            parse_select_target(
+                r#"SELECT * FROM "Account Service"."Accounts" WHERE id = 1"#
+            ),
+            (
+                Some("Account Service".into()),
+                Some("Accounts".into())
+            )
+        );
+        assert_eq!(
+            parse_select_target("SELECT * FROM (SELECT 1) t"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_select_target("SELECT * FROM public.users AS u WHERE u.id = 1"),
+            (Some("public".into()), Some("users".into()))
+        );
+    }
+
+    #[test]
+    fn split_statements_respects_dollar_quotes_and_comments() {
+        let stmts = split_statements(
+            "DO $$ BEGIN PERFORM 1; END $$; SELECT 1; -- ignore; me\nSELECT 2 /* ; */;",
+        );
+        assert_eq!(stmts.len(), 3, "{stmts:?}");
+        assert!(stmts[0].starts_with("DO $$"));
+        assert!(stmts[0].contains("PERFORM 1;"));
+        assert_eq!(stmts[1], "SELECT 1");
+        assert!(stmts[2].contains("SELECT 2"));
     }
 }
 
