@@ -49,6 +49,78 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+/// Clipboard set with retry for transient `OpenClipboard` failures on Windows (#161).
+fn clipboard_set_text(text: String) -> Result<(), arboard::Error> {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// Clipboard get with retry for transient `OpenClipboard` failures on Windows (#161).
+fn clipboard_get_text() -> Result<String, arboard::Error> {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// Write text via OSC 52 escape (remote/SSH clipboard fallback) (#161).
+fn osc52_set_clipboard(text: &str) {
+    use std::io::Write;
+    let encoded = base64_encode(text.as_bytes());
+    // OSC 52 ; c ; <base64> ST
+    let esc = format!("\x1b]52;c;{encoded}\x07");
+    let _ = std::io::stdout().write_all(esc.as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Try arboard first; fall back to OSC 52 on failure (SSH/WSL) (#161).
+fn clipboard_set_or_osc52(text: &str) {
+    match clipboard_set_text(text.to_string()) {
+        Ok(()) => {}
+        Err(_) => osc52_set_clipboard(text),
+    }
+}
+
 pub struct App {
     workspace: Workspace,
     buffers: BufferSet,
@@ -1714,7 +1786,7 @@ impl App {
             return;
         };
         let text = if cell == "NULL" { "" } else { cell.as_str() };
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
+        match clipboard_set_text(text.to_string()) {
             Ok(()) => {
                 let preview = if text.is_empty() {
                     "NULL".into()
@@ -1743,7 +1815,7 @@ impl App {
             .map(|c| if c == "NULL" { "" } else { c.as_str() })
             .collect::<Vec<_>>()
             .join("\t");
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+        match clipboard_set_text(text.clone()) {
             Ok(()) => self.set_status(
                 format!("copied row · {} cols TSV", row.len()),
                 false,
@@ -1774,7 +1846,7 @@ impl App {
             n += 1;
         }
         let text = lines.join("\n");
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        match clipboard_set_text(text) {
             Ok(()) => self.set_status(
                 if filt.is_empty() {
                     format!("copied all · {n} rows TSV")
@@ -1803,18 +1875,16 @@ impl App {
             self.set_status("yank: unnamed register empty (\"\" )", true);
             return Ok(());
         }
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
-            Ok(()) => self.set_status(
-                format!("yank → host clipboard ({} chars)", text.chars().count()),
-                false,
-            ),
-            Err(e) => self.set_status(format!("clipboard set: {e}"), true),
-        }
+        clipboard_set_or_osc52(&text);
+        self.set_status(
+            format!("yank → host clipboard ({} chars)", text.chars().count()),
+            false,
+        );
         Ok(())
     }
 
     async fn paste_host_clipboard_to_nvim(&mut self) -> Result<()> {
-        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+        let text = match clipboard_get_text() {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(format!("clipboard get: {e}"), true);
@@ -2224,7 +2294,7 @@ impl App {
             self.set_status("copy: nothing to copy", true);
             return;
         };
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+        match clipboard_set_text(text.clone()) {
             Ok(()) => self.set_status(
                 format!("copied {} chars", text.chars().count()),
                 false,
@@ -2333,7 +2403,7 @@ impl App {
     }
 
     fn clipboard_paste_sql_or_editor(&mut self) {
-        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+        let text = match clipboard_get_text() {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(format!("clipboard: {e}"), true);
@@ -3966,10 +4036,8 @@ impl App {
         self.agent_form_field_mut().pop();
     }
 
+    /// Always provide DB context to agents when a source is connected (#90).
     fn db_agent_seed(&self) -> Option<String> {
-        if self.ui.product != ProductMode::Database {
-            return None;
-        }
         let sid = self.db.active_source.as_ref()?;
         let src = self.db.sources.iter().find(|s| &s.id == sid)?;
         let schema = ""; // keep generic — explorer selection optional later
@@ -6840,14 +6908,7 @@ impl App {
                 }
             }
             Action::OpenSessions => {
-                // Home dashboard has no sidebar — jump to Editor chrome so Sessions list is visible.
-                if self.ui.product != ProductMode::Code {
-                    self.ui.product = ProductMode::Code;
-                }
-                if self.ui.code_surface != CodeSurface::Editor {
-                    self.ui.code_surface = CodeSurface::Editor;
-                    self.last_code_surface = CodeSurface::Editor;
-                }
+                // Keep current product mode — don't switch to Code (#90).
                 self.ui.mode = Mode::Normal;
                 self.ui.sidebar = Sidebar::Sessions;
                 self.ui.focus = Focus::Sessions;
@@ -6941,13 +7002,7 @@ impl App {
                 };
             }
             Action::OpenAgents => {
-                if self.ui.product != ProductMode::Code {
-                    self.ui.product = ProductMode::Code;
-                }
-                if self.ui.code_surface != CodeSurface::Editor {
-                    self.ui.code_surface = CodeSurface::Editor;
-                    self.last_code_surface = CodeSurface::Editor;
-                }
+                // Keep current product mode — don't switch to Code (#90).
                 self.ui.mode = Mode::Normal;
                 self.ui.sidebar = Sidebar::Agents;
                 self.ui.focus = Focus::Agents;
@@ -8405,9 +8460,7 @@ impl App {
                 self.set_status("terminal · Ctrl-` toggle", false);
             }
             "sessions" => {
-                self.ui.product = ProductMode::Code;
-                self.ui.code_surface = CodeSurface::Editor;
-                self.last_code_surface = CodeSurface::Editor;
+                // Keep current product mode — don't force Code (#90).
                 self.ui.mode = Mode::Normal;
                 self.ui.sidebar = Sidebar::Sessions;
                 self.ui.focus = Focus::Sessions;
@@ -8417,9 +8470,7 @@ impl App {
                 self.set_status("Sessions · Enter connect · a/A add", false);
             }
             "agents" => {
-                self.ui.product = ProductMode::Code;
-                self.ui.code_surface = CodeSurface::Editor;
-                self.last_code_surface = CodeSurface::Editor;
+                // Keep current product mode — don't force Code (#90).
                 self.ui.mode = Mode::Normal;
                 self.ui.sidebar = Sidebar::Agents;
                 self.ui.focus = Focus::Agents;

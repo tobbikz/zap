@@ -385,8 +385,10 @@ pub fn default_profiles() -> Vec<AgentProfile> {
     let mut ask = AgentProfile::new("Ask → SQL (confirm)", AgentKind::Cursor);
     ask.seed_prompt = "Write a SELECT for this schema. Show SQL only; I will confirm before run.\n".into();
 
+    let shell = if cfg!(windows) { "powershell" } else { "bash" };
+
     let mut jupyter = AgentProfile::new("Python / Jupyter REPL", AgentKind::Custom);
-    jupyter.binary = "python3".into();
+    jupyter.binary = if cfg!(windows) { "python".into() } else { "python3".into() };
     jupyter.seed_prompt = "import pandas as pd\n# load Studio CSV exports from explore_packs/\n".into();
 
     let mut marimo = AgentProfile::new("Marimo notebook", AgentKind::Custom);
@@ -394,20 +396,35 @@ pub fn default_profiles() -> Vec<AgentProfile> {
     marimo.args = vec!["edit".into()];
 
     let mut dbt = AgentProfile::new("dbt shell", AgentKind::Custom);
-    dbt.binary = "bash".into();
-    dbt.args = vec!["-lc".into(), "dbt --help; exec bash".into()];
+    dbt.binary = shell.into();
+    dbt.args = if cfg!(windows) {
+        vec!["-Command".into(), "dbt --help; Read-Host".into()]
+    } else {
+        vec!["-lc".into(), "dbt --help; exec bash".into()]
+    };
 
     let mut mlflow = AgentProfile::new("MLOps mlflow", AgentKind::Custom);
-    mlflow.binary = "bash".into();
-    mlflow.args = vec!["-lc".into(), "mlflow --help || echo install mlflow; exec bash".into()];
+    mlflow.binary = shell.into();
+    mlflow.args = if cfg!(windows) {
+        vec!["-Command".into(), "mlflow --help; Read-Host".into()]
+    } else {
+        vec!["-lc".into(), "mlflow --help || echo install mlflow; exec bash".into()]
+    };
     mlflow.seed_prompt = "# Model registry / scoring — no secrets in seed\n".into();
 
     let mut infer = AgentProfile::new("Inference health curl", AgentKind::Custom);
-    infer.binary = "bash".into();
-    infer.args = vec![
-        "-lc".into(),
-        "echo 'curl -sf $INFERENCE_URL/health || echo set INFERENCE_URL'; bash".into(),
-    ];
+    infer.binary = shell.into();
+    infer.args = if cfg!(windows) {
+        vec![
+            "-Command".into(),
+            "curl -sf $env:INFERENCE_URL/health; if (!$?) { echo 'set INFERENCE_URL' }".into(),
+        ]
+    } else {
+        vec![
+            "-lc".into(),
+            "echo 'curl -sf $INFERENCE_URL/health || echo set INFERENCE_URL'; bash".into(),
+        ]
+    };
 
     vec![
         AgentProfile::new("Cursor Agent", AgentKind::Cursor),
@@ -457,15 +474,31 @@ fn load_file(path: &Path) -> Result<AgentsFile> {
 }
 
 fn which(name: &str) -> Option<PathBuf> {
-    if name.contains('/') {
+    if name.contains('/') || name.contains('\\') {
         let p = PathBuf::from(name);
         return p.is_file().then_some(p);
     }
     let path = std::env::var_os("PATH")?;
+    // On Windows, check PATHEXT extensions (.exe, .cmd, etc.) (#65).
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .map(|e| e.to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
     for dir in std::env::split_paths(&path) {
         let c = dir.join(name);
         if c.is_file() {
             return Some(c);
+        }
+        for ext in &extensions {
+            let with_ext = dir.join(format!("{name}{ext}"));
+            if with_ext.is_file() {
+                return Some(with_ext);
+            }
         }
     }
     None
