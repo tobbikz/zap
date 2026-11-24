@@ -73,7 +73,8 @@ Desktop IDEs (DataGrip, DBeaver, Azure Data Studio, …) remain excellent for he
 - Multi-tab SQL · pin · rename · close (`Ctrl-W`) · new tab  
 - Run / cancel · lim default 50 · database / schema chips  
 - Format SQL · bookmarks · query history palette  
-- Completions / object search everywhere  
+- Console SQL completions · Explorer object search (Ctrl-P / Ctrl-Shift-A) — not IDE-wide Search Everywhere  
+ 
 - Fan-out SQL to pinned ★ connections  
 - Transactions · kill session (where driver allows)  
 
@@ -102,7 +103,8 @@ Desktop IDEs (DataGrip, DBeaver, Azure Data Studio, …) remain excellent for he
 
 ## Migrations & schema ops
 
-- Dry-run migration file  
+- Preview migration statements (split only — not executed / not DB-validated)  
+ 
 - Apply migration file  
 - Migration status  
 - Rollback last migration  

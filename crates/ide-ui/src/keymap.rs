@@ -167,6 +167,8 @@ pub enum Action {
     ExportSql,
     ImportCsv,
     KillSession,
+    /// Results: cycle pinned leading columns (#44).
+    TogglePinColumns,
     BookmarkSql,
     DumpDatabase,
     RestoreDump,
@@ -610,6 +612,7 @@ impl Keymap {
                 }
                 (true, false, KeyCode::Char('`')) => Some(Action::OpenTerminal),
                 (false, false, KeyCode::Char('K')) => Some(Action::KillSession),
+                (false, false, KeyCode::Char('P')) => Some(Action::TogglePinColumns),
                 (false, false, KeyCode::Char('a')) => Some(Action::ApplyRowUpdates),
                 (false, false, KeyCode::Char('u')) => Some(Action::Undo),
                 (false, false, KeyCode::Char('w')) => Some(Action::EditTableWhere),

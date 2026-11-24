@@ -78,7 +78,7 @@ impl Palette {
             item("View wide / blob cell", "view_wide_cell"),
             item("Paste TSV into results…", "paste_tsv"),
             item("Undo last cell edit", "undo_cell_edit"),
-            item("Dry-run migration file", "migrate_dry_run"),
+            item("Preview migration statements", "migrate_dry_run"),
             item("Apply migration file…", "migrate_apply"),
             item("Migration status", "migrate_status"),
             item("Rollback last migration", "migrate_rollback"),

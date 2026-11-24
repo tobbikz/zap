@@ -1,6 +1,15 @@
 # Install zap on Windows to %LOCALAPPDATA%\zap
 # Prefers the GitHub release binary; builds from source if that asset is missing.
 $ErrorActionPreference = "Stop"
+# irm … | iex leaves $PSScriptRoot empty — fail clearly instead of Resolve-Path noise (#69).
+if (-not $PSScriptRoot) {
+  Write-Error @"
+PSScriptRoot is empty (common with irm|iex).
+Download the release: https://github.com/tobbikz/zap/releases/latest/download/zap-windows-x86_64.exe
+Or clone the repo and run: .\scripts\install.ps1
+"@
+  exit 1
+}
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
 $DestDir = Join-Path $env:LOCALAPPDATA "zap"
