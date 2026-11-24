@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Home/Workspaces open 10th+ connections by unbounded index (#79).
+- Fan-out assert queries pinned sources; tab binding restored (#88).
+- Studio Terminal forwards keys before pane chords (#86).
+- DB Home: Tab cycles Connections/Recents/Favorites + health badges (#78).
+- Connect form scrolls to focused SSH fields (#96).
+- MSSQL cells render uuid/decimal/date/bytes (not silent NULL) (#56).
 - Results: `m` opens actions; `[`/`]` page; monitor is Shift-M (#80).
 - Host chords skip forms; Ctrl-Shift-A/O wire Search/Outline (#95).
 - Inspect Chart: ↑↓ move rows; header stays pinned (#118).

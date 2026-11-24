@@ -3832,9 +3832,9 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         area,
     );
 
-    // Brand lives in the header — body shows connections (DataGrip-like) + A/W tips.
     let sources = ctx.db.map(|d| d.sources.as_slice()).unwrap_or(&[]);
     let active = ctx.db.and_then(|d| d.active_source.as_deref());
+    let health = ctx.db.map(|d| &d.connection_health);
     let n = sources.len();
     let sel = if n == 0 {
         0
@@ -3842,62 +3842,145 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         ctx.ui.home_selected.min(n.saturating_sub(1))
     };
 
-    // Tips live only in the footer — avoid duplicating Enter/A/W in the body.
     let col = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(4)])
         .margin(2)
         .split(area);
 
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(
-            "Connections",
-            theme::style_muted().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-
-    if sources.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No connections yet — A to add",
-            theme::style_faint(),
-        )));
-    } else {
-        for (i, src) in sources.iter().enumerate() {
-            let is_sel = i == sel;
-            let is_active = active == Some(src.id.as_str());
-            let mark = if is_active { "●" } else { "○" };
-            let where_ = match src.driver {
-                ide_db::DbDriver::Sqlite => {
-                    if src.file.is_empty() {
-                        "sqlite".into()
-                    } else {
-                        truncate_chars(&src.file, 36)
-                    }
-                }
-                _ => {
-                    if src.database.is_empty() {
-                        format!("{}:{}", src.host, src.port)
-                    } else {
-                        format!("{}:{}/{}", src.host, src.port, src.database)
-                    }
-                }
-            };
-            let label = format!(
-                " {mark} {} · {} · {where_}",
-                src.name,
-                src.driver.label()
-            );
-            let style = if is_sel {
+    // Pane tabs: Connections · Recents · Favorites (#78).
+    let pane = ctx.ui.home_pane;
+    let tab = |label: &str, on: bool| -> Span<'static> {
+        if on {
+            Span::styled(
+                format!(" {label} "),
                 Style::default()
-                    .fg(theme::text())
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else if is_active {
-                theme::style_text().add_modifier(Modifier::BOLD)
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {label} "), theme::style_faint())
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            tab("Connections", pane == HomePane::Sources),
+            Span::styled(" · ", theme::style_faint()),
+            tab("Recents", pane == HomePane::Recents),
+            Span::styled(" · ", theme::style_faint()),
+            tab("Favorites", pane == HomePane::Favorites),
+            Span::styled("  (Tab)", theme::style_faint()),
+        ])),
+        col[0],
+    );
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match pane {
+        HomePane::Sources => {
+            if sources.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  No connections yet — A to add",
+                    theme::style_faint(),
+                )));
             } else {
-                theme::style_text()
-            };
-            lines.push(Line::from(Span::styled(label, style)));
+                for (i, src) in sources.iter().enumerate() {
+                    let is_sel = i == sel;
+                    let is_active = active == Some(src.id.as_str());
+                    let mark = if is_active { "●" } else { "○" };
+                    let badge = match health.and_then(|h| h.get(&src.id)) {
+                        Some(ide_db::ConnHealth::Ok { .. }) => " ✓",
+                        Some(ide_db::ConnHealth::Dead(_)) => " ✗",
+                        Some(ide_db::ConnHealth::Stale { .. }) => " ~",
+                        None => "",
+                    };
+                    let where_ = match src.driver {
+                        ide_db::DbDriver::Sqlite => {
+                            if src.file.is_empty() {
+                                "sqlite".into()
+                            } else {
+                                truncate_chars(&src.file, 36)
+                            }
+                        }
+                        _ => {
+                            if src.database.is_empty() {
+                                format!("{}:{}", src.host, src.port)
+                            } else {
+                                format!("{}:{}/{}", src.host, src.port, src.database)
+                            }
+                        }
+                    };
+                    let label = format!(
+                        " {mark}{} {} · {} · {where_}",
+                        badge,
+                        src.name,
+                        src.driver.label()
+                    );
+                    let style = if is_sel {
+                        Style::default()
+                            .fg(theme::text())
+                            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    } else if is_active {
+                        theme::style_text().add_modifier(Modifier::BOLD)
+                    } else {
+                        theme::style_text()
+                    };
+                    lines.push(Line::from(Span::styled(label, style)));
+                }
+            }
+        }
+        HomePane::Favorites => {
+            let pinned: Vec<_> = sources.iter().filter(|s| s.pinned).collect();
+            if pinned.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  No favorites — pin a source with p in Explorer",
+                    theme::style_faint(),
+                )));
+            } else {
+                let fsel = ctx
+                    .ui
+                    .home_favorite_selected
+                    .min(pinned.len().saturating_sub(1));
+                for (i, src) in pinned.iter().enumerate() {
+                    let style = if i == fsel {
+                        Style::default()
+                            .fg(theme::text())
+                            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    } else {
+                        theme::style_text()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!(" ★ {} · {}", src.name, src.driver.label()),
+                        style,
+                    )));
+                }
+            }
+        }
+        HomePane::Recents => {
+            let hist = ctx.db.map(|d| d.history.as_slice()).unwrap_or(&[]);
+            if hist.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  No recent queries yet",
+                    theme::style_faint(),
+                )));
+            } else {
+                let newest: Vec<_> = hist.iter().rev().take(6).collect();
+                let rsel = ctx
+                    .ui
+                    .home_recent_selected
+                    .min(newest.len().saturating_sub(1));
+                for (i, entry) in newest.iter().enumerate() {
+                    let style = if i == rsel {
+                        Style::default()
+                            .fg(theme::text())
+                            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    } else {
+                        theme::style_text()
+                    };
+                    let sql = truncate_chars(entry.sql.trim(), 52);
+                    lines.push(Line::from(Span::styled(format!(" ▸ {sql}"), style)));
+                }
+            }
         }
     }
 
