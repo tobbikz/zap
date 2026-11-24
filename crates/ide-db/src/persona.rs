@@ -318,19 +318,25 @@ pub fn quality_strip(result: &QueryResult) -> String {
 
 pub fn chart_typed(result: &QueryResult, kind: &str, value_col: Option<usize>, label_col: Option<usize>) -> Result<String> {
     let kind = kind.to_ascii_lowercase();
-    let vci = value_col.unwrap_or_else(|| first_numeric(result).unwrap_or(0));
-    let values = parse_nums(result, vci).context("no numeric column")?;
-    let labels: Vec<String> = (0..values.len())
-        .map(|i| {
+    // Prefer cursor/value col when numeric; else first numeric (#119).
+    let vci = value_col
+        .filter(|&ci| parse_nums(result, ci).is_some())
+        .or_else(|| first_numeric(result))
+        .unwrap_or(0);
+    let pairs = parse_nums(result, vci).context("no numeric column")?;
+    let values: Vec<f64> = pairs.iter().map(|(_, v)| *v).collect();
+    let labels: Vec<String> = pairs
+        .iter()
+        .map(|(ri, _)| {
             if let Some(lci) = label_col {
                 result
                     .rows
-                    .get(i)
+                    .get(*ri)
                     .and_then(|r| r.get(lci))
                     .cloned()
-                    .unwrap_or_else(|| (i + 1).to_string())
+                    .unwrap_or_else(|| format!("#{ri}"))
             } else {
-                (i + 1).to_string()
+                format!("#{ri}")
             }
         })
         .collect();
@@ -346,15 +352,16 @@ fn first_numeric(result: &QueryResult) -> Option<usize> {
     (0..result.columns.len()).find(|&ci| parse_nums(result, ci).is_some())
 }
 
-fn parse_nums(result: &QueryResult, ci: usize) -> Option<Vec<f64>> {
+/// `(grid_row_idx, value)` — keep original row when NULL cells are skipped (#104).
+fn parse_nums(result: &QueryResult, ci: usize) -> Option<Vec<(usize, f64)>> {
     let mut out = Vec::new();
-    for row in &result.rows {
+    for (ri, row) in result.rows.iter().enumerate() {
         let cell = row.get(ci)?;
         if cell == "NULL" {
             continue;
         }
         if let Ok(v) = cell.parse::<f64>() {
-            out.push(v);
+            out.push((ri, v));
         }
     }
     if out.is_empty() {
@@ -364,13 +371,25 @@ fn parse_nums(result: &QueryResult, ci: usize) -> Option<Vec<f64>> {
     }
 }
 
+fn bar_t(v: f64, min: f64, max: f64) -> f64 {
+    if (max - min).abs() < f64::EPSILON {
+        return 0.5;
+    }
+    if min >= 0.0 {
+        return (v / max.max(f64::EPSILON)).clamp(0.0, 1.0);
+    }
+    if max <= 0.0 {
+        return ((v - min) / (-min).max(f64::EPSILON)).clamp(0.0, 1.0);
+    }
+    ((v - min) / (max - min).abs().max(f64::EPSILON)).clamp(0.0, 1.0)
+}
+
 fn render_bar(col: &str, labels: &[String], values: &[f64]) -> String {
     let min = values.iter().copied().fold(f64::INFINITY, f64::min);
     let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let span = (max - min).abs().max(f64::EPSILON);
     let mut out = format!("Bar chart · {col}\n");
     for (i, v) in values.iter().take(16).enumerate() {
-        let n = (((v - min) / span) * 28.0).round() as usize;
+        let n = (bar_t(*v, min, max) * 28.0).round() as usize;
         let bar: String = std::iter::repeat(crate::draw_glyphs::bar()).take(n).collect();
         let lab = labels.get(i).map(|s| s.as_str()).unwrap_or("?");
         out.push_str(&format!(" {lab:>12} │{bar:<28} {v:.4}\n"));
@@ -379,17 +398,22 @@ fn render_bar(col: &str, labels: &[String], values: &[f64]) -> String {
 }
 
 fn render_line(col: &str, labels: &[String], values: &[f64]) -> String {
-    let spark = crate::draw_glyphs::spark();
     let min = values.iter().copied().fold(f64::INFINITY, f64::min);
     let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let span = (max - min).abs().max(f64::EPSILON);
-    let line: String = values
-        .iter()
-        .map(|v| {
-            let t = ((v - min) / span).clamp(0.0, 1.0);
-            spark[(t * (spark.len() - 1) as f64).round() as usize]
-        })
-        .collect();
+    let width = 48usize.min(values.len().max(1));
+    let line: String = if values.len() <= width {
+        values
+            .iter()
+            .map(|v| crate::draw_glyphs::spark_at(bar_t(*v, min, max)))
+            .collect()
+    } else {
+        (0..width)
+            .map(|i| {
+                let idx = (i * (values.len() - 1)) / (width - 1).max(1);
+                crate::draw_glyphs::spark_at(bar_t(values[idx], min, max))
+            })
+            .collect()
+    };
     format!(
         "Line chart · {col}\n  {}\n  labels: {}\n  min={min:.4} max={max:.4}\n",
         line,
@@ -404,10 +428,11 @@ fn render_pie(col: &str, labels: &[String], values: &[f64]) -> String {
         return format!("Pie chart · {col}\n (pie: |sum|≈0 — cannot chart)\n");
     }
     let mut out = format!("Pie chart · {col} (share %)\n");
+    let wedge_ch = crate::draw_glyphs::pie_wedge();
     for (i, v) in abs.iter().take(12).enumerate() {
         let pct = (v / sum) * 100.0;
         let n = ((pct / 5.0).round() as usize).clamp(0, 20);
-        let wedge: String = std::iter::repeat('●').take(n).collect();
+        let wedge: String = std::iter::repeat(wedge_ch).take(n).collect();
         let lab = labels.get(i).map(|s| s.as_str()).unwrap_or("?");
         out.push_str(&format!(" {lab:>12} {pct:5.1}% {wedge}\n"));
     }

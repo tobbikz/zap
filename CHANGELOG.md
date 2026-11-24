@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- `split_sql_script` preserves SQL escaped quotes (`O''Brien`) (#97).
+- ER navigate works for canvas; jump scoped to active source Table|View; Structure `… +N more` (#116).
+- Structure Enter jumps FK targets (ToggleOrOpen → structure_confirm) (#93).
+- Charts: anchor bars at 0, respect cursor col, Safe pie glyphs, downsample sparklines (#119).
+- Chart `#row` labels keep grid indices when NULLs are skipped (#104).
+- Results reserves height for inline chart; `m` → Hide chart (#105).
 - Postgres ER/FK: join on `constraint_schema`; cross-schema edges keep `schema.table` (#114).
 - SQLite ER: escape PRAGMA idents; resolve NULL `to` to parent PK (#107).
 - ER canvas draws all schema tables, not only FK participants (#106).

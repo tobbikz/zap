@@ -2699,7 +2699,16 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         .filter(|(_, row)| ide_db::row_matches_filter(row, &filter))
         .map(|(i, _)| i)
         .collect();
-    let body_h = grid_area.height.saturating_sub(2) as usize;
+    // Reserve space for the inline chart so it isn't clipped under a full grid (#105).
+    let chart_h = result
+        .chart
+        .as_ref()
+        .map(|c| c.lines().count().min(8).saturating_add(1))
+        .unwrap_or(0);
+    let body_h = grid_area
+        .height
+        .saturating_sub(2)
+        .saturating_sub(chart_h as u16) as usize;
     let visible_rows = (body_h / row_stride).max(1);
     let cursor_in_filtered = filtered_idx
         .iter()
@@ -3477,7 +3486,7 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
         Focus::Results => &[
             ("Ctrl-P", "command palette"),
             ("Ctrl-W", "close SQL tab"),
-            ("m", "actions · export · copy · page"),
+            ("m", "actions · export · copy · page · hide chart"),
             ("Enter", "inspect · Plan · Chart"),
             ("w  o", "WHERE · ORDER BY"),
             ("y  Y", "yank cell · row"),
@@ -3495,7 +3504,7 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("Alt-L", "cycle SELECT limit"),
             ("Shift-T", "cycle theme"),
         ],
-        Focus::Database | Focus::Structure => &[
+        Focus::Database => &[
             ("Ctrl-P", "command palette"),
             ("Ctrl-W", "close SQL tab"),
             ("Enter", "open / expand"),
@@ -3503,6 +3512,16 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("d", "Go to DDL"),
             ("n", "Create…"),
             ("e", "edit connection"),
+            ("Shift-T", "cycle theme"),
+        ],
+        Focus::Structure => &[
+            ("Ctrl-P", "command palette"),
+            ("Ctrl-W", "close SQL tab"),
+            ("Enter", "FK jump / open"),
+            ("↑↓", "move"),
+            ("b  s  o", "database · schema · table"),
+            ("d", "Go to DDL"),
+            ("Tab", "cycle focus"),
             ("Shift-T", "cycle theme"),
         ],
         _ => &[
@@ -3516,7 +3535,8 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
     let scope = match ui.focus {
         Focus::Results => "Results",
         Focus::Editor => "Console",
-        Focus::Database | Focus::Structure => "Explorer",
+        Focus::Database => "Explorer",
+        Focus::Structure => "Structure",
         _ => "Studio",
     };
 
@@ -4142,10 +4162,10 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
             ("Tab", "focus"),
         ],
         Focus::Structure => vec![
+            ("Enter", "FK jump"),
             ("↑↓", "move"),
             ("b/s/o", "db·schema·table"),
             ("Tab", "focus"),
-            ("Esc", "home"),
         ],
         Focus::Editor => vec![
             ("i", "insert"),

@@ -2216,7 +2216,7 @@ impl DbWorkspace {
         let Some(table) = e.table.clone() else {
             return;
         };
-        if table == "er_sketch" || table == "wide_cell" {
+        if table == "er_sketch" || table == "er_canvas" || table == "wide_cell" {
             return;
         }
         self.last_table_sel = Some((e.source_id.clone(), e.database.clone(), schema, table));
@@ -3757,8 +3757,12 @@ impl DbWorkspace {
         // Wave 4/5: ER sketch + canvas for the active schema (best-effort).
         if let Ok(sketch) = self.er_sketch_for_schema(source_id, database, schema).await {
             lines.push(StructureLine::section("ER"));
+            let sketch_n = sketch.lines().count();
             for line in sketch.lines().take(40) {
                 lines.push(StructureLine::ddl(line.to_string()));
+            }
+            if sketch_n > 40 {
+                lines.push(StructureLine::ddl(format!("… +{} more", sketch_n - 40)));
             }
             let edges = parse_er_edges(&sketch);
             let table_names: Vec<String> = self
@@ -3770,8 +3774,12 @@ impl DbWorkspace {
                 .collect();
             let canvas = render_er_canvas(schema, &table_names, &edges);
             lines.push(StructureLine::section("ER CANVAS"));
+            let canvas_n = canvas.lines().count();
             for line in canvas.lines().take(60) {
                 lines.push(StructureLine::ddl(line.to_string()));
+            }
+            if canvas_n > 60 {
+                lines.push(StructureLine::ddl(format!("… +{} more", canvas_n - 60)));
             }
         }
         self.structure_lines = lines;
@@ -6221,36 +6229,32 @@ impl DbWorkspace {
     }
 
     /// Jump explorer selection to `schema.table` (best-effort, case-insensitive).
+    /// Scoped to `active_source` and Table|View nodes only (#116).
     pub fn jump_to_table(&mut self, schema: &str, table: &str) -> bool {
-        if let Some(idx) = self.flat.iter().position(|e| {
-            e.table
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case(table))
+        let active = self.active_source.clone();
+        let idx = self.flat.iter().position(|e| {
+            matches!(e.kind, DbNodeKind::Table | DbNodeKind::View)
+                && e.table
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(table))
                 && (schema.is_empty()
                     || e.schema
                         .as_deref()
                         .is_some_and(|s| s.eq_ignore_ascii_case(schema)))
-        }) {
-            self.selected = idx;
-            if let Some(sid) = self.flat.get(idx).map(|e| e.source_id.clone()) {
-                self.active_source = Some(sid);
-            }
-            self.note_explorer_table_sel();
-            true
-        } else if let Some(idx) = self.flat.iter().position(|e| {
-            e.table
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case(table))
-        }) {
-            self.selected = idx;
-            if let Some(sid) = self.flat.get(idx).map(|e| e.source_id.clone()) {
-                self.active_source = Some(sid);
-            }
-            self.note_explorer_table_sel();
-            true
-        } else {
-            false
+                && active
+                    .as_ref()
+                    .map(|a| a == &e.source_id)
+                    .unwrap_or(true)
+        });
+        let Some(idx) = idx else {
+            return false;
+        };
+        self.selected = idx;
+        if let Some(sid) = self.flat.get(idx).map(|e| e.source_id.clone()) {
+            self.active_source = Some(sid);
         }
+        self.note_explorer_table_sel();
+        true
     }
 
     /// Jump using a recent-tables key `source|schema|table`.
@@ -6326,7 +6330,9 @@ impl DbWorkspace {
         let Some(result) = self.last_result.as_mut() else {
             bail!("no results to chart");
         };
-        let chart = chart_result(result, col_idx).context("no numeric column to chart")?;
+        // Prefer cursor column when the caller didn't pick one (#119).
+        let col = col_idx.or(Some(result.cursor_col));
+        let chart = chart_result(result, col).context("no numeric column to chart")?;
         result.chart = Some(chart.clone());
         Ok(chart)
     }
@@ -6335,9 +6341,22 @@ impl DbWorkspace {
         let Some(result) = self.last_result.as_mut() else {
             bail!("no results to chart");
         };
-        let chart = chart_typed(result, kind, None, None)?;
+        let col = Some(result.cursor_col);
+        let chart = chart_typed(result, kind, col, None)?;
         result.chart = Some(chart.clone());
         Ok(chart)
+    }
+
+    /// Clear inline `result.chart` overlay (#105).
+    pub fn dismiss_chart(&mut self) -> bool {
+        let Some(result) = self.last_result.as_mut() else {
+            return false;
+        };
+        if result.chart.is_none() {
+            return false;
+        }
+        result.chart = None;
+        true
     }
 
     pub fn toggle_mask_pii(&mut self) -> bool {
@@ -6847,7 +6866,7 @@ impl DbWorkspace {
         let (source_id, database, schema, table) = picked
             .or_else(|| self.last_table_sel.clone())
             .context("select a table in Explorer first (views / result fallbacks are blocked)")?;
-        if table == "er_sketch" || table == "wide_cell" {
+        if table == "er_sketch" || table == "er_canvas" || table == "wide_cell" {
             bail!("synthetic result tables cannot be vacuumed");
         }
         let driver = self
@@ -11575,7 +11594,8 @@ fn split_sql_script(text: &str, mssql: bool) -> Vec<String> {
             current.push(c);
         } else if c == '\'' && in_string {
             if chars.peek() == Some(&'\'') {
-                current.push('\'');
+                // Preserve SQL escaped quotes — `'O''Brien'` must stay intact (#97).
+                current.push_str("''");
                 chars.next();
             } else {
                 in_string = false;
@@ -12048,32 +12068,44 @@ fn looks_like_ddl(sql: &str) -> bool {
 pub fn parse_er_edges(sketch: &str) -> Vec<(String, String, String, String)> {
     let mut edges = Vec::new();
     for line in sketch.lines() {
-        if let Some((left, right)) = line.split_once("-->") {
-            let lb: Vec<&str> = left.trim().split('.').collect();
-            let rb: Vec<&str> = right.trim().split('.').collect();
-            // Support `table.col` or `schema.table.col` on either side (#114).
-            if lb.len() >= 2 && rb.len() >= 2 {
-                let (from_t, from_c) = if lb.len() >= 3 {
-                    (
-                        format!("{}.{}", lb[lb.len() - 3], lb[lb.len() - 2]),
-                        lb[lb.len() - 1].to_string(),
-                    )
-                } else {
-                    (lb[0].to_string(), lb[1].to_string())
-                };
-                let (to_t, to_c) = if rb.len() >= 3 {
-                    (
-                        format!("{}.{}", rb[rb.len() - 3], rb[rb.len() - 2]),
-                        rb[rb.len() - 1].to_string(),
-                    )
-                } else {
-                    (
-                        rb[rb.len() - 2].to_string(),
-                        rb[rb.len() - 1].to_string(),
-                    )
-                };
-                edges.push((from_t, from_c, to_t, to_c));
-            }
+        let Some((left, right)) = line
+            .split_once("-->")
+            .or_else(|| line.split_once("──►"))
+            .or_else(|| line.split_once("→"))
+        else {
+            continue;
+        };
+        // Canvas lines look like `orders.user_id ──N:1──► users.id  (FK)` (#116).
+        let left = left.split("──").next().unwrap_or(left).trim();
+        let right = right
+            .split_whitespace()
+            .next()
+            .unwrap_or(right.trim())
+            .trim();
+        let lb: Vec<&str> = left.split('.').collect();
+        let rb: Vec<&str> = right.split('.').collect();
+        // Support `table.col` or `schema.table.col` on either side (#116 / #114).
+        if lb.len() >= 2 && rb.len() >= 2 {
+            let (from_t, from_c) = if lb.len() >= 3 {
+                (
+                    format!("{}.{}", lb[lb.len() - 3], lb[lb.len() - 2]),
+                    lb[lb.len() - 1].to_string(),
+                )
+            } else {
+                (lb[0].to_string(), lb[1].to_string())
+            };
+            let (to_t, to_c) = if rb.len() >= 3 {
+                (
+                    format!("{}.{}", rb[rb.len() - 3], rb[rb.len() - 2]),
+                    rb[rb.len() - 1].to_string(),
+                )
+            } else {
+                (
+                    rb[rb.len() - 2].to_string(),
+                    rb[rb.len() - 1].to_string(),
+                )
+            };
+            edges.push((from_t, from_c, to_t, to_c));
         }
     }
     edges
@@ -12551,6 +12583,22 @@ mod bookmark_dedupe_tests {
         assert!(ws.status.contains("dropped"), "{}", ws.status);
         assert_eq!(ws.bookmarks.last().map(|s| s.as_str()), Some("SELECT 999;"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod split_sql_script_tests {
+    use super::split_sql_script;
+
+    #[test]
+    fn preserves_escaped_quotes_inside_strings() {
+        let stmts = split_sql_script("INSERT INTO t VALUES ('O''Brien'); SELECT 1;", false);
+        assert_eq!(stmts.len(), 2);
+        assert!(
+            stmts[0].contains("O''Brien"),
+            "got {:?}",
+            stmts[0]
+        );
     }
 }
 
