@@ -1964,6 +1964,26 @@ impl DbWorkspace {
                 src.name
             );
         }
+        if src.driver == DbDriver::Mongo {
+            if alt_engines::is_mongo_read_only(sql) {
+                return Ok(());
+            }
+            bail!(
+                "{} \"{}\" — MongoDB: find/count/ping/indexes only",
+                if src.read_only { "read-only" } else { "viewer" },
+                src.name
+            );
+        }
+        if src.driver == DbDriver::Elasticsearch {
+            if alt_engines::is_es_read_only(sql) {
+                return Ok(());
+            }
+            bail!(
+                "{} \"{}\" — Elasticsearch: GET/HEAD or POST _search only",
+                if src.read_only { "read-only" } else { "viewer" },
+                src.name
+            );
+        }
         if is_read_only_sql(sql) {
             return Ok(());
         }
@@ -2471,14 +2491,20 @@ impl DbWorkspace {
             }
             return;
         }
-        let (name, _driver) = self
+        let (name, driver) = self
             .active_source
             .as_ref()
             .and_then(|id| self.sources.iter().find(|s| &s.id == id))
-            .map(|s| (s.name.as_str(), s.driver.label()))
-            .unwrap_or(("database", "SQL"));
+            .map(|s| (s.name.as_str(), s.driver))
+            .unwrap_or(("database", DbDriver::Postgres));
+        let starter = match driver {
+            DbDriver::Redis => "PING",
+            DbDriver::Mongo => "ping",
+            DbDriver::Elasticsearch => "GET /",
+            _ => "SELECT 1 AS ok;",
+        };
         self.sql = format!(
-            "-- {name}\nSELECT 1 AS ok;\n"
+            "-- {name}\n{starter}\n"
         );
         if self.active_schema.is_none() {
             if let Some(id) = self.active_source.clone() {
@@ -3169,7 +3195,9 @@ impl DbWorkspace {
                 .get(idx)
                 .map(|t| (t.where_clause.clone(), t.order_by.clone()))
                 .unwrap_or_default();
-            let sql = build_table_data_sql(driver, &schema, &table, &where_clause, &order_by, 100);
+            let sql = entry.query_sql.clone().unwrap_or_else(|| {
+                build_table_data_sql(driver, &schema, &table, &where_clause, &order_by, 100)
+            });
             if let Some(tab) = self.tabs.get_mut(idx) {
                 tab.sql = sql.clone();
                 tab.source_id = Some(entry.source_id.clone());
@@ -3178,7 +3206,9 @@ impl DbWorkspace {
             self.sql = sql;
             self.last_result = None;
         } else {
-            let sql = build_table_data_sql(driver, &schema, &table, "", "", 100);
+            let sql = entry.query_sql.clone().unwrap_or_else(|| {
+                build_table_data_sql(driver, &schema, &table, "", "", 100)
+            });
             self.tabs.push(SqlTab {
                 id: table_key.clone(),
                 title: table.clone(),
@@ -4884,8 +4914,8 @@ impl DbWorkspace {
             .first()
             .map(|s| s.driver)
             .unwrap_or_default();
-        let db = ws.active_database.clone();
-        let key = Self::pool_key(&id, db.as_deref());
+        // Use None for pool_key to match what ensure_connected(…, None) stored (#157).
+        let key = Self::pool_key(&id, None);
         // Prove the connection with a real driver-specific probe; lazy/stub clients
         // must not report OK until they answer (#64).
         let probe = match driver {
@@ -4894,7 +4924,7 @@ impl DbWorkspace {
             DbDriver::Elasticsearch => "GET /",
             _ => "SELECT 1 AS ok",
         };
-        ws.exec_statement(&key, driver, db.as_deref(), probe)
+        ws.exec_statement(&key, driver, None, probe)
             .await
             .with_context(|| format!("{} probe `{probe}`", driver.label()))?;
         Ok(format!("ok · {}", driver.label()))
@@ -4933,12 +4963,16 @@ impl DbWorkspace {
                             ccu.table_schema AS ref_schema, \
                             ccu.table_name AS ref_table, ccu.column_name AS ref_column \
                      FROM information_schema.table_constraints tc \
+                     JOIN information_schema.referential_constraints rc \
+                       ON tc.constraint_schema = rc.constraint_schema \
+                      AND tc.constraint_name = rc.constraint_name \
                      JOIN information_schema.key_column_usage kcu \
-                       ON tc.constraint_name = kcu.constraint_name \
-                      AND tc.table_schema = kcu.table_schema \
-                     JOIN information_schema.constraint_column_usage ccu \
-                       ON ccu.constraint_name = tc.constraint_name \
-                      AND ccu.constraint_schema = tc.constraint_schema \
+                       ON tc.constraint_schema = kcu.constraint_schema \
+                      AND tc.constraint_name = kcu.constraint_name \
+                     JOIN information_schema.key_column_usage ccu \
+                       ON rc.unique_constraint_schema = ccu.constraint_schema \
+                      AND rc.unique_constraint_name = ccu.constraint_name \
+                      AND kcu.position_in_unique_constraint = ccu.ordinal_position \
                      WHERE tc.constraint_type = 'FOREIGN KEY' \
                        AND tc.table_schema = $1 \
                      ORDER BY tc.table_name, kcu.ordinal_position",
@@ -11068,7 +11102,44 @@ impl DbWorkspace {
         };
         self.active_source = Some(source_id.clone());
 
-        let (left, right) = parse_schema_diff_spec(spec, self.active_database.as_deref())?;
+        let driver = self
+            .sources
+            .iter()
+            .find(|s| s.id == source_id)
+            .map(|s| s.driver)
+            .unwrap_or_default();
+
+        let (mut left, mut right) = parse_schema_diff_spec(spec, self.active_database.as_deref())?;
+
+        // SQLite: cross-schema diff not supported (#135).
+        if driver == DbDriver::Sqlite {
+            let is_main = |s: &str| s.is_empty() || s.eq_ignore_ascii_case("main");
+            if !is_main(&left.schema) && !is_main(&right.schema) && left.schema != right.schema {
+                bail!(
+                    "SQLite does not support cross-schema diff ({} vs {}); \
+                     use different database files instead",
+                    left.schema,
+                    right.schema
+                );
+            }
+        }
+
+        // ClickHouse single-part: treat schema as database (#135).
+        if driver == DbDriver::Clickhouse {
+            if left.database.is_none() && !left.schema.is_empty() {
+                left = DiffSide {
+                    database: Some(left.schema),
+                    schema: "default".into(),
+                };
+            }
+            if right.database.is_none() && !right.schema.is_empty() {
+                right = DiffSide {
+                    database: Some(right.schema),
+                    schema: "default".into(),
+                };
+            }
+        }
+
         let start = std::time::Instant::now();
 
         self.ensure_connected(&source_id, left.database.as_deref())
@@ -11800,15 +11871,51 @@ fn split_sql_script(text: &str, mssql: bool) -> Vec<String> {
     let mut out = Vec::new();
     if mssql {
         let mut buf = String::new();
+        let mut in_string = false;
+        let mut in_block_comment = false;
+        let mut prev: char = '\0';
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.eq_ignore_ascii_case("GO") {
+            // GO only splits when outside string/comment context.
+            if !in_string && !in_block_comment && trimmed.eq_ignore_ascii_case("GO") {
                 let stmt = buf.trim().trim_end_matches(';').trim();
                 if !stmt.is_empty() {
                     out.push(stmt.to_string());
                 }
                 buf.clear();
+                prev = '\0';
             } else {
+                // Track string/comment state across lines; line comments reset each line.
+                let mut in_line_comment = false;
+                for c in line.chars() {
+                    if in_block_comment {
+                        if prev == '*' && c == '/' {
+                            in_block_comment = false;
+                        }
+                        prev = c;
+                        continue;
+                    }
+                    if in_line_comment {
+                        prev = c;
+                        continue;
+                    }
+                    if in_string {
+                        if c == '\'' {
+                            if false { /* mssql: no backslash escape */ }
+                            in_string = false;
+                        }
+                        prev = c;
+                        continue;
+                    }
+                    if c == '\'' {
+                        in_string = true;
+                    } else if c == '-' && prev == '-' {
+                        in_line_comment = true;
+                    } else if c == '*' && prev == '/' {
+                        in_block_comment = true;
+                    }
+                    prev = c;
+                }
                 buf.push_str(line);
                 buf.push('\n');
             }
@@ -11819,23 +11926,56 @@ fn split_sql_script(text: &str, mssql: bool) -> Vec<String> {
         }
         return out;
     }
+    // Non-MSSQL: split on `;` outside strings and comments.
     let mut current = String::new();
     let mut in_string = false;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\'' && !in_string {
+        if in_string {
+            current.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    // SQL escaped quote: 'O''Brien'
+                    current.push('\'');
+                    chars.next();
+                } else {
+                    in_string = false;
+                }
+            } else if c == '\\' {
+                // ClickHouse-style backslash escape inside strings.
+                if let Some(&next) = chars.peek() {
+                    current.push(next);
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        // Outside string — check comments.
+        if c == '-' && chars.peek() == Some(&'-') {
+            // Line comment: skip to end of line, replace with newline.
+            chars.next();
+            while chars.next().is_some_and(|ch| ch != '\n') {}
+            current.push('\n');
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('*') if chars.peek() == Some(&'/') => {
+                        chars.next();
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            continue;
+        }
+        if c == '\'' {
             in_string = true;
             current.push(c);
-        } else if c == '\'' && in_string {
-            if chars.peek() == Some(&'\'') {
-                // Preserve SQL escaped quotes — `'O''Brien'` must stay intact (#97).
-                current.push_str("''");
-                chars.next();
-            } else {
-                in_string = false;
-                current.push(c);
-            }
-        } else if c == ';' && !in_string {
+        } else if c == ';' {
             let stmt = current.trim();
             if !stmt.is_empty() {
                 out.push(stmt.to_string());

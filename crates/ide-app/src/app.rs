@@ -4166,8 +4166,8 @@ impl App {
         let Some(result) = self.db.last_result.as_ref() else {
             return false;
         };
-        let src = result.source_table.as_deref();
-        if src != Some("er_sketch") && src != Some("er_canvas") {
+        let col0 = result.columns.first().map(|s| s.as_str());
+        if col0 != Some("er") && col0 != Some("er_canvas") {
             return false;
         }
         let Some(line) = result
@@ -7460,7 +7460,7 @@ impl App {
                         elapsed_ms: 0,
                         truncated: false,
                         source_schema: None,
-                        source_table: Some("er_sketch".into()),
+                        source_table: None,
                         primary_keys: Vec::new(),
                         original_rows: Vec::new(),
                         cursor_row: 0,
@@ -7487,7 +7487,7 @@ impl App {
                         elapsed_ms: 0,
                         truncated: false,
                         source_schema: None,
-                        source_table: Some("er_canvas".into()),
+                        source_table: None,
                         primary_keys: Vec::new(),
                         original_rows: Vec::new(),
                         cursor_row: 0,
