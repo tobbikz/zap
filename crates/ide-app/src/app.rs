@@ -1772,6 +1772,31 @@ impl App {
         }
     }
 
+    /// Copy the active connection's URI to the host clipboard (#35).
+    fn copy_connection_uri(&mut self) {
+        let source_id = self
+            .selected_connection_id()
+            .or_else(|| self.db.active_source.clone());
+        let Some(source_id) = source_id else {
+            self.set_status("copy URI: no active connection", true);
+            return;
+        };
+        let Some(src) = self.db.sources.iter().find(|s| s.id == source_id) else {
+            self.set_status("copy URI: source not found", true);
+            return;
+        };
+        // Redact password in the copied URI.
+        let mut redacted = src.clone();
+        if !redacted.password.is_empty() {
+            redacted.password = "****".into();
+        }
+        let uri = redacted.url();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(uri.clone())) {
+            Ok(()) => self.set_status(format!("copied URI · {uri}"), false),
+            Err(e) => self.set_status(format!("clipboard: {e}"), true),
+        }
+    }
+
     fn yank_result_cell(&mut self) {
         let Some(result) = self.db.last_result.as_ref() else {
             self.set_status("copy: no results", true);
@@ -6628,6 +6653,14 @@ impl App {
             }
             Action::CycleDbSourceNext => self.cycle_db_source(1).await,
             Action::CycleDbSourcePrev => self.cycle_db_source(-1).await,
+            Action::CollapseAll => {
+                self.db.collapse_all();
+                self.set_status(self.db.status.clone(), false);
+            }
+            Action::CollapseOthers => {
+                self.db.collapse_others();
+                self.set_status(self.db.status.clone(), false);
+            }
             Action::DeleteDataSource => {
                 if let Some(id) = self.selected_connection_id() {
                     self.start_delete_connection(&id);
@@ -8391,6 +8424,17 @@ impl App {
             id if id.starts_with("plugin:") => {
                 let cmd = id.trim_start_matches("plugin:");
                 self.run_plugin_command(cmd).await?;
+            }
+            "copy_connection_uri" => {
+                self.copy_connection_uri();
+            }
+            "collapse_all" => {
+                self.db.collapse_all();
+                self.set_status(self.db.status.clone(), false);
+            }
+            "collapse_others" => {
+                self.db.collapse_others();
+                self.set_status(self.db.status.clone(), false);
             }
             "add_datasource" => self.start_add_connection(),
             "edit_connection" => {

@@ -513,19 +513,36 @@ pub fn build_table_data_sql(
         _ => {}
     }
     let qual = qualify_table_name(driver, schema, table);
-    let mut sql = format!("SELECT * FROM {qual}");
     let w = where_clause.trim().trim_end_matches(';').trim();
-    if !w.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(w);
-    }
     let o = order_by.trim().trim_end_matches(';').trim();
-    if !o.is_empty() {
-        sql.push_str(" ORDER BY ");
-        sql.push_str(o);
+    match driver {
+        DbDriver::Mssql => {
+            let mut sql = format!("SELECT TOP ({limit}) * FROM {qual}");
+            if !w.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(w);
+            }
+            if !o.is_empty() {
+                sql.push_str(" ORDER BY ");
+                sql.push_str(o);
+            }
+            sql.push_str(";\n");
+            sql
+        }
+        _ => {
+            let mut sql = format!("SELECT * FROM {qual}");
+            if !w.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(w);
+            }
+            if !o.is_empty() {
+                sql.push_str(" ORDER BY ");
+                sql.push_str(o);
+            }
+            sql.push_str(&format!(" LIMIT {limit};\n"));
+            sql
+        }
     }
-    sql.push_str(&format!(" LIMIT {limit};\n"));
-    sql
 }
 
 fn urlencoding_lite(s: &str) -> String {
@@ -813,6 +830,9 @@ pub struct QueryHistoryEntry {
     pub sql: String,
     #[serde(default)]
     pub elapsed_ms: u128,
+    /// Source that executed this query (empty for legacy entries) (#45).
+    #[serde(default)]
+    pub source_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2128,14 +2148,20 @@ impl DbWorkspace {
     }
 
     /// Palette items for recent query history (newest first).
+    /// Filters to active source when set; shows all when no source is active (#45).
     pub fn query_history_palette_items(&self) -> Vec<(String, String)> {
+        let active = self.active_source.as_deref().unwrap_or("");
         self.history
             .iter()
-            .rev()
-            .take(60)
             .enumerate()
-            .map(|(i, e)| {
-                let hist_idx = self.history.len().saturating_sub(1 + i);
+            .rev()
+            .filter(|(_, e)| {
+                active.is_empty()
+                    || e.source_id.is_empty()
+                    || e.source_id == active
+            })
+            .take(60)
+            .map(|(hist_idx, e)| {
                 (
                     e.label(56),
                     format!("hist:{hist_idx}"),
@@ -2202,6 +2228,26 @@ impl DbWorkspace {
         if self.selected >= self.flat.len() {
             self.selected = self.flat.len().saturating_sub(1);
         }
+    }
+
+    /// Collapse all expanded explorer tree nodes (#34).
+    pub fn collapse_all(&mut self) {
+        collapse_all_nodes(&mut self.tree);
+        self.rebuild_flat();
+        self.status = "collapsed all".into();
+    }
+
+    /// Collapse all explorer nodes except the selection's ancestors (#34).
+    pub fn collapse_others(&mut self) {
+        let keep_id = self
+            .flat
+            .get(self.selected)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        let ancestors = collect_ancestor_ids(&self.tree, &keep_id);
+        collapse_others(&mut self.tree, &ancestors);
+        self.rebuild_flat();
+        self.status = "collapsed others".into();
     }
 
     pub fn move_up(&mut self) {
@@ -3985,9 +4031,87 @@ impl DbWorkspace {
                 }
                 Ok(out)
             }
-            LivePool::Mssql(_)
-            | LivePool::Clickhouse(_)
-            | LivePool::Duckdb(_)
+            LivePool::Mssql(c) => {
+                if let Some(db) = database {
+                    let _ = engines::exec_mssql(c, &format!("USE [{}]", db.replace(']', "]]"))).await;
+                }
+                let qr = engines::exec_mssql(
+                    c,
+                    &format!(
+                        "SELECT fk.name AS constraint_name, \
+                                fc.name AS column_name, \
+                                rs.name AS ref_schema, \
+                                rt.name AS ref_table, \
+                                rc.name AS ref_column \
+                         FROM sys.foreign_keys fk \
+                         JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id \
+                         JOIN sys.columns fc ON fkc.parent_object_id = fc.object_id AND fkc.parent_column_id = fc.column_id \
+                         JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id \
+                         JOIN sys.schemas rs ON rt.schema_id = rs.schema_id \
+                         JOIN sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id \
+                         JOIN sys.tables pt ON fkc.parent_object_id = pt.object_id \
+                         JOIN sys.schemas ps ON pt.schema_id = ps.schema_id \
+                         WHERE ps.name = N'{}' AND pt.name = N'{}' \
+                         ORDER BY fk.name, fkc.constraint_column_id",
+                        schema.replace('\'', "''"),
+                        table.replace('\'', "''")
+                    ),
+                )
+                .await?;
+                Ok(group_fk_rows(
+                    source_id,
+                    db_owned.clone(),
+                    qr.rows.into_iter().filter_map(|r| {
+                        Some((
+                            r.first()?.clone(),
+                            r.get(1)?.clone(),
+                            r.get(2)?.clone(),
+                            r.get(3)?.clone(),
+                            r.get(4)?.clone(),
+                        ))
+                    }),
+                ))
+            }
+            LivePool::Duckdb(conn) => {
+                let qr = alt_engines::exec_duckdb(
+                    conn,
+                    &format!(
+                        "SELECT dc.constraint_text, \
+                                unnest(dc.constraint_column_names) AS col_name, \
+                                '{}' AS ref_schema, \
+                                rdc.table_name AS ref_table, \
+                                unnest(rdc.constraint_column_names) AS ref_col \
+                         FROM duckdb_constraints() dc \
+                         JOIN duckdb_constraints() rdc \
+                           ON dc.database_name = rdc.database_name \
+                          AND dc.schema_name = rdc.schema_name \
+                          AND rdc.constraint_type = 'PRIMARY KEY' \
+                          AND array_length(dc.constraint_column_names) = array_length(rdc.constraint_column_names) \
+                         WHERE dc.constraint_type = 'FOREIGN KEY' \
+                           AND dc.schema_name = '{}' AND dc.table_name = '{}' \
+                         ORDER BY dc.constraint_text",
+                        schema.replace('\'', "''"),
+                        schema.replace('\'', "''"),
+                        table.replace('\'', "''")
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| QueryResult::empty());
+                Ok(group_fk_rows(
+                    source_id,
+                    db_owned.clone(),
+                    qr.rows.into_iter().filter_map(|r| {
+                        Some((
+                            r.first()?.clone(),
+                            r.get(1)?.clone(),
+                            r.get(2)?.clone(),
+                            r.get(3)?.clone(),
+                            r.get(4)?.clone(),
+                        ))
+                    }),
+                ))
+            }
+            LivePool::Clickhouse(_)
             | LivePool::Redis(_)
             | LivePool::Mongo(_)
             | LivePool::CloudStub(_) | LivePool::Http(_) => Ok(Vec::new()),
@@ -5051,6 +5175,68 @@ impl DbWorkspace {
                 }
                 out
             }
+            LivePool::Mssql(c) => {
+                if let Some(db) = database {
+                    let _ = engines::exec_mssql(c, &format!("USE [{}]", db.replace(']', "]]"))).await;
+                }
+                let qr = engines::exec_mssql(
+                    c,
+                    &format!(
+                        "SELECT pt.name AS table_name, fc.name AS column_name, \
+                                rt.name AS ref_table, rc.name AS ref_column \
+                         FROM sys.foreign_keys fk \
+                         JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id \
+                         JOIN sys.tables pt ON fkc.parent_object_id = pt.object_id \
+                         JOIN sys.schemas ps ON pt.schema_id = ps.schema_id \
+                         JOIN sys.columns fc ON fkc.parent_object_id = fc.object_id AND fkc.parent_column_id = fc.column_id \
+                         JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id \
+                         JOIN sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id \
+                         WHERE ps.name = N'{}' \
+                         ORDER BY pt.name, fkc.constraint_column_id",
+                        schema.replace('\'', "''")
+                    ),
+                )
+                .await?;
+                qr.rows.into_iter().filter_map(|r| {
+                    Some((
+                        r.first()?.clone(),
+                        r.get(1)?.clone(),
+                        r.get(2)?.clone(),
+                        r.get(3)?.clone(),
+                    ))
+                }).collect()
+            }
+            LivePool::Duckdb(conn) => {
+                let qr = alt_engines::exec_duckdb(
+                    conn,
+                    &format!(
+                        "SELECT dc.table_name, \
+                                unnest(dc.constraint_column_names) AS col_name, \
+                                rdc.table_name AS ref_table, \
+                                unnest(rdc.constraint_column_names) AS ref_col \
+                         FROM duckdb_constraints() dc \
+                         JOIN duckdb_constraints() rdc \
+                           ON dc.database_name = rdc.database_name \
+                          AND dc.schema_name = rdc.schema_name \
+                          AND rdc.constraint_type = 'PRIMARY KEY' \
+                          AND array_length(dc.constraint_column_names) = array_length(rdc.constraint_column_names) \
+                         WHERE dc.constraint_type = 'FOREIGN KEY' \
+                           AND dc.schema_name = '{}' \
+                         ORDER BY dc.table_name",
+                        schema.replace('\'', "''")
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| QueryResult::empty());
+                qr.rows.into_iter().filter_map(|r| {
+                    Some((
+                        r.first()?.clone(),
+                        r.get(1)?.clone(),
+                        r.get(2)?.clone(),
+                        r.get(3)?.clone(),
+                    ))
+                }).collect()
+            }
             _ => {
                 return Ok(format!(
                     "# ER · {schema}\n(ER sketch not available for this engine)\n"
@@ -5662,6 +5848,7 @@ impl DbWorkspace {
                 self.history.push(QueryHistoryEntry {
                     sql: stmt.clone(),
                     elapsed_ms: last.elapsed_ms,
+                    source_id: source_id.clone(),
                 });
             }
             // Multi-statement: park intermediate result sets in new tabs.
@@ -7123,7 +7310,8 @@ impl DbWorkspace {
             return self.finish_explain_result(driver, result);
         }
         let explain = match driver {
-            DbDriver::Postgres => format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {stmt}"),
+            // Plan-only: never ANALYZE writes; ANALYZE on non-SELECT is dangerous (#38).
+            DbDriver::Postgres => format!("EXPLAIN (FORMAT TEXT) {stmt}"),
             DbDriver::Mysql => format!("EXPLAIN {stmt}"),
             DbDriver::Sqlite | DbDriver::Duckdb => format!("EXPLAIN {stmt}"),
             DbDriver::Mssql => unreachable!("mssql explain handled above"),
@@ -10087,6 +10275,46 @@ fn toggle_expand(nodes: &mut [DbTreeNode], id: &str) -> bool {
     false
 }
 
+/// Collapse every expanded node in the tree (#34).
+fn collapse_all_nodes(nodes: &mut [DbTreeNode]) {
+    for n in nodes {
+        n.expanded = false;
+        collapse_all_nodes(&mut n.children);
+    }
+}
+
+/// Collect ancestor node IDs of `target_id`.
+fn collect_ancestor_ids(nodes: &[DbTreeNode], target_id: &str) -> Vec<String> {
+    fn walk(nodes: &[DbTreeNode], target: &str, path: &mut Vec<String>) -> bool {
+        for n in nodes {
+            path.push(n.id.clone());
+            if n.id == target {
+                return true;
+            }
+            if walk(&n.children, target, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    walk(nodes, target_id, &mut path);
+    path
+}
+
+/// Collapse every node except those on the path to `keep_id` (#34).
+fn collapse_others(nodes: &mut [DbTreeNode], ancestors: &[String]) {
+    for n in nodes {
+        if ancestors.contains(&n.id) {
+            collapse_others(&mut n.children, ancestors);
+        } else {
+            n.expanded = false;
+            collapse_all_nodes(&mut n.children);
+        }
+    }
+}
+
 fn find_node_mut<'a>(nodes: &'a mut [DbTreeNode], id: &str) -> Option<&'a mut DbTreeNode> {
     for n in nodes {
         if n.id == id {
@@ -10198,6 +10426,7 @@ fn load_query_history() -> Vec<QueryHistoryEntry> {
                 .map(|sql| QueryHistoryEntry {
                     sql,
                     elapsed_ms: 0,
+                    source_id: String::new(),
                 })
                 .collect()
         })
