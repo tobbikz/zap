@@ -15,28 +15,38 @@ fn pad_row(content: &str, inner_w: usize) -> String {
 }
 
 /// Build a simple canvas: one box per table, edges as lines underneath.
-pub fn render_er_canvas(schema: &str, edges: &[(String, String, String, String)]) -> String {
-    // edges: (from_table, from_col, to_table, to_col)
-    let mut tables: Vec<String> = Vec::new();
+///
+/// `tables` lists schema tables (so entities without FKs still appear — #106).
+/// Extra tables referenced only by edges are merged in.
+pub fn render_er_canvas(
+    schema: &str,
+    tables: &[String],
+    edges: &[(String, String, String, String)],
+) -> String {
+    let mut all: Vec<String> = tables.to_vec();
     for (t, _, rt, _) in edges {
-        if !tables.iter().any(|x| x == t) {
-            tables.push(t.clone());
+        if !all.iter().any(|x| x == t) {
+            all.push(t.clone());
         }
-        if !tables.iter().any(|x| x == rt) {
-            tables.push(rt.clone());
+        if !all.iter().any(|x| x == rt) {
+            all.push(rt.clone());
         }
     }
-    tables.sort();
+    all.sort();
+    all.dedup();
     let title = format!(" ER canvas · {schema} ");
-    if tables.is_empty() {
+    if all.is_empty() {
         let inner = disp_w(&title).max(22);
         let bar = "─".repeat(inner);
-        let empty = pad_row(" (no tables / FKs)", inner);
+        let empty = pad_row(" (no tables)", inner);
         return format!("┌{bar}┐\n│{empty}│\n└{bar}┘\n");
     }
 
     let mut out = format!("══ ER canvas · {schema} ══\n\n");
-    for t in &tables {
+    if edges.is_empty() {
+        out.push_str("(no foreign keys — showing tables)\n\n");
+    }
+    for t in &all {
         let cols: Vec<String> = edges
             .iter()
             .filter(|(ft, _, _, _)| ft == t)
@@ -64,10 +74,12 @@ pub fn render_er_canvas(schema: &str, edges: &[(String, String, String, String)]
         }
         out.push_str(&format!("└{bar}┘\n\n"));
     }
-    out.push_str("Edges (FK · cardinality N:1 child→parent):\n");
-    for (t, c, rt, rc) in edges {
-        out.push_str(&format!("  {t}.{c} ──N:1──► {rt}.{rc}  (FK)\n"));
-        out.push_str(&format!("    PK side: {rt}.{rc} · FK side: {t}.{c}\n"));
+    if !edges.is_empty() {
+        out.push_str("Edges (FK · cardinality N:1 child→parent):\n");
+        for (t, c, rt, rc) in edges {
+            out.push_str(&format!("  {t}.{c} ──N:1──► {rt}.{rc}  (FK)\n"));
+            out.push_str(&format!("    PK side: {rt}.{rc} · FK side: {t}.{c}\n"));
+        }
     }
     out
 }
@@ -84,22 +96,8 @@ mod tests {
             "users".into(),
             "id".into(),
         )];
-        let canvas = render_er_canvas("public", &edges);
-        for line in canvas.lines() {
-            if line.starts_with('┌') || line.starts_with('├') || line.starts_with('└') {
-                let w = disp_w(line);
-                // Find matching content rows in same box — all │ rows share width.
-                for other in canvas.lines() {
-                    if other.starts_with('│') {
-                        // Compare within same-width boxes by checking any │ line width equals bar.
-                        // Soft check: every border/content line that is a box row has equal width
-                        // to its siblings — we assert no content line is wider than its bar.
-                        let _ = w;
-                    }
-                }
-            }
-        }
-        // Concrete: first box title row and bar must share display width.
+        let tables = vec!["orders".into(), "users".into()];
+        let canvas = render_er_canvas("public", &tables, &edges);
         let mut bar_w = None;
         for line in canvas.lines() {
             if line.starts_with('┌') {
@@ -111,6 +109,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tables_without_fks_still_draw_boxes() {
+        let tables = vec!["lonely".into(), "orphan".into()];
+        let canvas = render_er_canvas("public", &tables, &[]);
+        assert!(canvas.contains("lonely"), "{canvas}");
+        assert!(canvas.contains("orphan"), "{canvas}");
+        assert!(canvas.contains("no foreign keys"), "{canvas}");
+        assert!(!canvas.contains("(no tables)"), "{canvas}");
     }
 
     #[test]

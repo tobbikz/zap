@@ -3761,7 +3761,14 @@ impl DbWorkspace {
                 lines.push(StructureLine::ddl(line.to_string()));
             }
             let edges = parse_er_edges(&sketch);
-            let canvas = render_er_canvas(schema, &edges);
+            let table_names: Vec<String> = self
+                .introspect_tables(source_id, database, schema)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|n| n.table)
+                .collect();
+            let canvas = render_er_canvas(schema, &table_names, &edges);
             lines.push(StructureLine::section("ER CANVAS"));
             for line in canvas.lines().take(60) {
                 lines.push(StructureLine::ddl(line.to_string()));
@@ -3843,6 +3850,8 @@ impl DbWorkspace {
         let db_owned = database.map(|s| s.to_string());
         match pool {
             LivePool::Pg(p) => {
+                // Join on constraint_schema — ccu.table_schema is the *referenced*
+                // table's schema, so equating it to tc.table_schema drops cross-schema FKs (#114).
                 let rows = sqlx::query(
                     "SELECT tc.constraint_name, kcu.column_name, \
                             ccu.table_schema AS ref_schema, ccu.table_name AS ref_table, \
@@ -3853,7 +3862,7 @@ impl DbWorkspace {
                       AND tc.table_schema = kcu.table_schema \
                      JOIN information_schema.constraint_column_usage ccu \
                        ON ccu.constraint_name = tc.constraint_name \
-                      AND ccu.table_schema = tc.table_schema \
+                      AND ccu.constraint_schema = tc.constraint_schema \
                      WHERE tc.constraint_type = 'FOREIGN KEY' \
                        AND tc.table_schema = $1 AND tc.table_name = $2 \
                      ORDER BY tc.constraint_name, kcu.ordinal_position",
@@ -3905,7 +3914,8 @@ impl DbWorkspace {
                 ))
             }
             LivePool::Sqlite(p) => {
-                let rows = sqlx::query(&format!("PRAGMA foreign_key_list('{table}')"))
+                let qtable = sqlite_ident_literal(table);
+                let rows = sqlx::query(&format!("PRAGMA foreign_key_list('{qtable}')"))
                     .fetch_all(p)
                     .await?;
                 let mut out = Vec::new();
@@ -3914,7 +3924,11 @@ impl DbWorkspace {
                     let _seq: i64 = r.try_get(1).unwrap_or(0);
                     let ref_table: String = r.try_get(2).unwrap_or_default();
                     let from_col: String = r.try_get(3).unwrap_or_default();
-                    let ref_col: String = r.try_get(4).unwrap_or_default();
+                    let mut ref_col: String = r.try_get(4).unwrap_or_default();
+                    // NULL `to` means implicit parent PK (#107).
+                    if ref_col.is_empty() && !ref_table.is_empty() {
+                        ref_col = sqlite_parent_pk(p, &ref_table).await;
+                    }
                     let name = format!("fk_{table}_{id}");
                     let ref_schema = schema.to_string();
                     let label = format!(
@@ -4907,6 +4921,7 @@ impl DbWorkspace {
             LivePool::Pg(p) => {
                 let rows = sqlx::query(
                     "SELECT tc.table_name, kcu.column_name, \
+                            ccu.table_schema AS ref_schema, \
                             ccu.table_name AS ref_table, ccu.column_name AS ref_column \
                      FROM information_schema.table_constraints tc \
                      JOIN information_schema.key_column_usage kcu \
@@ -4914,7 +4929,7 @@ impl DbWorkspace {
                       AND tc.table_schema = kcu.table_schema \
                      JOIN information_schema.constraint_column_usage ccu \
                        ON ccu.constraint_name = tc.constraint_name \
-                      AND ccu.table_schema = tc.table_schema \
+                      AND ccu.constraint_schema = tc.constraint_schema \
                      WHERE tc.constraint_type = 'FOREIGN KEY' \
                        AND tc.table_schema = $1 \
                      ORDER BY tc.table_name, kcu.ordinal_position",
@@ -4924,12 +4939,24 @@ impl DbWorkspace {
                 .await?;
                 rows.into_iter()
                     .filter_map(|r| {
-                        Some((
-                            r.try_get(0).ok()?,
-                            r.try_get(1).ok()?,
-                            r.try_get(2).ok()?,
-                            r.try_get(3).ok()?,
-                        ))
+                        let t: String = r.try_get(0).ok()?;
+                        let c: String = r.try_get(1).ok()?;
+                        let ref_schema: String = r.try_get(2).ok()?;
+                        let rt: String = r.try_get(3).ok()?;
+                        let rc: String = r.try_get(4).ok()?;
+                        // Cross-schema: emit schema.table.col on both sides (#114).
+                        let cross = ref_schema != schema && !ref_schema.is_empty();
+                        let t_disp = if cross {
+                            format!("{schema}.{t}")
+                        } else {
+                            t
+                        };
+                        let rt_disp = if cross {
+                            format!("{ref_schema}.{rt}")
+                        } else {
+                            rt
+                        };
+                        Some((t_disp, c, rt_disp, rc))
                     })
                     .collect()
             }
@@ -4964,14 +4991,18 @@ impl DbWorkspace {
                 let mut out = Vec::new();
                 for t in tables {
                     let name: String = t.try_get(0).unwrap_or_default();
-                    let fks = sqlx::query(&format!("PRAGMA foreign_key_list('{name}')"))
+                    let qname = sqlite_ident_literal(&name);
+                    let fks = sqlx::query(&format!("PRAGMA foreign_key_list('{qname}')"))
                         .fetch_all(p)
                         .await
                         .unwrap_or_default();
                     for r in fks {
                         let ref_table: String = r.try_get(2).unwrap_or_default();
                         let from_col: String = r.try_get(3).unwrap_or_default();
-                        let ref_col: String = r.try_get(4).unwrap_or_default();
+                        let mut ref_col: String = r.try_get(4).unwrap_or_default();
+                        if ref_col.is_empty() && !ref_table.is_empty() {
+                            ref_col = sqlite_parent_pk(p, &ref_table).await;
+                        }
                         out.push((name.clone(), from_col, ref_table, ref_col));
                     }
                 }
@@ -4983,12 +5014,13 @@ impl DbWorkspace {
                 ));
             }
         };
-        if edges.is_empty() {
-            return Ok(format!("# ER · {schema}\n(no foreign keys found)\n"));
-        }
         let mut out = format!("# ER · {schema}\n");
-        for (t, c, rt, rc) in edges {
-            out.push_str(&format!("{t}.{c} --> {rt}.{rc}\n"));
+        if edges.is_empty() {
+            out.push_str("(no foreign keys found)\n");
+        } else {
+            for (t, c, rt, rc) in &edges {
+                out.push_str(&format!("{t}.{c} --> {rt}.{rc}\n"));
+            }
         }
         Ok(out)
     }
@@ -6140,7 +6172,27 @@ impl DbWorkspace {
             .get(self.selected)
             .and_then(|e| e.schema.clone())
             .unwrap_or_else(|| "public".into());
-        Ok(render_er_canvas(&schema, &parse_er_edges(&sketch)))
+        let source_id = self
+            .active_source
+            .clone()
+            .or_else(|| self.flat.get(self.selected).map(|e| e.source_id.clone()))
+            .unwrap_or_default();
+        let database = self.active_database.clone();
+        let table_names: Vec<String> = if source_id.is_empty() {
+            Vec::new()
+        } else {
+            self.introspect_tables(&source_id, database.as_deref(), &schema)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|n| n.table)
+                .collect()
+        };
+        Ok(render_er_canvas(
+            &schema,
+            &table_names,
+            &parse_er_edges(&sketch),
+        ))
     }
 
     pub fn undo_last_cell_edit(&mut self) -> bool {
@@ -10313,21 +10365,39 @@ impl DbWorkspace {
             let Some(table) = t.table else {
                 continue;
             };
+            let is_view = matches!(t.kind, DbNodeKind::View);
             let ddl = engines::ch_show_create(&ch, &db, &table).await?;
-            body.push_str(&format!("-- table {db}.{table}\n{ddl};\n\n"));
+            let kind_label = if is_view { "view" } else { "table" };
+            body.push_str(&format!("-- {kind_label} {db}.{table}\n{ddl};\n\n"));
+            // Views: DDL only — INSERT INTO view fails on restore (#101).
+            if is_view {
+                continue;
+            }
+            let db_q = db.replace('`', "``");
+            let table_q = table.replace('`', "``");
+            let target = format!("`{db_q}`.`{table_q}`");
+            // Name the INSERT target — CH defaults to literal `table` otherwise (#112).
             let inserts = engines::ch_query_format(
                 &ch,
-                &format!("SELECT * FROM `{}`.`{}`", db.replace('`', "``"), table.replace('`', "``")),
+                &format!(
+                    "SELECT * FROM {target} \
+                     SETTINGS output_format_sql_insert_table_name = '{target}'"
+                ),
                 "SQLInsert",
             )
-            .await
-            .unwrap_or_else(|e| format!("-- data export failed: {e:#}\n"));
-            if !inserts.trim().is_empty() {
-                body.push_str(&inserts);
-                if !inserts.ends_with('\n') {
+            .await;
+            match inserts {
+                Ok(text) if !text.trim().is_empty() => {
+                    body.push_str(&text);
+                    if !text.ends_with('\n') {
+                        body.push('\n');
+                    }
                     body.push('\n');
                 }
-                body.push('\n');
+                Ok(_) => {}
+                Err(e) => {
+                    body.push_str(&format!("-- data export FAILED for {target}: {e:#}\n\n"));
+                }
             }
         }
         std::fs::write(&out, body)?;
@@ -11981,17 +12051,57 @@ pub fn parse_er_edges(sketch: &str) -> Vec<(String, String, String, String)> {
         if let Some((left, right)) = line.split_once("-->") {
             let lb: Vec<&str> = left.trim().split('.').collect();
             let rb: Vec<&str> = right.trim().split('.').collect();
+            // Support `table.col` or `schema.table.col` on either side (#114).
             if lb.len() >= 2 && rb.len() >= 2 {
-                edges.push((
-                    lb[0].to_string(),
-                    lb[1].to_string(),
-                    rb[rb.len() - 2].to_string(),
-                    rb[rb.len() - 1].to_string(),
-                ));
+                let (from_t, from_c) = if lb.len() >= 3 {
+                    (
+                        format!("{}.{}", lb[lb.len() - 3], lb[lb.len() - 2]),
+                        lb[lb.len() - 1].to_string(),
+                    )
+                } else {
+                    (lb[0].to_string(), lb[1].to_string())
+                };
+                let (to_t, to_c) = if rb.len() >= 3 {
+                    (
+                        format!("{}.{}", rb[rb.len() - 3], rb[rb.len() - 2]),
+                        rb[rb.len() - 1].to_string(),
+                    )
+                } else {
+                    (
+                        rb[rb.len() - 2].to_string(),
+                        rb[rb.len() - 1].to_string(),
+                    )
+                };
+                edges.push((from_t, from_c, to_t, to_c));
             }
         }
     }
     edges
+}
+
+/// Escape a SQLite identifier for use inside a single-quoted PRAGMA arg (#107).
+fn sqlite_ident_literal(name: &str) -> String {
+    name.replace('\'', "''")
+}
+
+/// Resolve parent PK column when `PRAGMA foreign_key_list` returns NULL `to` (#107).
+async fn sqlite_parent_pk(p: &sqlx::SqlitePool, parent: &str) -> String {
+    let q = sqlite_ident_literal(parent);
+    let rows = sqlx::query(&format!("PRAGMA table_info('{q}')"))
+        .fetch_all(p)
+        .await
+        .unwrap_or_default();
+    for r in &rows {
+        let pk: i64 = r.try_get(5).unwrap_or(0);
+        if pk > 0 {
+            return r.try_get::<String, _>(1).unwrap_or_default();
+        }
+    }
+    // Fall back to first column / "rowid".
+    rows.first()
+        .and_then(|r| r.try_get::<String, _>(1).ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "rowid".into())
 }
 
 /// Row visible under Results `/` filter (case-insensitive substring).

@@ -77,9 +77,18 @@ fn parse_er_edges_and_filter() {
     assert_eq!(edges.len(), 2);
     assert_eq!(edges[0].0, "users");
     assert_eq!(edges[0].3, "user_id");
-    let canvas = render_er_canvas("public", &edges);
+    let tables = vec!["users".into(), "orders".into(), "items".into()];
+    let canvas = render_er_canvas("public", &tables, &edges);
     assert!(canvas.contains("users"));
     assert!(canvas.contains("──►"));
+
+    // Cross-schema sketch form (#114).
+    let xs = parse_er_edges("app.orders.user_id --> auth.users.id\n");
+    assert_eq!(xs.len(), 1);
+    assert_eq!(xs[0].0, "app.orders");
+    assert_eq!(xs[0].1, "user_id");
+    assert_eq!(xs[0].2, "auth.users");
+    assert_eq!(xs[0].3, "id");
 
     let row = vec!["Alice".into(), "42".into()];
     assert!(row_matches_filter(&row, "ali"));
