@@ -7509,6 +7509,9 @@ impl DbWorkspace {
         }
         let restore = self.active_source.clone();
         let restore_db = self.active_database.clone();
+        // Preserve the active tab's binding — execute_sql_text flushes mid-loop (#88).
+        let tab_sid = self.tabs.get(self.active_tab).and_then(|t| t.source_id.clone());
+        let tab_db = self.tabs.get(self.active_tab).and_then(|t| t.database.clone());
         let start = std::time::Instant::now();
         let mut rows: Vec<Vec<String>> = Vec::new();
         for (id, name) in &targets {
@@ -7529,6 +7532,10 @@ impl DbWorkspace {
         }
         self.active_source = restore;
         self.active_database = restore_db;
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.source_id = tab_sid;
+            tab.database = tab_db;
+        }
         let elapsed_ms = start.elapsed().as_millis();
         let ok = rows.iter().filter(|r| r.get(1).map(|s| s.as_str()) == Some("ok")).count();
         let err = rows.len() - ok;
@@ -7540,6 +7547,59 @@ impl DbWorkspace {
         self.last_result = Some(result);
         self.status = format!("fan-out · {ok} ok · {err} err · {elapsed_ms} ms");
         Ok(())
+    }
+
+    /// Query each pinned source with the console SQL and compare row counts (#88).
+    pub async fn run_fanout_rowcount_assert(&mut self) -> Result<String> {
+        let sql = self.sql.trim().to_string();
+        if sql.is_empty() {
+            bail!("empty SQL — write a statement first");
+        }
+        let targets: Vec<(String, String)> = self
+            .sources
+            .iter()
+            .filter(|s| s.pinned)
+            .map(|s| (s.id.clone(), s.name.clone()))
+            .collect();
+        if targets.is_empty() {
+            bail!("pin at least one connection (★) for fan-out assert");
+        }
+        let restore = self.active_source.clone();
+        let restore_db = self.active_database.clone();
+        let tab_sid = self.tabs.get(self.active_tab).and_then(|t| t.source_id.clone());
+        let tab_db = self.tabs.get(self.active_tab).and_then(|t| t.database.clone());
+        let saved = self.last_result.clone();
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for (id, name) in &targets {
+            self.active_source = Some(id.clone());
+            self.active_database = self
+                .sources
+                .iter()
+                .find(|s| s.id == *id)
+                .map(|s| s.database.clone())
+                .filter(|d| !d.is_empty());
+            match self.execute_sql_text(&sql).await {
+                Ok(()) => {
+                    let n = self
+                        .last_result
+                        .as_ref()
+                        .map(|r| r.rows.len())
+                        .unwrap_or(0);
+                    counts.push((name.clone(), n));
+                }
+                Err(e) => {
+                    counts.push((format!("{name} · err: {e:#}"), usize::MAX));
+                }
+            }
+        }
+        self.active_source = restore;
+        self.active_database = restore_db;
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.source_id = tab_sid;
+            tab.database = tab_db;
+        }
+        self.last_result = saved;
+        Ok(crate::persona::fanout_rowcount_assert(&counts))
     }
 
     /// Pretty-print (light) the active console SQL in place.

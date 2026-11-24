@@ -750,7 +750,23 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
             Span::styled(value_shown, value_style),
         ]));
     }
-    frame.render_widget(Paragraph::new(lines), inner[0]);
+    // Focus-following scroll so SSH fields stay visible when feedback shrinks the body (#96).
+    let body_h = inner[0].height as usize;
+    let focus_line = lines
+        .iter()
+        .position(|l| l.spans.first().is_some_and(|s| s.content.starts_with('›')))
+        .unwrap_or(0);
+    let scroll = if focus_line + 1 > body_h {
+        focus_line
+            .saturating_sub(body_h.saturating_sub(1))
+            .min(lines.len().saturating_sub(body_h))
+    } else {
+        0
+    };
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll as u16, 0)),
+        inner[0],
+    );
 
     let foot_idx = if let Some((ref msg, err)) = form.test_feedback {
         let badge = if err {

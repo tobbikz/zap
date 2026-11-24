@@ -412,7 +412,8 @@ impl App {
                 };
                 (
                     format!("{} · {} · {where_}", s.name, s.driver.label()),
-                    format!("workspace:{}", i + 1),
+                    // Unbounded index — not limited to slots 1–9 (#79).
+                    format!("workspace:{i}"),
                 )
             })
             .collect();
@@ -1412,7 +1413,7 @@ impl App {
         self.clear_db_sql_all_selected();
         if let Some(id) = self.db.active_source.clone() {
             if let Some(i) = self.db.sources.iter().position(|s| s.id == id) {
-                self.ui.home_selected = i.min(8);
+                self.ui.home_selected = i;
             }
         }
         let n = self.db.sources.len();
@@ -1420,19 +1421,26 @@ impl App {
             if n == 0 {
                 "DB Home · a add connection".to_string()
             } else {
-                format!("DB Home · {n} source(s) · Enter open · r health")
+                format!(
+                    "DB Home · {n} source(s) · Tab panes · Enter open · r health"
+                )
             },
             false,
         );
     }
 
+    /// Digit hotkeys 1–9 only (#79). Home / Workspaces use `open_db_source_at`.
     async fn open_db_source_slot(&mut self, slot: u8) {
         if slot == 0 || slot > 9 {
             return;
         }
-        let idx = (slot as usize).saturating_sub(1);
+        self.open_db_source_at((slot as usize).saturating_sub(1)).await;
+    }
+
+    /// Open connection by unbounded index (Home Enter, Workspaces palette) (#79).
+    async fn open_db_source_at(&mut self, idx: usize) {
         let Some(src) = self.db.sources.get(idx).cloned() else {
-            self.set_status(format!("no source [{slot}]"), true);
+            self.set_status(format!("no source [{}]", idx + 1), true);
             return;
         };
         self.ui.home_selected = idx;
@@ -1450,13 +1458,13 @@ impl App {
                 self.ui.busy_label = None;
                 self.enter_db_studio();
                 // Select active source in Explorer + fill Structure properties + gray strip.
-                if let Some(idx) = self
+                if let Some(flat_idx) = self
                     .db
                     .flat
                     .iter()
                     .position(|e| e.source_id == src.id && matches!(e.kind, DbNodeKind::Source))
                 {
-                    self.db.selected = idx;
+                    self.db.selected = flat_idx;
                 }
                 let _ = self.db.refresh_structure_for_selection().await;
                 self.set_ok(format!("connected · {}", src.name));
@@ -1493,8 +1501,7 @@ impl App {
             .ui
             .home_selected
             .min(self.db.sources.len().saturating_sub(1));
-        let slot = (idx + 1) as u8;
-        self.open_db_source_slot(slot).await;
+        self.open_db_source_at(idx).await;
     }
 
     /// Studio: cycle active source by delta (±1), reconnect, stay in Studio.
@@ -1557,8 +1564,7 @@ impl App {
             .ui
             .home_favorite_selected
             .min(pinned.len().saturating_sub(1));
-        let slot = (pinned[idx].0 + 1) as u8;
-        self.open_db_source_slot(slot).await;
+        self.open_db_source_at(pinned[idx].0).await;
     }
 
     /// Home Recents: connect last source, load history SQL into console, open Studio.
@@ -7114,9 +7120,9 @@ impl App {
                 return Ok(());
             }
         }
-        if let Some(slot_str) = item.id.strip_prefix("workspace:") {
-            if let Ok(slot) = slot_str.parse::<u8>() {
-                self.open_db_source_slot(slot).await;
+        if let Some(idx_str) = item.id.strip_prefix("workspace:") {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                self.open_db_source_at(idx).await;
             }
             return Ok(());
         }
@@ -7901,21 +7907,13 @@ impl App {
                     None => self.set_status("run a query first", true),
                 }
             }
-            "fanout_assert" => {
-                // Compare last result rowcount to itself as placeholder when multi-pin unavailable.
-                let n = self
-                    .db
-                    .last_result
-                    .as_ref()
-                    .map(|r| r.rows.len())
-                    .unwrap_or(0);
-                let msg = ide_db::fanout_rowcount_assert(&[
-                    ("active".into(), n),
-                    ("pinned-check".into(), n),
-                ]);
-                self.db.show_text_result("fanout", &msg);
-                self.ui.focus = Focus::Results;
-            }
+            "fanout_assert" => match self.db.run_fanout_rowcount_assert().await {
+                Ok(msg) => {
+                    self.db.show_text_result("fanout", &msg);
+                    self.ui.focus = Focus::Results;
+                }
+                Err(e) => self.set_status(format!("fanout: {e:#}"), true),
+            },
             "explain_cost" => {
                 let text = self
                     .db
@@ -8662,7 +8660,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
     app.ui.mode = Mode::Normal;
     if let Some(id) = app.db.active_source.clone() {
         if let Some(i) = app.db.sources.iter().position(|s| s.id == id) {
-            app.ui.home_selected = i.min(8);
+            app.ui.home_selected = i;
         }
     }
     app.db.refresh_stale_health().await;
@@ -9540,15 +9538,16 @@ async fn event_loop(
                             }
                         }
 
-                        // Database Home: source list · Enter open · A add · W workspaces
+                        // Database Home: Sources · Recents · Favorites (#78).
                         if app.ui.product == ProductMode::Database
                             && app.ui.db_surface == DbSurface::Home
                             && app.ui.mode == Mode::Normal
                             && !key.modifiers.contains(KeyModifiers::CONTROL)
                             && !key.modifiers.contains(KeyModifiers::SUPER)
                         {
-                            app.ui.home_pane = ide_ui::HomePane::Sources;
                             let n_sources = app.db.sources.len();
+                            let n_fav = app.db.sources.iter().filter(|s| s.pinned).count();
+                            let n_recent = app.db.history.len().min(6);
                             match key.code {
                                 KeyCode::Char('?') => {
                                     app.ui.show_help = !app.ui.show_help;
@@ -9562,24 +9561,76 @@ async fn event_loop(
                                     app.ui.status = None;
                                     continue;
                                 }
+                                KeyCode::Tab => {
+                                    app.ui.home_pane = match app.ui.home_pane {
+                                        ide_ui::HomePane::Sources => ide_ui::HomePane::Recents,
+                                        ide_ui::HomePane::Recents => ide_ui::HomePane::Favorites,
+                                        ide_ui::HomePane::Favorites => ide_ui::HomePane::Sources,
+                                    };
+                                    app.set_status(
+                                        match app.ui.home_pane {
+                                            ide_ui::HomePane::Sources => "Home · Connections",
+                                            ide_ui::HomePane::Recents => "Home · Recents",
+                                            ide_ui::HomePane::Favorites => "Home · Favorites",
+                                        },
+                                        false,
+                                    );
+                                    continue;
+                                }
+                                KeyCode::BackTab => {
+                                    app.ui.home_pane = match app.ui.home_pane {
+                                        ide_ui::HomePane::Sources => ide_ui::HomePane::Favorites,
+                                        ide_ui::HomePane::Recents => ide_ui::HomePane::Sources,
+                                        ide_ui::HomePane::Favorites => ide_ui::HomePane::Recents,
+                                    };
+                                    continue;
+                                }
                                 KeyCode::Up | KeyCode::Left => {
-                                    if n_sources > 0 {
-                                        app.ui.home_selected =
-                                            app.ui.home_selected.saturating_sub(1);
+                                    match app.ui.home_pane {
+                                        ide_ui::HomePane::Sources if n_sources > 0 => {
+                                            app.ui.home_selected =
+                                                app.ui.home_selected.saturating_sub(1);
+                                        }
+                                        ide_ui::HomePane::Favorites if n_fav > 0 => {
+                                            app.ui.home_favorite_selected =
+                                                app.ui.home_favorite_selected.saturating_sub(1);
+                                        }
+                                        ide_ui::HomePane::Recents if n_recent > 0 => {
+                                            app.ui.home_recent_selected =
+                                                app.ui.home_recent_selected.saturating_sub(1);
+                                        }
+                                        _ => {}
                                     }
                                     continue;
                                 }
                                 KeyCode::Down | KeyCode::Right => {
-                                    if n_sources > 0 {
-                                        let max = n_sources.saturating_sub(1);
-                                        if app.ui.home_selected < max {
-                                            app.ui.home_selected += 1;
+                                    match app.ui.home_pane {
+                                        ide_ui::HomePane::Sources if n_sources > 0 => {
+                                            let max = n_sources.saturating_sub(1);
+                                            if app.ui.home_selected < max {
+                                                app.ui.home_selected += 1;
+                                            }
                                         }
+                                        ide_ui::HomePane::Favorites if n_fav > 0 => {
+                                            let max = n_fav.saturating_sub(1);
+                                            if app.ui.home_favorite_selected < max {
+                                                app.ui.home_favorite_selected += 1;
+                                            }
+                                        }
+                                        ide_ui::HomePane::Recents if n_recent > 0 => {
+                                            let max = n_recent.saturating_sub(1);
+                                            if app.ui.home_recent_selected < max {
+                                                app.ui.home_recent_selected += 1;
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                     continue;
                                 }
                                 KeyCode::Enter => {
-                                    if n_sources == 0 {
+                                    if n_sources == 0
+                                        && matches!(app.ui.home_pane, ide_ui::HomePane::Sources)
+                                    {
                                         app.start_add_connection();
                                     } else {
                                         app.home_enter_studio().await;
@@ -9592,6 +9643,13 @@ async fn event_loop(
                                 }
                                 KeyCode::Char('w') | KeyCode::Char('W') => {
                                     app.open_db_workspaces_palette();
+                                    continue;
+                                }
+                                KeyCode::Char('r') | KeyCode::Char('R') => {
+                                    app.ui.busy_label = Some("health…".into());
+                                    app.db.refresh_stale_health().await;
+                                    app.ui.busy_label = None;
+                                    app.set_status("connection health refreshed", false);
                                     continue;
                                 }
                                 _ => {}
@@ -9983,6 +10041,18 @@ async fn event_loop(
                                 }
 
                             }
+
+                            // Terminal owns keys first — Studio f/1–4/?/Tab/Esc must not steal (#86).
+                            if app.ui.focus == Focus::Terminal && app.ui.mode == Mode::Normal {
+                                let ctx = Keymap::context(app.ui.mode, app.ui.focus);
+                                if let Some(action) = Keymap::map(ctx, key) {
+                                    app.handle_action(action, view_h, term_rows).await?;
+                                } else {
+                                    app.forward_terminal_key(key)?;
+                                }
+                                continue;
+                            }
+
                             match key.code {
                                 KeyCode::Tab
                                     if !ctrl && app.ui.mode == Mode::Normal =>
@@ -10136,16 +10206,6 @@ async fn event_loop(
                                 }
                                 _ => {}
                             }
-                        }
-
-                        if app.ui.focus == Focus::Terminal && app.ui.mode == Mode::Normal {
-                            let ctx = Keymap::context(app.ui.mode, app.ui.focus);
-                            if let Some(action) = Keymap::map(ctx, key) {
-                                app.handle_action(action, view_h, term_rows).await?;
-                            } else {
-                                app.forward_terminal_key(key)?;
-                            }
-                            continue;
                         }
 
                         let ctx = Keymap::context(app.ui.mode, app.ui.focus);

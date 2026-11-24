@@ -205,7 +205,7 @@ fn rows_from_mssql(rows: &[tiberius::Row]) -> QueryResult {
 }
 
 fn mssql_cell(row: &tiberius::Row, i: usize) -> String {
-    // Try common types; fall back to debug.
+    // Broaden Tiberius coverage — uniqueidentifier / decimal / dates / bytes (#56).
     if let Ok(v) = row.try_get::<&str, _>(i) {
         return v.unwrap_or("NULL").to_string();
     }
@@ -215,18 +215,65 @@ fn mssql_cell(row: &tiberius::Row, i: usize) -> String {
     if let Ok(v) = row.try_get::<i32, _>(i) {
         return v.map(|n| n.to_string()).unwrap_or_else(|| "NULL".into());
     }
+    if let Ok(v) = row.try_get::<i16, _>(i) {
+        return v.map(|n| n.to_string()).unwrap_or_else(|| "NULL".into());
+    }
+    if let Ok(v) = row.try_get::<u8, _>(i) {
+        return v.map(|n| n.to_string()).unwrap_or_else(|| "NULL".into());
+    }
     if let Ok(v) = row.try_get::<f64, _>(i) {
+        return v.map(|n| n.to_string()).unwrap_or_else(|| "NULL".into());
+    }
+    if let Ok(v) = row.try_get::<f32, _>(i) {
         return v.map(|n| n.to_string()).unwrap_or_else(|| "NULL".into());
     }
     if let Ok(v) = row.try_get::<bool, _>(i) {
         return v.map(|n| n.to_string()).unwrap_or_else(|| "NULL".into());
+    }
+    if let Ok(v) = row.try_get::<uuid::Uuid, _>(i) {
+        return v
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "NULL".into());
+    }
+    if let Ok(v) = row.try_get::<tiberius::numeric::Numeric, _>(i) {
+        return v
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "NULL".into());
     }
     if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(i) {
         return v
             .map(|n| n.to_string())
             .unwrap_or_else(|| "NULL".into());
     }
-    "NULL".into()
+    if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(i) {
+        return v
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "NULL".into());
+    }
+    if let Ok(v) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(i) {
+        return v
+            .map(|n| n.to_rfc3339())
+            .unwrap_or_else(|| "NULL".into());
+    }
+    if let Ok(v) = row.try_get::<&[u8], _>(i) {
+        return match v {
+            None => "NULL".into(),
+            Some(b) if b.is_empty() => String::new(),
+            Some(b) => {
+                let mut s = String::with_capacity(2 + b.len() * 2);
+                s.push_str("0x");
+                for byte in b {
+                    s.push_str(&format!("{byte:02x}"));
+                }
+                s
+            }
+        };
+    }
+    // Last resort: column type name so grids are not silently empty.
+    row.columns()
+        .get(i)
+        .map(|c| format!("<{:?}>", c.column_type()))
+        .unwrap_or_else(|| "NULL".into())
 }
 
 pub async fn exec_clickhouse(
