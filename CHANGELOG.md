@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- Data compare: deterministic ORDER BY (PK or col 1); don't collapse duplicate rows without PK; fix ClickHouse db.table resolution (#137).
+- `generate_schema_diff_ddl`: strip `?` nullable markers from DDL types; patch left (target) side for `+` objects; dialect-valid DROP (no CASCADE on SQLite/MSSQL); nullability drift emits SET/DROP NOT NULL (#134).
+- Structure pane: separate `structure_selected` from `structure_scroll`; ↑↓ moves selection with highlight; Enter acts on selected row (#29).
+- FK jump from Structure auto-expands target schema if not loaded (#30).
+
+### Added
+
+- Charts: `c` chart · `C` cycle kind (bar/line/pie) · `V` cycle value column · `L` cycle category column in Results (#110).
+- Transaction chords in Results: `t` begin · `x` rollback · `X` commit; discover overlay updated (#28).
+
+### Previously Fixed
+
 - BigQuery: poll `jobComplete` until done (~60 s timeout); fix `test_data_source` pool key mismatch (#157).
 - Snowflake: `snowflake_configured` accepts env-only host/user; `output_format=csv`; CSV fallback; first-seen column order (#158).
 - Redis/Mongo/ES: `guard_writable` allows read commands; Redis keys carry type-aware `query_sql`; `open_selected_table_tab` uses it; driver-specific studio starter (#91).

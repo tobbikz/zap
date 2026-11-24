@@ -1308,18 +1308,20 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
                 format!(" structure · {fitted} ")
             };
             let scroll = ws.structure_scroll.min(ws.structure_lines.len().saturating_sub(1));
+            let selected = ws.structure_selected;
             let inner_w = area.width.saturating_sub(2) as usize;
             let items: Vec<ListItem> = ws
                 .structure_lines
                 .iter()
+                .enumerate()
                 .skip(scroll)
                 .take(inner_h.max(1))
-                .map(|line| {
+                .map(|(idx, line)| {
                     let icon = match line.kind {
                         StructureLineKind::Section => icons::structure_section(&line.text),
                         _ => "",
                     };
-                    let (prefix, style) = match line.kind {
+                    let (prefix, mut style) = match line.kind {
                         StructureLineKind::Section => (
                             if icon.is_empty() {
                                 String::new()
@@ -1331,6 +1333,10 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
                         StructureLineKind::Item => ("  ".into(), theme::style_text()),
                         StructureLineKind::Ddl => ("  ".into(), theme::style_muted()),
                     };
+                    // Highlight the selected row (#29).
+                    if focused && idx == selected {
+                        style = style.bg(theme::surface_3());
+                    }
                     let max = inner_w.saturating_sub(prefix.chars().count()).max(4);
                     let mut text = format!("{prefix}{}", truncate_chars(&line.text, max));
                     let pad = inner_w.saturating_sub(text.chars().count());
@@ -3491,9 +3497,11 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("Ctrl-W", "close SQL tab"),
             ("m", "actions · export · copy · page · hide chart"),
             ("Enter", "inspect · Plan · Chart"),
+            ("c", "chart · C kind · V value · L label"),
             ("w  o", "WHERE · ORDER BY"),
             ("y  Y", "yank cell · row"),
             ("a", "apply Changes"),
+            ("t", "begin txn · x rollback · X commit"),
             ("Esc", "cancel running query (not kill)"),
             ("K", "kill session at cursor (confirm)"),
             ("P", "pin leading columns"),

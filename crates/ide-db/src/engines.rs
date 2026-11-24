@@ -174,6 +174,9 @@ pub async fn exec_mssql(client: &Arc<Mutex<MssqlClient>>, sql: &str) -> Result<Q
             cursor_col: 0,
             explain: None,
             chart: None,
+            chart_value_col: None,
+            chart_category_col: None,
+            chart_kind_name: None,
             page: 0,
             has_more: false,
         })
@@ -358,6 +361,9 @@ pub async fn exec_clickhouse(
             cursor_col: 0,
             explain: None,
             chart: None,
+            chart_value_col: None,
+            chart_category_col: None,
+            chart_kind_name: None,
             page: 0,
             has_more: false,
         });

@@ -801,6 +801,12 @@ pub struct QueryResult {
     pub explain: Option<String>,
     /// ASCII chart / sparkline text (Results footer).
     pub chart: Option<String>,
+    /// Chart: chosen value column index (None = auto-detect first numeric) (#110).
+    pub chart_value_col: Option<usize>,
+    /// Chart: chosen category/label column index (None = row indices) (#110).
+    pub chart_category_col: Option<usize>,
+    /// Chart: active kind name ("bar"/"line"/"pie"; None = default bar) (#110).
+    pub chart_kind_name: Option<String>,
     /// Zero-based page when results were fetched with LIMIT/OFFSET.
     pub page: usize,
     /// More rows may exist beyond this page.
@@ -856,6 +862,9 @@ impl QueryResult {
             cursor_col: 0,
             explain: None,
             chart: None,
+            chart_value_col: None,
+            chart_category_col: None,
+            chart_kind_name: None,
             page: 0,
             has_more: false,
         }
@@ -1510,6 +1519,8 @@ pub struct DbWorkspace {
     pub structure_lines: Vec<StructureLine>,
     pub structure_title: String,
     pub structure_scroll: usize,
+    /// Logical selected row in structure — independent of scroll (#29).
+    pub structure_selected: usize,
     /// Console transaction open on `txn_pool_key` (held connection; not pool auto-commit).
     pub in_txn: bool,
     pools: HashMap<String, LivePool>,
@@ -1662,6 +1673,7 @@ impl Default for DbWorkspace {
             structure_lines: Vec::new(),
             structure_title: String::new(),
             structure_scroll: 0,
+            structure_selected: 0,
             in_txn: false,
             txn_pool_key: None,
             txn_conn: None,
@@ -3145,6 +3157,7 @@ impl DbWorkspace {
                 StructureLine::ddl("Enter / F5 runs the canned admin SELECT."),
             ];
             self.structure_scroll = 0;
+            self.structure_selected = 0;
             self.status = format!("admin: {}", entry.label);
         } else {
             self.status = "loaded into Console · F5 to run".into();
@@ -3367,6 +3380,7 @@ impl DbWorkspace {
             self.structure_lines.clear();
             self.structure_title.clear();
             self.structure_scroll = 0;
+            self.structure_selected = 0;
             return Ok(());
         };
         match entry.kind {
@@ -3464,6 +3478,7 @@ impl DbWorkspace {
         self.structure.clear();
         self.structure_title = format!("{} · properties", src.name);
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         let mut lines = vec![
             StructureLine::section("CONNECTION"),
             StructureLine::item(format!("name     {}", src.name)),
@@ -3526,6 +3541,7 @@ impl DbWorkspace {
         self.structure.clear();
         self.structure_title = format!("{name} · database");
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         self.structure_lines = vec![
             StructureLine::section("DATABASE"),
             StructureLine::item(format!("name   {name}")),
@@ -3542,6 +3558,7 @@ impl DbWorkspace {
         self.structure.clear();
         self.structure_title = format!("{schema} · schema");
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         self.structure_lines = vec![
             StructureLine::section("SCHEMA"),
             StructureLine::item(format!("name     {schema}")),
@@ -3640,6 +3657,7 @@ impl DbWorkspace {
     fn set_structure_query_hint(&mut self, preview: Option<String>) {
         self.structure.clear();
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         self.structure_title = String::new();
         let mut lines = vec![StructureLine::section("CONSOLE QUERY")];
         if let Some(p) = preview.filter(|s| !s.is_empty()) {
@@ -3708,6 +3726,7 @@ impl DbWorkspace {
             format!("{schema}.{table}")
         };
         self.structure_scroll = 0;
+        self.structure_selected = 0;
 
         let mut lines = Vec::new();
         if !stats.is_empty() {
@@ -6398,6 +6417,83 @@ impl DbWorkspace {
         Ok(chart)
     }
 
+    /// Cycle chart kind (bar → line → pie → bar) and re-render (#110).
+    pub fn chart_cycle_kind(&mut self) -> Result<String> {
+        let Some(result) = self.last_result.as_mut() else {
+            bail!("no results to chart");
+        };
+        let kinds = result_chart::CHART_KINDS;
+        let cur = result.chart_kind_name.as_deref().unwrap_or("bar");
+        let next_idx = kinds.iter().position(|k| *k == cur).map(|i| (i + 1) % kinds.len()).unwrap_or(0);
+        let next = kinds[next_idx].to_string();
+        result.chart_kind_name = Some(next.clone());
+        let vcol = result.chart_value_col.or(Some(result.cursor_col));
+        let lcol = result.chart_category_col;
+        let chart = chart_typed(result, &next, vcol, lcol)?;
+        result.chart = Some(chart.clone());
+        Ok(format!("chart:{next}"))
+    }
+
+    /// Cycle chart value column to next numeric column (#110).
+    pub fn chart_cycle_value_col(&mut self) -> Result<String> {
+        let Some(result) = self.last_result.as_mut() else {
+            bail!("no results to chart");
+        };
+        let ncols = result.columns.len();
+        if ncols == 0 {
+            bail!("no columns");
+        }
+        let cur = result.chart_value_col.unwrap_or(result.cursor_col);
+        let mut next = (cur + 1) % ncols;
+        let start = next;
+        loop {
+            let is_numeric = result.rows.iter().any(|r| {
+                r.get(next)
+                    .map(|c| c != "NULL" && c.parse::<f64>().is_ok())
+                    .unwrap_or(false)
+            });
+            if is_numeric { break; }
+            next = (next + 1) % ncols;
+            if next == start { break; }
+        }
+        result.chart_value_col = Some(next);
+        let col_name = result.columns.get(next).cloned().unwrap_or_default();
+        let kind = result.chart_kind_name.clone().unwrap_or_else(|| "bar".into());
+        let lcol = result.chart_category_col;
+        let chart = chart_typed(result, &kind, Some(next), lcol)?;
+        result.chart = Some(chart.clone());
+        Ok(format!("value:{col_name}"))
+    }
+
+    /// Cycle chart category/label column (#110).
+    pub fn chart_cycle_category_col(&mut self) -> Result<String> {
+        let Some(result) = self.last_result.as_mut() else {
+            bail!("no results to chart");
+        };
+        let ncols = result.columns.len();
+        if ncols == 0 {
+            bail!("no columns");
+        }
+        let cur = result.chart_category_col;
+        let next = match cur {
+            Some(c) => {
+                let n = (c + 1) % (ncols + 1);
+                if n == ncols { None } else { Some(n) }
+            }
+            None => Some(0),
+        };
+        result.chart_category_col = next;
+        let label = match next {
+            Some(ci) => result.columns.get(ci).cloned().unwrap_or_else(|| format!("col{ci}")),
+            None => "row#".into(),
+        };
+        let kind = result.chart_kind_name.clone().unwrap_or_else(|| "bar".into());
+        let vcol = result.chart_value_col.or(Some(result.cursor_col));
+        let chart = chart_typed(result, &kind, vcol, next)?;
+        result.chart = Some(chart.clone());
+        Ok(format!("label:{label}"))
+    }
+
     /// Clear inline `result.chart` overlay (#105).
     pub fn dismiss_chart(&mut self) -> bool {
         let Some(result) = self.last_result.as_mut() else {
@@ -6845,6 +6941,51 @@ impl DbWorkspace {
             }
         }
         false
+    }
+
+    /// Expand the target schema in the explorer tree, then select the table (#30).
+    pub async fn expand_and_select_table(
+        &mut self,
+        source_id: &str,
+        database: Option<&str>,
+        schema: &str,
+        table: &str,
+    ) -> Result<bool> {
+        // Already present? Quick path.
+        if self.select_table_in_explorer(source_id, database, schema, table) {
+            return Ok(true);
+        }
+        self.ensure_connected(source_id, database).await?;
+        // Find the schema node and expand it if needed.
+        let schema_id = self.flat.iter().find_map(|e| {
+            if e.source_id == source_id
+                && e.database.as_deref() == database
+                && e.schema.as_deref() == Some(schema)
+                && e.kind == DbNodeKind::Schema
+            {
+                Some(e.id.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(sid) = schema_id {
+            let needs_load = find_node(&self.tree, &sid)
+                .map(|n| !n.expanded || n.children.is_empty())
+                .unwrap_or(true);
+            if needs_load {
+                if let Some(node) = find_node_mut(&mut self.tree, &sid) {
+                    node.expanded = true;
+                }
+                let children = self.introspect_tables(source_id, database, schema).await?;
+                if let Some(node) = find_node_mut(&mut self.tree, &sid) {
+                    if node.children.is_empty() {
+                        node.children = children;
+                    }
+                }
+                self.rebuild_flat();
+            }
+        }
+        Ok(self.select_table_in_explorer(source_id, database, schema, table))
     }
 
     /// Explorer selection or bound table tab → `(source_id, database, schema, table)`.
@@ -11295,6 +11436,7 @@ impl DbWorkspace {
             StructureLine::ddl("+ only right · - only left · ~ type/null drift"),
         ];
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         self.status = if n == 0 {
             format!("schema diff · identical · {elapsed_ms} ms")
         } else {
@@ -11347,6 +11489,7 @@ impl DbWorkspace {
             let left_ty = row.get(2).map(|s| s.as_str()).unwrap_or("");
             let right_ty = row.get(3).map(|s| s.as_str()).unwrap_or("");
             match change {
+                // `+` objects exist only on right → patch left to gain them (#134).
                 "+" if object.starts_with("table ") => {
                     let t = object.trim_start_matches("table ").trim();
                     let cols = self
@@ -11362,7 +11505,7 @@ impl DbWorkspace {
                     if cols.is_empty() {
                         ddl.push_str(&format!("-- TODO: CREATE TABLE {t} (...);\n\n"));
                     } else {
-                        ddl.push_str(&ddl_create_table(driver, &right.schema, t, &cols));
+                        ddl.push_str(&ddl_create_table(driver, &left.schema, t, &cols));
                         ddl.push_str("\n\n");
                     }
                 }
@@ -11373,7 +11516,7 @@ impl DbWorkspace {
                 }
                 "+" if object.contains('.') => {
                     let (t, col) = object.split_once('.').unwrap_or((object, ""));
-                    ddl.push_str(&ddl_add_column(driver, &right.schema, t, col, right_ty));
+                    ddl.push_str(&ddl_add_column(driver, &left.schema, t, col, right_ty));
                     ddl.push_str("\n\n");
                 }
                 "-" if object.contains('.') => {
@@ -11608,15 +11751,21 @@ impl DbWorkspace {
             .table_primary_keys(source_id, side.database.as_deref(), &side.schema, &side.table)
             .await?;
         let qual = table_qual(driver, &side.schema, &side.table);
-        let sql = format!("SELECT * FROM {qual} LIMIT {limit}");
+        // Deterministic ORDER BY: use PK columns when available, else column 1 (#137).
+        let order = if !pks.is_empty() {
+            pks.iter().map(|c| ident_quote(driver, c)).collect::<Vec<_>>().join(", ")
+        } else {
+            "1".to_string()
+        };
+        let sql = format!("SELECT * FROM {qual} ORDER BY {order} LIMIT {limit}");
         let qr = match pool {
             LivePool::Pg(p) => exec_pg(p, &sql).await?,
             LivePool::Mysql(p) => {
-                let q = format!("SELECT * FROM {qual} LIMIT {limit}");
+                let q = format!("SELECT * FROM {qual} ORDER BY {order} LIMIT {limit}");
                 exec_mysql(p, &q).await?
             }
             LivePool::Sqlite(p) => {
-                let q = format!("SELECT * FROM {qual} LIMIT {limit}");
+                let q = format!("SELECT * FROM {qual} ORDER BY {order} LIMIT {limit}");
                 exec_sqlite(p, &q).await?
             }
             LivePool::Mssql(c) => {
@@ -11627,17 +11776,18 @@ impl DbWorkspace {
                     )
                     .await;
                 }
-                let q = format!("SELECT TOP ({limit}) * FROM {qual}");
+                let q = format!("SELECT TOP ({limit}) * FROM {qual} ORDER BY {order}");
                 engines::exec_mssql(c, &q).await?
             }
             LivePool::Clickhouse(ch) => {
-                let db = side.database.as_deref().unwrap_or(&side.schema);
+                let ch_db = side.database.as_deref().unwrap_or(&side.schema);
+                let ch_tbl = &side.table;
                 let q = format!(
-                    "SELECT * FROM `{}`.`{}` LIMIT {limit}",
-                    db.replace('`', "``"),
-                    side.table.replace('`', "``")
+                    "SELECT * FROM `{}`.`{}` ORDER BY {order} LIMIT {limit}",
+                    ch_db.replace('`', "``"),
+                    ch_tbl.replace('`', "``")
                 );
-                engines::exec_clickhouse(&ch.with_database(db), &q, None).await?
+                engines::exec_clickhouse(&ch.with_database(ch_db), &q, None).await?
             }
             LivePool::Duckdb(d) => alt_engines::exec_duckdb(d, &sql).await?,
             LivePool::Redis(_) | LivePool::Mongo(_) | LivePool::CloudStub(_) | LivePool::Http(_) => {
@@ -11645,7 +11795,7 @@ impl DbWorkspace {
             }
         };
         let mut out = Vec::new();
-        for row in &qr.rows {
+        for (row_idx, row) in qr.rows.iter().enumerate() {
             let digest = row_digest(row);
             let preview = row_preview(row, &qr.columns);
             let key = if !pks.is_empty() {
@@ -11654,7 +11804,8 @@ impl DbWorkspace {
                     .filter_map(|pk| qr.columns.iter().position(|c| c == pk))
                     .collect();
                 if idxs.is_empty() {
-                    digest.clone()
+                    // No PK columns matched — use row index to avoid digest collapse (#137).
+                    format!("__row_{row_idx}_{digest}")
                 } else {
                     idxs.iter()
                         .map(|i| row.get(*i).cloned().unwrap_or_default())
@@ -11662,7 +11813,8 @@ impl DbWorkspace {
                         .join("|")
                 }
             } else {
-                digest.clone()
+                // No PK — use row index so duplicates are not collapsed (#137).
+                format!("__row_{row_idx}_{digest}")
             };
             out.push((key, digest, preview));
         }
@@ -12223,7 +12375,10 @@ fn ddl_create_table(driver: DbDriver, schema: &str, table: &str, cols: &[ColumnI
 fn ddl_drop_table(driver: DbDriver, schema: &str, table: &str) -> String {
     let qual = table_qual(driver, schema, table);
     match driver {
-        DbDriver::Mssql => format!("DROP TABLE IF EXISTS {qual};"),
+        // SQLite/DuckDB/MSSQL do not support CASCADE on DROP TABLE (#134).
+        DbDriver::Sqlite | DbDriver::Duckdb | DbDriver::Mssql => {
+            format!("DROP TABLE IF EXISTS {qual};")
+        }
         DbDriver::Mysql | DbDriver::Clickhouse => format!("DROP TABLE IF EXISTS {qual};"),
         _ => format!("DROP TABLE IF EXISTS {qual} CASCADE;"),
     }
@@ -12231,24 +12386,25 @@ fn ddl_drop_table(driver: DbDriver, schema: &str, table: &str) -> String {
 
 fn ddl_add_column(driver: DbDriver, schema: &str, table: &str, col: &str, ty: &str) -> String {
     let qual = table_qual(driver, schema, table);
-    let ty = ty.trim();
-    let ty = if ty.is_empty() {
-        match driver {
+    // Strip trailing `?` that the diff marks nullable types with (#134).
+    let ty = ty.trim().trim_end_matches('?').trim();
+    let (ty, null_clause) = if ty.is_empty() {
+        (match driver {
             DbDriver::Mssql => "nvarchar(max)",
             DbDriver::Mysql => "TEXT",
             _ => "text",
-        }
+        }, "")
     } else {
-        ty
+        (ty, "")
     };
     // T-SQL: ADD col ty — the COLUMN keyword is illegal on ADD (#127).
     match driver {
         DbDriver::Mssql => format!(
-            "ALTER TABLE {qual} ADD {} {ty};",
+            "ALTER TABLE {qual} ADD {} {ty}{null_clause};",
             ident_quote(driver, col)
         ),
         _ => format!(
-            "ALTER TABLE {qual} ADD COLUMN {} {ty};",
+            "ALTER TABLE {qual} ADD COLUMN {} {ty}{null_clause};",
             ident_quote(driver, col)
         ),
     }
@@ -12302,27 +12458,51 @@ fn ddl_alter_column(
     schema: &str,
     table: &str,
     col: &str,
-    _from: &str,
+    from: &str,
     to: &str,
 ) -> String {
     let qual = table_qual(driver, schema, table);
-    let to = to.trim();
-    let ty = if to.is_empty() { "text" } else { to.trim_end_matches('?') };
+    // Strip trailing `?` nullable marker from both sides (#134).
+    let from_trimmed = from.trim().trim_end_matches('?').trim();
+    let to_trimmed = to.trim().trim_end_matches('?').trim();
+    let ty = if to_trimmed.is_empty() { "text" } else { to_trimmed };
+    // Detect pure-nullability drift: same base type but `?` suffix changed (#134).
+    let from_nullable = from.trim().ends_with('?');
+    let to_nullable = to.trim().ends_with('?');
+    let type_same = norm_type(from_trimmed) == norm_type(to_trimmed);
+    let mut stmts = Vec::new();
     match driver {
-        DbDriver::Postgres => format!(
-            "ALTER TABLE {qual} ALTER COLUMN {} TYPE {ty};",
-            ident_quote(driver, col)
-        ),
-        DbDriver::Mysql | DbDriver::Clickhouse => format!(
-            "ALTER TABLE {qual} MODIFY COLUMN {} {ty};",
-            ident_quote(driver, col)
-        ),
-        DbDriver::Mssql => format!(
-            "ALTER TABLE {qual} ALTER COLUMN {} {ty};",
-            ident_quote(driver, col)
-        ),
+        DbDriver::Postgres => {
+            if !type_same {
+                stmts.push(format!(
+                    "ALTER TABLE {qual} ALTER COLUMN {} TYPE {ty};",
+                    ident_quote(driver, col)
+                ));
+            }
+            if from_nullable != to_nullable {
+                let null_action = if to_nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
+                stmts.push(format!(
+                    "ALTER TABLE {qual} ALTER COLUMN {} {null_action};",
+                    ident_quote(driver, col)
+                ));
+            }
+        }
+        DbDriver::Mysql | DbDriver::Clickhouse => {
+            let null_kw = if to_nullable { " NULL" } else { " NOT NULL" };
+            stmts.push(format!(
+                "ALTER TABLE {qual} MODIFY COLUMN {} {ty}{null_kw};",
+                ident_quote(driver, col)
+            ));
+        }
+        DbDriver::Mssql => {
+            let null_kw = if to_nullable { " NULL" } else { " NOT NULL" };
+            stmts.push(format!(
+                "ALTER TABLE {qual} ALTER COLUMN {} {ty}{null_kw};",
+                ident_quote(driver, col)
+            ));
+        }
         DbDriver::Sqlite | DbDriver::Duckdb => {
-            format!("-- SQLite/DuckDB: recreate table to change {} to {ty}", col)
+            stmts.push(format!("-- SQLite/DuckDB: recreate table to change {} to {ty}", col));
         }
         DbDriver::Redis
         | DbDriver::Mongo
@@ -12330,8 +12510,13 @@ fn ddl_alter_column(
         | DbDriver::Bigquery
         | DbDriver::Elasticsearch
         | DbDriver::Trino => {
-            format!("-- DDL not supported for {}", driver.label())
+            stmts.push(format!("-- DDL not supported for {}", driver.label()));
         }
+    }
+    if stmts.is_empty() {
+        format!("-- no change for {col}")
+    } else {
+        stmts.join("\n")
     }
 }
 
