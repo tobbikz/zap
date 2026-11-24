@@ -638,8 +638,11 @@ pub async fn mssql_columns(
     let qr = exec_mssql(
         client,
         &format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA = N'{}' AND TABLE_NAME = N'{}' ORDER BY ORDINAL_POSITION",
+            "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, \
+             c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION, c.NUMERIC_SCALE \
+             FROM INFORMATION_SCHEMA.COLUMNS c \
+             WHERE c.TABLE_SCHEMA = N'{}' AND c.TABLE_NAME = N'{}' \
+             ORDER BY c.ORDINAL_POSITION",
             schema.replace('\'', "''"),
             table.replace('\'', "''")
         ),
@@ -649,9 +652,16 @@ pub async fn mssql_columns(
         .rows
         .into_iter()
         .filter_map(|r| {
+            let base_type = r.get(1).cloned().unwrap_or_default();
+            let full_type = mssql_full_type_spec(
+                &base_type,
+                r.get(3).map(|s| s.as_str()),
+                r.get(4).map(|s| s.as_str()),
+                r.get(5).map(|s| s.as_str()),
+            );
             Some(ColumnInfo {
                 name: r.first()?.clone(),
-                data_type: r.get(1).cloned().unwrap_or_default(),
+                data_type: full_type,
                 nullable: r
                     .get(2)
                     .map(|s| s.eq_ignore_ascii_case("YES"))
@@ -659,6 +669,49 @@ pub async fn mssql_columns(
             })
         })
         .collect())
+}
+
+/// Build a full T-SQL type spec from INFORMATION_SCHEMA metadata (#113).
+fn mssql_full_type_spec(
+    base: &str,
+    char_max_len: Option<&str>,
+    num_precision: Option<&str>,
+    num_scale: Option<&str>,
+) -> String {
+    let bl = base.to_ascii_lowercase();
+    if matches!(
+        bl.as_str(),
+        "char" | "varchar" | "nchar" | "nvarchar" | "binary" | "varbinary"
+    ) {
+        let len = char_max_len
+            .filter(|s| !s.is_empty() && *s != "NULL")
+            .unwrap_or("-1");
+        let len_display = if len == "-1" { "max" } else { len };
+        return format!("{base}({len_display})");
+    }
+    if matches!(bl.as_str(), "decimal" | "numeric") {
+        let p = num_precision
+            .filter(|s| !s.is_empty() && *s != "NULL")
+            .unwrap_or("18");
+        let s = num_scale
+            .filter(|s| !s.is_empty() && *s != "NULL")
+            .unwrap_or("0");
+        return format!("{base}({p},{s})");
+    }
+    if matches!(bl.as_str(), "float") {
+        if let Some(p) = num_precision.filter(|s| !s.is_empty() && *s != "NULL" && *s != "53") {
+            return format!("{base}({p})");
+        }
+    }
+    if matches!(
+        bl.as_str(),
+        "datetime2" | "datetimeoffset" | "time"
+    ) {
+        if let Some(s) = num_scale.filter(|s| !s.is_empty() && *s != "NULL" && *s != "7") {
+            return format!("{base}({s})");
+        }
+    }
+    base.to_string()
 }
 
 pub async fn ch_databases(ch: &ClickhouseHttp, source_id: &str) -> Result<Vec<DbTreeNode>> {

@@ -10450,28 +10450,7 @@ impl DbWorkspace {
         let port = local_port.unwrap_or(if src.port == 0 { 1433 } else { src.port });
         let server = format!("{host},{port}");
 
-        if tool_on_path("sqlcmd") {
-            let script_q = "EXEC sp_MSforeachtable 'SELECT ''-- TABLE: ?'' AS [--]; SELECT * FROM ?'";
-            let mut cmd = Command::new("sqlcmd");
-            cmd.args(["-S", &server, "-d", db, "-I", "-b", "-r", "1", "-y", "0"]);
-            if !src.user.is_empty() {
-                cmd.args(["-U", &src.user]);
-            }
-            if !src.password.is_empty() {
-                cmd.args(["-P", &src.password]);
-            }
-            cmd.args([
-                "-o",
-                out.to_str().context("path utf8")?,
-                "-Q",
-                script_q,
-            ]);
-            let status = cmd.status().context("spawn sqlcmd (is it on PATH?)")?;
-            if status.success() && out.exists() && out.metadata()?.len() > 0 {
-                return Ok(out);
-            }
-        }
-
+        // Prefer mssql-scripter which emits real DDL+DML (#109).
         if tool_on_path("mssql-scripter") {
             let mut cmd = Command::new("mssql-scripter");
             cmd.args(["-S", &server, "-d", db, "--file-path", out.to_str().context("path utf8")?]);
@@ -10497,9 +10476,9 @@ impl DbWorkspace {
         };
 
         let mut body = format!(
-            "-- Zap MSSQL export (sqlcmd/mssql-scripter not used or failed)\n\
+            "-- Zap MSSQL export (mssql-scripter not found or failed)\n\
              -- database: {db}\n\
-             -- For large datasets prefer: sqlcmd or mssql-scripter on PATH\n\n"
+             -- For large datasets prefer: mssql-scripter on PATH\n\n"
         );
         let schemas = engines::mssql_schemas(c, source_id, Some(db)).await?;
         for sch_node in schemas {
@@ -10522,21 +10501,21 @@ impl DbWorkspace {
                         engines::mssql_show_create(c, Some(db), &schema, &table).await
                     {
                         if !def.is_empty() {
-                            body.push_str(&format!("-- view {schema}.{table}\n{def};\n\n"));
+                            body.push_str(&format!("-- view {schema}.{table}\n{def};\nGO\n\n"));
                             continue;
                         }
                     }
                 }
                 let cols = engines::mssql_columns(c, Some(db), &schema, &table).await?;
                 body.push_str(&format!(
-                    "-- table {schema}.{table}\n{}\n\n",
+                    "-- table {schema}.{table}\n{}\nGO\n\n",
                     engines::build_mssql_create_table(&schema, &table, &cols)
                 ));
                 let qual = engines::mssql_qual(&schema, &table);
                 let qr = engines::exec_mssql(c, &format!("SELECT * FROM {qual}")).await?;
                 if !qr.rows.is_empty() {
                     body.push_str(&mssql_inserts_from_result(&qr, &schema, &table));
-                    body.push('\n');
+                    body.push_str("GO\n\n");
                 }
             }
         }
@@ -11293,6 +11272,8 @@ impl DbWorkspace {
             StructureLine::item(format!("left  {left_label}")),
             StructureLine::item(format!("right {right_label}")),
             StructureLine::ddl("+ only right · - only left · ~ type/null drift"),
+            StructureLine::item("scope: table + column name/type/null only"),
+            StructureLine::item("indexes, FKs, constraints not compared (#124)"),
         ];
         self.structure_scroll = 0;
         self.status = if n == 0 {
@@ -11992,6 +11973,18 @@ fn split_sql_script(text: &str, mssql: bool) -> Vec<String> {
     out
 }
 
+/// N-prefix aware literal for MSSQL INSERT values (#113).
+fn mssql_literal(v: &str) -> String {
+    let t = v.trim();
+    if t == "NULL" || t.eq_ignore_ascii_case("<null>") {
+        "NULL".into()
+    } else if t.parse::<i64>().is_ok() || t.parse::<f64>().is_ok() {
+        t.to_string()
+    } else {
+        format!("N'{}'", v.replace('\'', "''"))
+    }
+}
+
 fn mssql_inserts_from_result(qr: &QueryResult, schema: &str, table: &str) -> String {
     let qual = engines::mssql_qual(schema, table);
     let cols = qr
@@ -12002,7 +11995,7 @@ fn mssql_inserts_from_result(qr: &QueryResult, schema: &str, table: &str) -> Str
         .join(", ");
     let mut out = String::new();
     for row in &qr.rows {
-        let vals = row.iter().map(|v| sql_literal(v)).collect::<Vec<_>>().join(", ");
+        let vals = row.iter().map(|v| mssql_literal(v)).collect::<Vec<_>>().join(", ");
         out.push_str(&format!("INSERT INTO {qual} ({cols}) VALUES ({vals});\n"));
     }
     out
