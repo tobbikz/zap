@@ -162,11 +162,19 @@ pub fn chart_kind_n(
             ))
         }
         "pie" => {
-            let sum: f64 = values.iter().sum::<f64>().max(f64::EPSILON);
+            // Abs-normalize so mixed signs cannot make sum≈0 and OOM on ● (#103).
+            let abs: Vec<f64> = values.iter().map(|v| v.abs()).collect();
+            let sum: f64 = abs.iter().sum();
+            if sum < f64::EPSILON {
+                return Some(format!(
+                    "{col_name}  n={}\n (pie: |sum|≈0 — cannot chart)\n",
+                    values.len()
+                ));
+            }
             let mut out = format!("{col_name}  n={}\n", values.len());
-            for (i, v) in values.iter().take(limit).enumerate() {
+            for (i, v) in abs.iter().take(limit).enumerate() {
                 let pct = (v / sum) * 100.0;
-                let n = (pct / 5.0).round() as usize;
+                let n = ((pct / 5.0).round() as usize).clamp(0, 20);
                 let wedge: String = std::iter::repeat('●').take(n).collect();
                 out.push_str(&format!("#{i} {pct:4.0}% {wedge}\n"));
             }
@@ -176,5 +184,27 @@ pub fn chart_kind_n(
             Some(out)
         }
         _ => chart_result_n(result, Some(ci), limit),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::QueryResult;
+
+    #[test]
+    fn pie_mixed_signs_near_zero_does_not_explode() {
+        let qr = QueryResult {
+            columns: vec!["n".into()],
+            rows: vec![vec!["100".into()], vec!["-100".into()]],
+            ..QueryResult::empty()
+        };
+        let out = chart_kind_n(&qr, "pie", Some(0), 12).expect("pie");
+        assert!(
+            out.contains("cannot chart") || out.contains('%'),
+            "{out}"
+        );
+        // Wedge width is clamped — never a multi-megabyte string.
+        assert!(out.len() < 4_000, "len={}", out.len());
     }
 }

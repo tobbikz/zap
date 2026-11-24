@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Postgres ER/FK: join on `constraint_schema`; cross-schema edges keep `schema.table` (#114).
+- SQLite ER: escape PRAGMA idents; resolve NULL `to` to parent PK (#107).
+- ER canvas draws all schema tables, not only FK participants (#106).
+- Pie chart: abs-normalize + clamp wedges (no OOM on mixed signs) (#103).
+- ClickHouse dump: views are DDL-only; SQLInsert names real `` `db`.`table` `` (#101 #112).
 - Create Table: AddBtn prev-field, Tab wraps, Delete guarded while typing, scroll (#149).
 - Trino: nextUri Basic Auth, DELETE on early stop, `OFFSET…LIMIT` paging (#155).
 - Elasticsearch: Explorer → `_search`; METHOD+body; tabular JSON arrays; unwrap `_id` (#156).

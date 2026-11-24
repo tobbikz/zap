@@ -398,11 +398,15 @@ fn render_line(col: &str, labels: &[String], values: &[f64]) -> String {
 }
 
 fn render_pie(col: &str, labels: &[String], values: &[f64]) -> String {
-    let sum: f64 = values.iter().sum::<f64>().max(f64::EPSILON);
+    let abs: Vec<f64> = values.iter().map(|v| v.abs()).collect();
+    let sum: f64 = abs.iter().sum();
+    if sum < f64::EPSILON {
+        return format!("Pie chart · {col}\n (pie: |sum|≈0 — cannot chart)\n");
+    }
     let mut out = format!("Pie chart · {col} (share %)\n");
-    for (i, v) in values.iter().take(12).enumerate() {
+    for (i, v) in abs.iter().take(12).enumerate() {
         let pct = (v / sum) * 100.0;
-        let n = (pct / 5.0).round() as usize;
+        let n = ((pct / 5.0).round() as usize).clamp(0, 20);
         let wedge: String = std::iter::repeat('●').take(n).collect();
         let lab = labels.get(i).map(|s| s.as_str()).unwrap_or("?");
         out.push_str(&format!(" {lab:>12} {pct:5.1}% {wedge}\n"));
