@@ -8239,12 +8239,16 @@ impl DbWorkspace {
                     })
                     .collect())
             }
-            LivePool::Mssql(_)
-            | LivePool::Clickhouse(_)
+            LivePool::Mssql(c) => {
+                // Grid edit/apply needs PK metadata (#60).
+                engines::mssql_primary_keys(c, self.active_database.as_deref(), schema, table).await
+            }
+            LivePool::Clickhouse(_)
             | LivePool::Duckdb(_)
             | LivePool::Redis(_)
             | LivePool::Mongo(_)
-            | LivePool::CloudStub(_) | LivePool::Http(_) => Ok(Vec::new()),
+            | LivePool::CloudStub(_)
+            | LivePool::Http(_) => Ok(Vec::new()),
         }
     }
 }

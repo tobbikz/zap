@@ -4633,15 +4633,29 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     };
 
     // Row: one line per column — scroll to keep selection visible.
+    // Chart: never scroll by grid cursor_row (that hid the sparkline/header) (#118).
     let scroll = if !drill && tab == 0 {
         col_i
             .saturating_sub(body_h.saturating_sub(1) / 2)
             .min(lines.len().saturating_sub(body_h))
-    } else if !drill && (tab == 1 || tab == 2) {
-        // Plan/Chart: keep cursor row near mid when long.
+    } else if !drill && tab == 1 {
         row_i
             .saturating_sub(body_h.saturating_sub(1) / 2)
             .min(lines.len().saturating_sub(body_h))
+    } else if !drill && tab == 2 {
+        let tag = format!("#{row_i} ");
+        let bar_line = lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.starts_with(&tag)))
+            .unwrap_or(0);
+        // Keep control strip (lines 0–1) visible; scroll only when the bar is below the fold.
+        if bar_line + 1 > body_h {
+            bar_line
+                .saturating_sub(body_h.saturating_sub(1))
+                .min(lines.len().saturating_sub(body_h))
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -4674,7 +4688,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             .copied()
             .unwrap_or("bar");
         format!(
-            " c {kind}   [ ] rows·{}   ←→ col   Tab JSON   Esc ",
+            " c {kind}   [ ] rows·{}   ↑↓ row   ←→ col   Tab JSON   Esc ",
             ctx.ui.chart_limit
         )
     } else {

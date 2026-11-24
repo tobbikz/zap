@@ -239,7 +239,7 @@ pub async fn exec_clickhouse(
         bail!("empty SQL");
     }
     let body = if is_query_like(sql) {
-        format!("{sql}\nFORMAT JSONCompact")
+        clickhouse_query_body(sql)
     } else {
         sql.to_string()
     };
@@ -315,6 +315,91 @@ fn parse_json_compact(text: &str) -> Result<QueryResult> {
     q.rows = rows;
     q.original_rows = q.rows.clone();
     Ok(q)
+}
+
+/// Prepare a ClickHouse SELECT-like body: strip one trailing `;`, skip appending
+/// FORMAT when the user already specified one (#66).
+fn clickhouse_query_body(sql: &str) -> String {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if sql_has_explicit_format(trimmed) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}\nFORMAT JSONCompact")
+    }
+}
+
+fn sql_has_explicit_format(sql: &str) -> bool {
+    // Walk outside strings/comments for a bare FORMAT keyword.
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_line = false;
+    let mut in_block = false;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_line {
+            if c == '\n' {
+                in_line = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block {
+            if c == '*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '\'' && !in_single {
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        if c == '\'' && in_single {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            in_single = false;
+            i += 1;
+            continue;
+        }
+        if in_single {
+            i += 1;
+            continue;
+        }
+        if c == '-' && bytes.get(i + 1) == Some(&b'-') {
+            in_line = true;
+            i += 2;
+            continue;
+        }
+        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        if c.eq_ignore_ascii_case(&'f') && i + 6 <= bytes.len() {
+            let word = &sql[i..i + 6];
+            if word.eq_ignore_ascii_case("format") {
+                let before_ok = i == 0 || {
+                    let b = bytes[i - 1];
+                    !b.is_ascii_alphanumeric() && b != b'_'
+                };
+                let after_ok = i + 6 >= bytes.len() || {
+                    let b = bytes[i + 6];
+                    !b.is_ascii_alphanumeric() && b != b'_'
+                };
+                if before_ok && after_ok {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn is_query_like(sql: &str) -> bool {
@@ -754,5 +839,32 @@ mod query_like_tests {
         assert!(is_query_like("INSERT INTO t VALUES (1) RETURNING id"));
         assert!(is_query_like("UPDATE t SET x=1 OUTPUT inserted.id"));
         assert!(!is_query_like("-- comment\nDELETE FROM t"));
+    }
+}
+
+#[cfg(test)]
+mod clickhouse_format_tests {
+    use super::{clickhouse_query_body, sql_has_explicit_format};
+
+    #[test]
+    fn strips_trailing_semicolon_and_appends_format() {
+        let body = clickhouse_query_body("SELECT 1;");
+        assert!(body.ends_with("FORMAT JSONCompact"), "{body}");
+        assert!(!body.contains("1;"), "{body}");
+    }
+
+    #[test]
+    fn respects_explicit_format() {
+        assert!(sql_has_explicit_format("SELECT 1 FORMAT Pretty"));
+        let body = clickhouse_query_body("SELECT 1 FORMAT Pretty;");
+        assert_eq!(body, "SELECT 1 FORMAT Pretty");
+        assert!(!body.contains("JSONCompact"));
+    }
+
+    #[test]
+    fn format_inside_string_is_ignored() {
+        assert!(!sql_has_explicit_format("SELECT 'FORMAT' AS x"));
+        let body = clickhouse_query_body("SELECT 'FORMAT' AS x");
+        assert!(body.contains("FORMAT JSONCompact"), "{body}");
     }
 }

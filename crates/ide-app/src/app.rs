@@ -9196,9 +9196,35 @@ async fn event_loop(
                             continue;
                         }
                         // Host chords: Super preferred, Control fallback (WM often eats Super).
+                        // Never steal keys while forms/modals own typing (#95).
+                        let host_form = matches!(
+                            app.ui.mode,
+                            Mode::DbConnect
+                                | Mode::EditCell
+                                | Mode::Find
+                                | Mode::Replace
+                                | Mode::Rename
+                                | Mode::Settings
+                                | Mode::OpenFolder
+                                | Mode::ImportCsv
+                                | Mode::RestoreDump
+                                | Mode::SchemaDiff
+                                | Mode::DataCompare
+                                | Mode::QueryParams
+                                | Mode::SaveMaterialize
+                                | Mode::BrainAsk
+                                | Mode::SessionForm
+                                | Mode::AgentForm
+                                | Mode::EditTableFilter
+                                | Mode::CreateObject
+                                | Mode::Commit
+                                | Mode::Command
+                                | Mode::Insert
+                                | Mode::Palette
+                        );
                         let modk = key.modifiers.contains(KeyModifiers::CONTROL)
                             || key.modifiers.contains(KeyModifiers::SUPER);
-                        if ide_nvim::is_host_chord(key.code, key.modifiers) {
+                        if !host_form && ide_nvim::is_host_chord(key.code, key.modifiers) {
                             if modk
                                 && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
                             {
@@ -9251,26 +9277,35 @@ async fn event_loop(
                                     .await?;
                                 continue;
                             }
-                            // Git / Sessions / Agents / Outline are not part of Zap.
-                            if modk
-                                && key.modifiers.contains(KeyModifiers::SHIFT)
-                                && matches!(
-                                    key.code,
+                            // Wire advertised Studio chords; leave unused ones as a hint (#95).
+                            if modk && key.modifiers.contains(KeyModifiers::SHIFT) {
+                                match key.code {
+                                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                                        app.handle_action(
+                                            Action::SearchEverywhere,
+                                            view_h,
+                                            term_rows,
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                                        app.handle_action(Action::OpenOutline, view_h, term_rows)
+                                            .await?;
+                                        continue;
+                                    }
                                     KeyCode::Char('s')
-                                        | KeyCode::Char('S')
-                                        | KeyCode::Char('a')
-                                        | KeyCode::Char('A')
-                                        | KeyCode::Char('o')
-                                        | KeyCode::Char('O')
-                                        | KeyCode::Char('g')
-                                        | KeyCode::Char('G')
-                                )
-                            {
-                                app.set_status(
-                                    "Zap · Super-⇧H home · Super-⇧D studio · 1–4 panes",
-                                    false,
-                                );
-                                continue;
+                                    | KeyCode::Char('S')
+                                    | KeyCode::Char('g')
+                                    | KeyCode::Char('G') => {
+                                        app.set_status(
+                                            "Zap · Super-⇧H home · Super-⇧D studio · 1–4 panes",
+                                            false,
+                                        );
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
                             }
                             if modk && !key.modifiers.contains(KeyModifiers::SHIFT) {
                                 if let KeyCode::Char(d) = key.code {
@@ -9636,6 +9671,9 @@ async fn event_loop(
                                         if let Some(r) = app.db.last_result.as_mut() {
                                             if app.ui.cell_modal_drill {
                                                 r.move_cell(-1, 0);
+                                            } else if app.ui.cell_modal_tab == 2 {
+                                                // Chart tab: move among grid rows (bar highlight) (#118).
+                                                r.move_cell(-1, 0);
                                             } else {
                                                 r.move_cell(0, -1);
                                             }
@@ -9645,6 +9683,8 @@ async fn event_loop(
                                     KeyCode::Down => {
                                         if let Some(r) = app.db.last_result.as_mut() {
                                             if app.ui.cell_modal_drill {
+                                                r.move_cell(1, 0);
+                                            } else if app.ui.cell_modal_tab == 2 {
                                                 r.move_cell(1, 0);
                                             } else {
                                                 r.move_cell(0, 1);
@@ -9664,7 +9704,10 @@ async fn event_loop(
                                         }
                                         continue;
                                     }
-                                    KeyCode::Char('m') => {
+                                    // Shift-M toggles monitor inside Inspect; bare `m` is Results actions (#80).
+                                    KeyCode::Char('M')
+                                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                    {
                                         app.ui.db_monitor = !app.ui.db_monitor;
                                         continue;
                                     }
@@ -9702,16 +9745,18 @@ async fn event_loop(
                                     _ => {}
                                 }
                             }
+                            // Shift-M toggles latency monitor; bare `m` → Results actions via Keymap (#80).
                             if !app.ui.cell_modal
                                 && app.ui.mode == Mode::Normal
-                                && matches!(key.code, KeyCode::Char('m'))
+                                && matches!(key.code, KeyCode::Char('M'))
+                                && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && !key.modifiers.contains(KeyModifiers::CONTROL)
                                 && app.ui.focus == Focus::Results
                             {
                                 app.ui.db_monitor = !app.ui.db_monitor;
                                 app.set_status(
                                     if app.ui.db_monitor {
-                                        "monitor on · m close"
+                                        "monitor on · Shift-M / Esc close"
                                     } else {
                                         "monitor off"
                                     },
@@ -9721,10 +9766,10 @@ async fn event_loop(
                             }
                             if app.ui.db_monitor
                                 && app.ui.mode == Mode::Normal
-                                && matches!(
-                                    key.code,
-                                    KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('q')
-                                )
+                                && (matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                                    || (matches!(key.code, KeyCode::Char('M'))
+                                        && key.modifiers.contains(KeyModifiers::SHIFT))
+                                    || matches!(key.code, KeyCode::Char('m')))
                             {
                                 app.ui.db_monitor = false;
                                 continue;
@@ -9905,8 +9950,10 @@ async fn event_loop(
                                     app.set_status(app.db.status.clone(), false);
                                     continue;
                                 }
+                                // Results: `[`/`]` page results via Keymap — tab cycle elsewhere (#80).
                                 if !ctrl
                                     && !alt
+                                    && app.ui.focus != Focus::Results
                                     && matches!(key.code, KeyCode::Char('[') | KeyCode::Char(']'))
                                 {
                                     match key.code {
