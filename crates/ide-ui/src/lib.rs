@@ -3496,6 +3496,7 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("a", "apply Changes"),
             ("Esc", "cancel running query (not kill)"),
             ("K", "kill session at cursor (confirm)"),
+            ("P", "pin leading columns"),
             ("Shift-T", "cycle theme"),
         ],
         Focus::Editor => &[

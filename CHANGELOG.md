@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Airflow/BI/model deep-links use `open_browser` (Windows/macOS/Linux) (#61 #49).
+- Results `P` cycles pinned columns (#44).
+- FEATURES: honest completions/search scope; migration preview (not dry-run) (#47 #142).
+- Data compare status notes `≤500 rows/side` (#123).
+- Migration rollback skips journal rollbacks / `.down.sql` (no `.down.down`) (#92).
+- `install.ps1` fails clearly when `PSScriptRoot` empty under `irm|iex` (#69).
 - Terminal forwards Ctrl-* to the focused PTY; Studio terminal preferred (#145).
 - Results meta shows query timeout; palette cycles 30s…off (#50).
 - Kill session confirms foreign pids; help distinguishes Esc cancel vs K (#54).

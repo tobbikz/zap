@@ -499,7 +499,7 @@ async fn wave14_15_data_editor_and_migrate_runner() {
     std::fs::write(&mig, "CREATE TABLE IF NOT EXISTS m (x INT);\nINSERT INTO m VALUES (1);\n")
         .unwrap();
     ws.dry_run_migration_file(&mig).unwrap();
-    assert!(ws.status.contains("dry-run"));
+    assert!(ws.status.contains("preview"));
     ws.apply_migration_file(&mig).await.unwrap();
     assert!(ws.migration_journal_path().exists() || dir.path().join(".migrate_journal.jsonl").exists());
     let help = DbWorkspace::studio_help_text();

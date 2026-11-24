@@ -7774,7 +7774,7 @@ impl DbWorkspace {
             .collect()
     }
 
-    /// Dry-run a migration file: show statements in Results without executing.
+    /// Preview migration statements in Results without executing (#142).
     pub fn dry_run_migration_file(&mut self, path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;
@@ -7798,7 +7798,7 @@ impl DbWorkspace {
         self.last_result = Some(result);
         self.pending_row_deletes.clear();
         self.status = format!(
-            "dry-run {} · {n} statement(s) — not executed",
+            "preview {} · {n} statement(s) — not executed (no DB validate)",
             path.file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("migrate.sql")
@@ -7895,7 +7895,14 @@ impl DbWorkspace {
         let mut out = Vec::new();
         for line in text.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                // Skip rollback journal lines and `.down.sql` paths (#92).
+                if v.get("kind").and_then(|x| x.as_str()) == Some("rollback") {
+                    continue;
+                }
                 if let Some(p) = v.get("path").and_then(|x| x.as_str()) {
+                    if p.ends_with(".down.sql") {
+                        continue;
+                    }
                     out.push(p.to_string());
                 }
             }
@@ -7958,7 +7965,12 @@ impl DbWorkspace {
             bail!("migration journal empty — nothing to rollback");
         };
         let up = PathBuf::from(&last_path);
-        let stem = up.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        // `migrate_0001.sql` → `migrate_0001.down.sql` (never `.down.down.sql`) (#92).
+        let stem = up
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .trim_end_matches(".down");
         let down = up.with_file_name(format!("{stem}.down.sql"));
         if !down.exists() {
             bail!(
@@ -11503,10 +11515,11 @@ impl DbWorkspace {
             self.active_tab = self.tabs.len() - 1;
         }
         self.last_result = Some(result);
+        let cap_note = format!("compared ≤{LIMIT} rows/side");
         self.status = if n == 0 {
-            format!("data compare · identical (sample) · {elapsed_ms} ms")
+            format!("data compare · identical (sample) · {cap_note} · {elapsed_ms} ms")
         } else {
-            format!("data compare · {n} row diff(s) · {elapsed_ms} ms")
+            format!("data compare · {n} row diff(s) · {cap_note} · {elapsed_ms} ms")
         };
         Ok(())
     }

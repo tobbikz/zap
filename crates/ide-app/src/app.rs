@@ -2925,7 +2925,7 @@ impl App {
     fn start_migrate_dry_run(&mut self) {
         self.ui.mode = Mode::ImportCsv;
         self.ui.confirm_run_sql = Some("__migrate_dry_run__".into());
-        self.ui.prompt_modal_title = " Migrate dry-run ".into();
+        self.ui.prompt_modal_title = " Preview migration ".into();
         self.ui.prompt_modal_hint = "  migration SQL path · Enter preview · Esc cancel".into();
         self.ui.import_csv_input = self
             .db
@@ -2939,7 +2939,7 @@ impl App {
                     .display()
                     .to_string()
             });
-        self.set_status("migration dry-run path · Enter · Esc cancel", false);
+        self.set_status("migration preview path · Enter · Esc cancel", false);
     }
 
     fn start_delete_result_row(&mut self) {
@@ -3639,7 +3639,7 @@ impl App {
                             self.ui.focus = Focus::Results;
                             self.set_status(self.db.status.clone(), false);
                         }
-                        Err(e) => self.set_status(format!("migrate dry-run: {e:#}"), true),
+                        Err(e) => self.set_status(format!("migrate preview: {e:#}"), true),
                     }
                 } else {
                     match self.db.apply_migration_file(&path).await {
@@ -6536,6 +6536,19 @@ impl App {
             Action::CycleTheme => {
                 self.apply_theme_id(&ide_ui::theme::cycle_theme(true));
             }
+            Action::TogglePinColumns => {
+                self.ui.results_pinned_cols = if self.ui.results_pinned_cols == 0 {
+                    1
+                } else if self.ui.results_pinned_cols == 1 {
+                    2
+                } else {
+                    0
+                };
+                self.set_status(
+                    format!("pinned columns · {} · P cycle", self.ui.results_pinned_cols),
+                    false,
+                );
+            }
             Action::ToggleResultsDensity => {
                 self.ui.results_compact = !self.ui.results_compact;
                 let label = if self.ui.results_compact {
@@ -7908,13 +7921,21 @@ impl App {
                 }
             }
             "airflow_link" => match ide_db::airflow_deep_link(&self.db.persona) {
-                Ok(url) => {
-                    self.db.show_text_result("airflow", &format!("Open: {url}\n"));
-                    self.ui.focus = Focus::Results;
-                    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
-                    self.set_status(url, false);
-                }
-                Err(e) => self.set_status(format!("airflow: {e:#}"), true),
+                Ok(url) => match ide_db::open_browser(&url) {
+                    Ok(()) => self.set_status(format!("opened {url}"), false),
+                    Err(e) => {
+                        self.db.show_text_result("airflow", &format!("Open: {url}\n"));
+                        self.ui.focus = Focus::Results;
+                        self.set_status(
+                            format!("browser: {e:#} · URL in Results · set persona airflow_url"),
+                            true,
+                        );
+                    }
+                },
+                Err(e) => self.set_status(
+                    format!("airflow: {e:#} · set persona airflow_url"),
+                    true,
+                ),
             },
             "bi_deeplink" => {
                 let schema = self
@@ -7930,11 +7951,14 @@ impl App {
                     .and_then(|r| r.source_table.clone())
                     .unwrap_or_else(|| "table".into());
                 match ide_db::bi_deep_link(&self.db.persona, &schema, &table) {
-                    Ok(url) => {
-                        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
-                        self.set_status(url, false);
-                    }
-                    Err(e) => self.set_status(format!("bi: {e:#}"), true),
+                    Ok(url) => match ide_db::open_browser(&url) {
+                        Ok(()) => self.set_status(format!("opened {url}"), false),
+                        Err(e) => self.set_status(format!("browser: {e:#} · {url}"), true),
+                    },
+                    Err(e) => self.set_status(
+                        format!("bi: {e:#} · set persona bi_url"),
+                        true,
+                    ),
                 }
             }
             "bi_export_csv" => {
@@ -7952,11 +7976,14 @@ impl App {
                 }
             }
             "model_registry_link" => match ide_db::model_registry_link(&self.db.persona) {
-                Ok(url) => {
-                    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
-                    self.set_status(url, false);
-                }
-                Err(e) => self.set_status(format!("registry: {e:#}"), true),
+                Ok(url) => match ide_db::open_browser(&url) {
+                    Ok(()) => self.set_status(format!("opened {url}"), false),
+                    Err(e) => self.set_status(format!("browser: {e:#} · {url}"), true),
+                },
+                Err(e) => self.set_status(
+                    format!("registry: {e:#} · set persona model_registry_url"),
+                    true,
+                ),
             },
             "codegen_rust" => match self.db.codegen_from_structure("rust") {
                 Ok(code) => {
