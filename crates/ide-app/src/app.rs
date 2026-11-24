@@ -175,6 +175,8 @@ pub struct App {
     theme_before_preview: Option<String>,
     /// Origin for restrained TUI motion (spinner / pulse).
     anim_origin: Instant,
+    /// Last known terminal width for horizontal-scroll calculations (#26).
+    last_term_width: u16,
 }
 
 impl App {
@@ -222,6 +224,7 @@ impl App {
             health_activity_tick: 0,
             theme_before_preview: None,
             anim_origin: Instant::now(),
+            last_term_width: 120,
         };
         app.config.remember_project(&app.workspace.root);
         app.db.query_timeout_secs = app.config.database.query_timeout_secs;
@@ -1487,6 +1490,103 @@ impl App {
         }
     }
 
+    /// Handle mouse events in Database Studio: click to focus panes, wheel to scroll (#27).
+    async fn handle_studio_mouse(&mut self, me: MouseEvent, _term_w: u16, term_h: u16) {
+        // Approximate Studio layout: row 0 = ribbon, row 1.. = panes.
+        // Left half: Explorer (top) + Structure (bottom) ≈ studio_left_width.
+        // Right half: Console (top) + Results (bottom).
+        let left_w = self.ui.studio_left_width;
+        let body_top = 1u16; // ribbon height
+        let body_h = term_h.saturating_sub(body_top + 1); // minus status
+        let results_h = (body_h as u32 * self.ui.results_pct as u32 / 100).max(3) as u16;
+        let console_h = body_h.saturating_sub(results_h);
+        let results_top = body_top + console_h;
+
+        let pane = if me.row < body_top {
+            None // ribbon
+        } else if me.column < left_w {
+            if me.row < body_top + body_h / 2 {
+                Some(Focus::Database)
+            } else {
+                Some(Focus::Structure)
+            }
+        } else if me.row < results_top {
+            Some(Focus::Editor)
+        } else {
+            Some(Focus::Results)
+        };
+
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(focus) = pane {
+                    if self.ui.focus != focus {
+                        self.ui.focus = focus;
+                        self.ui.mode = Mode::Normal;
+                        self.ui.show_completions = false;
+                        self.ui.completions.clear();
+                    }
+                    // Click in Explorer: select row under mouse.
+                    if focus == Focus::Database && me.row > body_top {
+                        let row_in_pane = (me.row - body_top) as usize;
+                        let idx = self.db.explorer_scroll + row_in_pane;
+                        if idx < self.db.flat.len() {
+                            self.db.selected = idx;
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(focus) = pane {
+                    match focus {
+                        Focus::Database => {
+                            self.db.explorer_scroll = self.db.explorer_scroll.saturating_sub(3);
+                        }
+                        Focus::Structure => {
+                            self.db.structure_scroll = self.db.structure_scroll.saturating_sub(3);
+                        }
+                        Focus::Editor => {
+                            self.ui.db_scroll_row = self.ui.db_scroll_row.saturating_sub(3);
+                        }
+                        Focus::Results => {
+                            if let Some(r) = self.db.last_result.as_mut() {
+                                r.cursor_row = r.cursor_row.saturating_sub(3);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(focus) = pane {
+                    match focus {
+                        Focus::Database => {
+                            if self.db.explorer_scroll + 3 < self.db.flat.len() {
+                                self.db.explorer_scroll += 3;
+                            }
+                        }
+                        Focus::Structure => {
+                            if self.db.structure_scroll + 3 < self.db.structure_lines.len() {
+                                self.db.structure_scroll += 3;
+                            }
+                        }
+                        Focus::Editor => {
+                            let max = self.db_line_count().saturating_sub(1);
+                            self.ui.db_scroll_row = (self.ui.db_scroll_row + 3).min(max);
+                        }
+                        Focus::Results => {
+                            if let Some(r) = self.db.last_result.as_mut() {
+                                let max = r.rows.len().saturating_sub(1);
+                                r.cursor_row = (r.cursor_row + 3).min(max);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn focus_db_explorer(&mut self) {
         self.ui.product = ProductMode::Database;
         self.ui.db_surface = DbSurface::Studio;
@@ -1938,6 +2038,18 @@ impl App {
             self.ui.db_scroll_row = self.ui.db_cursor.row;
         } else if self.ui.db_cursor.row >= self.ui.db_scroll_row + view_h {
             self.ui.db_scroll_row = self.ui.db_cursor.row.saturating_sub(view_h.saturating_sub(1));
+        }
+        // Horizontal scroll: keep caret inside visible columns (#26).
+        let line_count = self.db_line_count();
+        let gutter = (line_count.max(1).ilog10() as usize) + 1;
+        // Approximate text_cols from last known terminal width (conservative).
+        let text_cols = (self.last_term_width as usize).saturating_sub(gutter + 3 + 30);
+        let text_cols = text_cols.max(20);
+        let col = self.ui.db_cursor.col;
+        if col < self.ui.db_scroll_col {
+            self.ui.db_scroll_col = col;
+        } else if col >= self.ui.db_scroll_col + text_cols {
+            self.ui.db_scroll_col = col.saturating_sub(text_cols.saturating_sub(1));
         }
     }
 
@@ -2662,6 +2774,49 @@ impl App {
         Ok(())
     }
 
+    /// Run the statement under the cursor, or the selection if present (#20).
+    async fn run_query_at_cursor(&mut self) -> Result<()> {
+        let selection = if self.ui.db_sql_all_selected {
+            Some(self.db.sql.clone())
+        } else {
+            None // TODO: visual selection (future enhancement)
+        };
+        let (s_row, e_row) = self.db.statement_range_at_cursor(
+            self.ui.db_cursor.row,
+            self.ui.db_cursor.col,
+        );
+        let stmt = ide_db::statement_at_cursor_text(
+            &self.db.sql,
+            self.ui.db_cursor.row,
+            self.ui.db_cursor.col,
+            selection,
+        );
+        let stmt = stmt.trim().to_string();
+        if stmt.is_empty() {
+            self.set_status("no statement at cursor", true);
+            return Ok(());
+        }
+        if self.maybe_confirm_destructive_sql(stmt.clone()) {
+            return Ok(());
+        }
+        self.set_status(
+            format!("running statement (lines {}–{})…", s_row + 1, e_row + 1),
+            false,
+        );
+        self.ui.busy_label = Some("RUNNING…".into());
+        self.pending_db_query = false;
+        let result = self.db.execute_sql_text(&stmt).await;
+        self.finish_query_ui();
+        match result {
+            Ok(()) => {
+                self.ui.focus = Focus::Results;
+                self.set_status(self.db.status.clone(), false);
+            }
+            Err(e) => self.show_query_error(format!("{e:#}")),
+        }
+        Ok(())
+    }
+
     /// If persona wants a gate and SQL looks destructive, open confirm modal (#173).
     fn maybe_confirm_destructive_sql(&mut self, sql: String) -> bool {
         if !self.db.should_confirm_destructive(&sql) {
@@ -2701,6 +2856,9 @@ impl App {
         self.ui.results_col_window = 0;
         self.ui.cell_modal = false;
         self.ui.cell_modal_drill = false;
+        // Reset client-side sort on new results (#31).
+        self.ui.results_sort_col = None;
+        self.ui.results_sort_asc = true;
     }
 
     fn show_query_error(&mut self, msg: String) {
@@ -6647,6 +6805,45 @@ impl App {
             Action::OpenDbSourceSlot(n) => self.open_db_source_slot(n).await,
             Action::OpenDatabase => self.enter_database_mode(),
             Action::RunQuery => self.run_query().await?,
+            Action::RunQueryAtCursor => self.run_query_at_cursor().await?,
+            Action::ToggleSortColumn => {
+                if let Some(result) = &self.db.last_result {
+                    let col = result.cursor_col;
+                    if self.ui.results_sort_col == Some(col) {
+                        if self.ui.results_sort_asc {
+                            self.ui.results_sort_asc = false;
+                            let name = result.columns.get(col).map(|s| s.as_str()).unwrap_or("?");
+                            self.set_status(format!("sort {name} DESC"), false);
+                        } else {
+                            self.ui.results_sort_col = None;
+                            self.set_status("sort off", false);
+                        }
+                    } else {
+                        self.ui.results_sort_col = Some(col);
+                        self.ui.results_sort_asc = true;
+                        let name = result.columns.get(col).map(|s| s.as_str()).unwrap_or("?");
+                        self.set_status(format!("sort {name} ASC"), false);
+                    }
+                }
+            }
+            Action::WidenColumn => {
+                if let Some(result) = &self.db.last_result {
+                    let col = result.cursor_col;
+                    let d = self.ui.results_col_width_delta.entry(col).or_insert(0);
+                    *d += 4;
+                    let val = *d;
+                    self.set_status(format!("column +4 (delta {val})"), false);
+                }
+            }
+            Action::NarrowColumn => {
+                if let Some(result) = &self.db.last_result {
+                    let col = result.cursor_col;
+                    let d = self.ui.results_col_width_delta.entry(col).or_insert(0);
+                    *d = (*d - 4).max(-20);
+                    let val = *d;
+                    self.set_status(format!("column -4 (delta {val})"), false);
+                }
+            }
             Action::ResultPageNext => match self.db.next_result_page().await {
                 Ok(()) => {
                     self.ui.focus = Focus::Results;
@@ -8933,6 +9130,7 @@ async fn event_loop(
         app.poll_dap().await;
 
         let size = terminal.size()?;
+        app.last_term_width = size.width;
         let agents_workspace = app.ui.product == ProductMode::Code
             && app.ui.code_surface == CodeSurface::Editor
             && app.ui.sidebar == Sidebar::Agents;
@@ -9313,6 +9511,13 @@ async fn event_loop(
                                         .await;
                                 }
                             }
+                        }
+                        // Database Studio mouse: click to focus panes, wheel to scroll (#27).
+                        if app.ui.product == ProductMode::Database
+                            && app.ui.db_surface == DbSurface::Studio
+                            && !app.nvim_active()
+                        {
+                            app.handle_studio_mouse(me, size.width, size.height).await;
                         }
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
@@ -10041,6 +10246,10 @@ async fn event_loop(
                             }
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
                                 || key.modifiers.contains(KeyModifiers::SUPER);
+                            if is_run_at_cursor_key(key) {
+                                app.handle_action(Action::RunQueryAtCursor, view_h, term_rows).await?;
+                                continue;
+                            }
                             if is_run_query_key(key) {
                                 app.handle_action(Action::RunQuery, view_h, term_rows).await?;
                                 continue;
@@ -10699,6 +10908,17 @@ fn nvim_visual_mode(mode: &str) -> bool {
 
 fn nvim_normal_mode(mode: &str) -> bool {
     mode.is_empty() || mode == "n" || (mode.starts_with('n') && !mode.starts_with("ni"))
+}
+
+/// Alt-Enter / Shift-F5: run the statement under the cursor, not the whole buffer (#20).
+fn is_run_at_cursor_key(key: KeyEvent) -> bool {
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('\n') if alt => true,
+        KeyCode::F(5) if shift => true,
+        _ => false,
+    }
 }
 
 /// Studio run chords. Plain terminals often emit Ctrl-J (LF) for Ctrl-Enter;
