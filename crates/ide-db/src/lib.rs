@@ -30,7 +30,8 @@ pub use snippets::{ensure_example_snippet, list_snippets};
 
 pub use query_params::{query_param_prompt_seed, sql_has_query_params, substitute_query_params};
 pub use query_paging::{
-    has_limit_clause, next_select_limit_preset, paginate_select_sql, MAX_FETCH_ROWS,
+    has_limit_clause, next_select_limit_preset, paginate_select_sql,
+    paginate_select_sql_for, MAX_FETCH_ROWS,
     RESULT_PAGE_SIZE,
 };
 pub use persona::{
@@ -506,6 +507,13 @@ pub fn build_table_data_sql(
     match driver {
         DbDriver::Redis => return format!("GET {table}\n"),
         DbDriver::Mongo => return format!("find {table}\n"),
+        DbDriver::Elasticsearch => {
+            // Explorer Enter → _search match_all (not bogus SQL) (#156).
+            let index = if table.is_empty() { "_all" } else { table };
+            return format!(
+                "POST /{index}/_search\n{{\"size\":{limit},\"query\":{{\"match_all\":{{}}}}}}"
+            );
+        }
         _ => {}
     }
     let qual = qualify_table_name(driver, schema, table);
@@ -5522,7 +5530,7 @@ impl DbWorkspace {
             }
             self.guard_writable(&source_id, stmt)?;
             let exec_sql = if statements.len() == 1 {
-                paginate_select_sql(stmt, page, self.select_limit)
+                paginate_select_sql_for(driver, stmt, page, self.select_limit)
             } else {
                 stmt.to_string()
             };
@@ -7993,81 +8001,8 @@ impl DbWorkspace {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;
         let (headers, rows) = parse_csv(&text)?;
-        if headers.is_empty() {
-            bail!("CSV has no header row");
-        }
-        if rows.is_empty() {
-            bail!("CSV has no data rows");
-        }
-        let Some(source_id) = self.active_source.clone() else {
-            bail!("no active data source");
-        };
-        self.guard_writable_op(&source_id, "CSV import")?;
-        let database = self.active_database.clone();
-        self.ensure_connected(&source_id, database.as_deref())
-            .await?;
-        let mysql = self
-            .sources
-            .iter()
-            .find(|s| s.id == source_id)
-            .map(|s| matches!(s.driver, DbDriver::Mysql))
-            .unwrap_or(false);
-        let q = |id: &str| -> String {
-            if mysql {
-                format!("`{}`", id.replace('`', "``"))
-            } else {
-                format!("\"{}\"", id.replace('"', "\"\""))
-            }
-        };
-        let qual = match schema.as_deref() {
-            Some(s) if !s.is_empty() && s != "main" => format!("{}.{}", q(s), q(&table)),
-            _ => q(&table),
-        };
-        let cols = headers.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
-        let key = Self::pool_key(&source_id, database.as_deref());
-        let mut inserted = 0usize;
-        for row in &rows {
-            let mut vals = Vec::with_capacity(headers.len());
-            for i in 0..headers.len() {
-                let v = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                vals.push(sql_literal(v));
-            }
-            let sql = format!(
-                "INSERT INTO {qual} ({cols}) VALUES ({});",
-                vals.join(", ")
-            );
-            let pool = self.pools.get(&key).context("not connected")?;
-            match pool {
-                LivePool::Pg(p) => {
-                    sqlx::query(&sql).execute(p).await?;
-                }
-                LivePool::Mysql(p) => {
-                    sqlx::query(&sql).execute(p).await?;
-                }
-                LivePool::Sqlite(p) => {
-                    sqlx::query(&sql).execute(p).await?;
-                }
-                LivePool::Mssql(c) => {
-                    let _ = engines::exec_mssql(c, &sql).await?;
-                }
-                LivePool::Clickhouse(c) => {
-                    let _ = engines::exec_clickhouse(c, &sql, None).await?;
-                }
-                LivePool::Duckdb(d) => {
-                    let _ = alt_engines::exec_duckdb(d, &sql).await?;
-                }
-                LivePool::Redis(_) | LivePool::Mongo(_) | LivePool::CloudStub(_) | LivePool::Http(_) => {
-                    bail!("CSV import not supported for this driver");
-                }
-            }
-            inserted += 1;
-        }
-        self.audit_sql(&format!(
-            "-- CSV import {} → {qual} ({inserted} rows)",
-            path.display()
-        ));
-        self.status = format!("imported {inserted} row(s) → {qual}");
-        Ok(inserted)
+        self.import_tabular_rows("CSV", path, schema, table, headers, rows)
+            .await
     }
 
     /// Import a JSON array of objects (or newline-delimited objects) into the target table.
@@ -8076,48 +8011,59 @@ impl DbWorkspace {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;
         let (headers, rows) = parse_json_table(&text)?;
+        self.import_tabular_rows("JSON", path, schema, table, headers, rows)
+            .await
+    }
+
+    /// Driver-aware quoting + batched multi-row INSERT (#130).
+    async fn import_tabular_rows(
+        &mut self,
+        kind: &str,
+        path: &std::path::Path,
+        schema: Option<String>,
+        table: String,
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    ) -> Result<usize> {
         if headers.is_empty() {
-            bail!("JSON has no object keys");
+            bail!("{kind} has no columns");
         }
         if rows.is_empty() {
-            bail!("JSON has no data rows");
+            bail!("{kind} has no data rows");
         }
         let Some(source_id) = self.active_source.clone() else {
             bail!("no active data source");
         };
-        self.guard_writable_op(&source_id, "JSON import")?;
+        self.guard_writable_op(&source_id, &format!("{kind} import"))?;
         let database = self.active_database.clone();
         self.ensure_connected(&source_id, database.as_deref())
             .await?;
-        let mysql = self
-            .sources
-            .iter()
-            .find(|s| s.id == source_id)
-            .map(|s| matches!(s.driver, DbDriver::Mysql))
-            .unwrap_or(false);
-        let q = |id: &str| -> String {
-            if mysql {
-                format!("`{}`", id.replace('`', "``"))
-            } else {
-                format!("\"{}\"", id.replace('"', "\"\""))
-            }
-        };
+        let driver = self
+            .source_cfg(&source_id)
+            .map(|s| s.driver)
+            .unwrap_or_default();
+        let q = |id: &str| quote_ident(driver, id);
         let qual = match schema.as_deref() {
             Some(s) if !s.is_empty() && s != "main" => format!("{}.{}", q(s), q(&table)),
             _ => q(&table),
         };
         let cols = headers.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
         let key = Self::pool_key(&source_id, database.as_deref());
+        const BATCH: usize = 50;
         let mut inserted = 0usize;
-        for row in &rows {
-            let mut vals = Vec::with_capacity(headers.len());
-            for i in 0..headers.len() {
-                let v = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                vals.push(sql_literal(v));
+        for chunk in rows.chunks(BATCH) {
+            let mut value_rows = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                let mut vals = Vec::with_capacity(headers.len());
+                for i in 0..headers.len() {
+                    let v = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                    vals.push(sql_literal(v));
+                }
+                value_rows.push(format!("({})", vals.join(", ")));
             }
             let sql = format!(
-                "INSERT INTO {qual} ({cols}) VALUES ({});",
-                vals.join(", ")
+                "INSERT INTO {qual} ({cols}) VALUES {};",
+                value_rows.join(", ")
             );
             let pool = self.pools.get(&key).context("not connected")?;
             match pool {
@@ -8139,17 +8085,20 @@ impl DbWorkspace {
                 LivePool::Duckdb(d) => {
                     let _ = alt_engines::exec_duckdb(d, &sql).await?;
                 }
-                LivePool::Redis(_) | LivePool::Mongo(_) | LivePool::CloudStub(_) | LivePool::Http(_) => {
-                    bail!("JSON import not supported for this driver");
+                LivePool::Redis(_)
+                | LivePool::Mongo(_)
+                | LivePool::CloudStub(_)
+                | LivePool::Http(_) => {
+                    bail!("{kind} import not supported for this driver");
                 }
             }
-            inserted += 1;
+            inserted += chunk.len();
         }
         self.audit_sql(&format!(
-            "-- JSON import {} → {qual} ({inserted} rows)",
+            "-- {kind} import {} → {qual} ({inserted} rows)",
             path.display()
         ));
-        self.status = format!("imported {inserted} JSON row(s) → {qual}");
+        self.status = format!("imported {inserted} {kind} row(s) → {qual}");
         Ok(inserted)
     }
 

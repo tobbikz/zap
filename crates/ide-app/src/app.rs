@@ -6512,12 +6512,8 @@ impl App {
                 }
             }
             Action::CreateObjectNextField => {
-                let form = &mut self.ui.create_object_form;
-                if form.on_add_button() {
-                    form.add_column();
-                } else {
-                    form.next_field();
-                }
+                // Tab advances / wraps; Space/+/a add columns (#149).
+                self.ui.create_object_form.next_field();
             }
             Action::CreateObjectPrevField => self.ui.create_object_form.prev_field(),
             Action::CreateObjectToggleFlag => {
@@ -10246,7 +10242,11 @@ async fn event_loop(
                                         form.push_char(c);
                                     }
                                 } else if key.code == KeyCode::Delete {
-                                    app.ui.create_object_form.remove_column();
+                                    // Don't drop a column while typing its name (#149).
+                                    let typing = app.ui.create_object_form.active_mut().is_some();
+                                    if !typing {
+                                        app.ui.create_object_form.remove_column();
+                                    }
                                 }
                             }
                             Mode::OpenFolder => {

@@ -499,34 +499,87 @@ fn exec_duckdb_sync(conn: &DuckDbConn, sql: &str) -> Result<QueryResult> {
 fn duckdb_row_cells(row: &Row<'_>, col_count: usize) -> Vec<String> {
     (0..col_count)
         .map(|i| match row.get_ref(i) {
-            Ok(ValueRef::Null) => "NULL".into(),
-            Ok(ValueRef::Boolean(b)) => b.to_string(),
-            Ok(ValueRef::TinyInt(v)) => v.to_string(),
-            Ok(ValueRef::SmallInt(v)) => v.to_string(),
-            Ok(ValueRef::Int(v)) => v.to_string(),
-            Ok(ValueRef::BigInt(v)) => v.to_string(),
-            Ok(ValueRef::HugeInt(v)) => v.to_string(),
-            Ok(ValueRef::UTinyInt(v)) => v.to_string(),
-            Ok(ValueRef::USmallInt(v)) => v.to_string(),
-            Ok(ValueRef::UInt(v)) => v.to_string(),
-            Ok(ValueRef::UBigInt(v)) => v.to_string(),
-            Ok(ValueRef::Float(v)) => v.to_string(),
-            Ok(ValueRef::Double(v)) => v.to_string(),
-            Ok(ValueRef::Text(s)) => String::from_utf8_lossy(s).into_owned(),
-            Ok(ValueRef::Blob(b)) => {
-                let preview: String = b
-                    .iter()
-                    .take(32)
-                    .map(|x| format!("{x:02x}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let more = if b.len() > 32 { "…" } else { "" };
-                format!("<blob {}b: {preview}{more}>", b.len())
-            }
-            Ok(other) => format!("{other:?}"),
+            Ok(v) => duckdb_cell(v),
             Err(_) => "NULL".into(),
         })
         .collect()
+}
+
+/// Format DuckDB values as ISO / decimal / JSON — never Rust Debug (#159).
+fn duckdb_cell(v: ValueRef<'_>) -> String {
+    use duckdb::types::TimeUnit;
+    match v {
+        ValueRef::Null => "NULL".into(),
+        ValueRef::Boolean(b) => b.to_string(),
+        ValueRef::TinyInt(n) => n.to_string(),
+        ValueRef::SmallInt(n) => n.to_string(),
+        ValueRef::Int(n) => n.to_string(),
+        ValueRef::BigInt(n) => n.to_string(),
+        ValueRef::HugeInt(n) => n.to_string(),
+        ValueRef::UTinyInt(n) => n.to_string(),
+        ValueRef::USmallInt(n) => n.to_string(),
+        ValueRef::UInt(n) => n.to_string(),
+        ValueRef::UBigInt(n) => n.to_string(),
+        ValueRef::UHugeInt(n) => n.to_string(),
+        ValueRef::Float(n) => n.to_string(),
+        ValueRef::Double(n) => n.to_string(),
+        ValueRef::Decimal(d) => d.to_string(),
+        ValueRef::Text(s) => String::from_utf8_lossy(s).into_owned(),
+        ValueRef::Blob(b) | ValueRef::Geometry(b) => {
+            let preview: String = b
+                .iter()
+                .take(32)
+                .map(|x| format!("{x:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let more = if b.len() > 32 { "…" } else { "" };
+            format!("<blob {}b: {preview}{more}>", b.len())
+        }
+        ValueRef::Date32(days) => chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|d| d.checked_add_signed(chrono::Duration::days(i64::from(days))))
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| days.to_string()),
+        ValueRef::Timestamp(unit, ticks) => {
+            let micros = unit.to_micros(ticks);
+            let secs = micros.div_euclid(1_000_000);
+            let nanos = (micros.rem_euclid(1_000_000) * 1000) as u32;
+            chrono::DateTime::from_timestamp(secs, nanos)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+                .unwrap_or_else(|| format!("{ticks}"))
+        }
+        ValueRef::Time64(unit, ticks) => {
+            let micros = match unit {
+                TimeUnit::Second => ticks.saturating_mul(1_000_000),
+                TimeUnit::Millisecond => ticks.saturating_mul(1_000),
+                TimeUnit::Microsecond => ticks,
+                TimeUnit::Nanosecond => ticks / 1000,
+            };
+            let total_secs = micros.div_euclid(1_000_000);
+            let h = total_secs.div_euclid(3600);
+            let m = total_secs.rem_euclid(3600).div_euclid(60);
+            let s = total_secs.rem_euclid(60);
+            let frac = micros.rem_euclid(1_000_000);
+            if frac == 0 {
+                format!("{h:02}:{m:02}:{s:02}")
+            } else {
+                format!("{h:02}:{m:02}:{s:02}.{frac:06}")
+            }
+        }
+        ValueRef::Interval { months, days, nanos } => {
+            format!("{months} months {days} days {} ns", nanos)
+        }
+        ValueRef::Enum(..) => v
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "<enum>".into()),
+        ValueRef::List(..) | ValueRef::Struct(..) | ValueRef::Array(..) | ValueRef::Map(..)
+        | ValueRef::Union(..) => v
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "<nested>".into()),
+        // ValueRef is #[non_exhaustive]
+        _ => "<value>".into(),
+    }
 }
 
 pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
