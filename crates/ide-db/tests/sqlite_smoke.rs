@@ -194,6 +194,9 @@ fn wave11_format_json_migration_helpers() {
         cursor_col: 0,
         explain: None,
         chart: None,
+        chart_value_col: None,
+        chart_category_col: None,
+        chart_kind_name: None,
         page: 0,
         has_more: false,
     };
@@ -321,6 +324,9 @@ fn wave12_params_markdown_alter_fanout_help() {
         cursor_col: 0,
         explain: None,
         chart: None,
+        chart_value_col: None,
+        chart_category_col: None,
+        chart_kind_name: None,
         page: 0,
         has_more: false,
     };
@@ -526,6 +532,9 @@ fn wave18_21_paste_blob_migrate_status_help() {
         cursor_col: 0,
         explain: None,
         chart: None,
+        chart_value_col: None,
+        chart_category_col: None,
+        chart_kind_name: None,
         page: 0,
         has_more: false,
     };
@@ -574,6 +583,9 @@ fn editable_result(rows: Vec<Vec<&str>>, cursor_row: usize, cursor_col: usize) -
         cursor_col,
         explain: None,
         chart: None,
+        chart_value_col: None,
+        chart_category_col: None,
+        chart_kind_name: None,
         page: 0,
         has_more: false,
     }

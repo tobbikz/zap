@@ -1211,6 +1211,9 @@ impl App {
             cursor_col: 0,
             explain: None,
             chart: None,
+            chart_value_col: None,
+            chart_category_col: None,
+            chart_kind_name: None,
             page: 0,
             has_more: false,
         });
@@ -2117,18 +2120,26 @@ impl App {
     }
 
     async fn structure_confirm(&mut self, term_rows: u16) -> Result<()> {
-        let Some(line) = self.db.structure_lines.get(self.db.structure_scroll).cloned() else {
+        let Some(line) = self.db.structure_lines.get(self.db.structure_selected).cloned() else {
             return Ok(());
         };
         let Some(nav) = line.nav else {
             return Ok(());
         };
-        if self.db.select_table_in_explorer(
+        // Auto-expand the target schema if needed (#30).
+        let found = match self.db.expand_and_select_table(
             &nav.source_id,
             nav.database.as_deref(),
             &nav.schema,
             &nav.table,
-        ) {
+        ).await {
+            Ok(f) => f,
+            Err(e) => {
+                self.set_status(format!("FK expand: {e:#}"), true);
+                return Ok(());
+            }
+        };
+        if found {
             self.db
                 .ensure_explorer_visible(Self::explorer_view_h(term_rows));
             match self.db.open_selected_table_tab().await {
@@ -2142,7 +2153,7 @@ impl App {
         } else {
             self.set_status(
                 format!(
-                    "FK → {}.{} (table not in explorer — expand schema)",
+                    "FK → {}.{} (table not found in explorer)",
                     nav.schema, nav.table
                 ),
                 false,
@@ -2909,6 +2920,9 @@ impl App {
             cursor_col: 0,
             explain: None,
             chart: None,
+            chart_value_col: None,
+            chart_category_col: None,
+            chart_kind_name: None,
             page: 0,
             has_more: false,
         });
@@ -3739,6 +3753,9 @@ impl App {
                     cursor_col: 0,
                     explain: None,
                     chart: None,
+                    chart_value_col: None,
+                    chart_category_col: None,
+                    chart_kind_name: None,
                     page: 0,
                     has_more: false,
                 });
@@ -3833,6 +3850,9 @@ impl App {
                         cursor_col: 0,
                         explain: None,
                         chart: None,
+                        chart_value_col: None,
+                        chart_category_col: None,
+                        chart_kind_name: None,
                         page: 0,
                         has_more: false,
                     });
@@ -6113,8 +6133,12 @@ impl App {
                         self.db_explorer_moved(term_rows).await;
                     }
                     Focus::Structure => {
-                        self.db.structure_scroll =
-                            self.db.structure_scroll.saturating_sub(1);
+                        // Move selection, then adjust scroll to keep it visible (#29).
+                        self.db.structure_selected =
+                            self.db.structure_selected.saturating_sub(1);
+                        if self.db.structure_selected < self.db.structure_scroll {
+                            self.db.structure_scroll = self.db.structure_selected;
+                        }
                     }
                     Focus::Results => {
                         if let Some(result) = self.db.last_result.as_mut() {
@@ -6175,8 +6199,14 @@ impl App {
                     }
                     Focus::Structure => {
                         let max = self.db.structure_lines.len().saturating_sub(1);
-                        if self.db.structure_scroll < max {
-                            self.db.structure_scroll += 1;
+                        if self.db.structure_selected < max {
+                            self.db.structure_selected += 1;
+                        }
+                        // Adjust scroll to keep selected row visible (#29).
+                        let view_h = term_rows.saturating_sub(6).max(2) as usize;
+                        if self.db.structure_selected >= self.db.structure_scroll + view_h {
+                            self.db.structure_scroll =
+                                self.db.structure_selected.saturating_sub(view_h - 1);
                         }
                     }
                     Focus::Results => {
@@ -6894,9 +6924,21 @@ impl App {
             Action::ChartResults => match self.db.chart_last_result(None) {
                 Ok(_) => {
                     self.ui.focus = Focus::Results;
-                    self.set_status("chart in Results", false);
+                    self.set_status("chart in Results · C kind · V value-col · L label-col", false);
                 }
                 Err(e) => self.set_status(format!("chart: {e:#}"), true),
+            },
+            Action::ChartCycleKind => match self.db.chart_cycle_kind() {
+                Ok(label) => self.set_status(format!("chart → {label}"), false),
+                Err(e) => self.set_status(format!("chart kind: {e:#}"), true),
+            },
+            Action::ChartCycleValueCol => match self.db.chart_cycle_value_col() {
+                Ok(label) => self.set_status(format!("chart → {label}"), false),
+                Err(e) => self.set_status(format!("chart value col: {e:#}"), true),
+            },
+            Action::ChartCycleCategoryCol => match self.db.chart_cycle_category_col() {
+                Ok(label) => self.set_status(format!("chart → {label}"), false),
+                Err(e) => self.set_status(format!("chart label col: {e:#}"), true),
             },
             Action::SaveResultTemp => self.start_save_result(true),
             Action::SaveResultView => self.start_save_result(false),
@@ -7752,6 +7794,9 @@ impl App {
                         cursor_col: 0,
                         explain: None,
                         chart: None,
+                        chart_value_col: None,
+                        chart_category_col: None,
+                        chart_kind_name: None,
                         page: 0,
                         has_more: false,
                     });
@@ -7779,6 +7824,9 @@ impl App {
                         cursor_col: 0,
                         explain: None,
                         chart: None,
+                        chart_value_col: None,
+                        chart_category_col: None,
+                        chart_kind_name: None,
                         page: 0,
                         has_more: false,
                     });
@@ -8041,6 +8089,9 @@ impl App {
                     cursor_col: 0,
                     explain: None,
                     chart: None,
+                    chart_value_col: None,
+                    chart_category_col: None,
+                    chart_kind_name: None,
                     page: 0,
                     has_more: false,
                 });
@@ -10422,9 +10473,11 @@ async fn event_loop(
                                 }
 
                                 // In Explorer, bare `x` deletes the connection (confirm modal).
+                                // In Results, `x` / `X` are rollback / commit (#28).
                                 // Elsewhere `x` / Ctrl-W closes the SQL tab.
                                 let close_tab = (!ctrl
                                     && app.ui.focus != Focus::Database
+                                    && app.ui.focus != Focus::Results
                                     && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X')))
                                     || (ctrl
                                         && matches!(
@@ -10453,13 +10506,16 @@ async fn event_loop(
                                     continue;
                                 }
                                 // Lowercase `t` / `+` only — Shift+T is CycleTheme (#85).
+                                // Results uses `t` to begin a transaction (#28); `+` still opens a tab.
+                                let new_tab_key = match key.code {
+                                    KeyCode::Char('+') => true,
+                                    KeyCode::Char('t') if app.ui.focus != Focus::Results => true,
+                                    _ => false,
+                                };
                                 if !ctrl
                                     && !alt
                                     && !key.modifiers.contains(KeyModifiers::SHIFT)
-                                    && matches!(
-                                        key.code,
-                                        KeyCode::Char('t') | KeyCode::Char('+')
-                                    )
+                                    && new_tab_key
                                 {
                                     app.db.new_query_tab();
                                     app.ui.db_cursor = Cursor::default();

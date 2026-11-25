@@ -192,6 +192,12 @@ pub enum Action {
     ResultPageNext,
     ResultPagePrev,
     ChartResults,
+    /// Cycle chart kind (bar → line → pie) (#110).
+    ChartCycleKind,
+    /// Cycle chart value column to next numeric (#110).
+    ChartCycleValueCol,
+    /// Cycle chart category/label column (#110).
+    ChartCycleCategoryCol,
     SaveResultTemp,
     SaveResultView,
     CancelQuery,
@@ -648,6 +654,12 @@ impl Keymap {
                 (false, false, KeyCode::Char('n')) => Some(Action::OpenCreateMenu),
                 (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
                 (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
+                // Transaction chords: Results shortcuts so they're not palette-only (#28).
+                (false, false, KeyCode::Char('t')) => Some(Action::BeginTransaction),
+                (false, false, KeyCode::Char('x')) => Some(Action::RollbackTransaction),
+                (false, false, KeyCode::Char('X')) | (false, true, KeyCode::Char('X')) => {
+                    Some(Action::CommitTransaction)
+                }
                 (false, false, KeyCode::Char('D')) => Some(Action::ToggleResultsDensity),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Enter) => Some(Action::OpenCellModal),
@@ -658,6 +670,16 @@ impl Keymap {
                 }
                 (true, false, KeyCode::Char('c') | KeyCode::Char('C')) => {
                     Some(Action::YankResultCell)
+                }
+                (false, false, KeyCode::Char('c')) => Some(Action::ChartResults),
+                (false, true, KeyCode::Char('C')) | (false, false, KeyCode::Char('C')) => {
+                    Some(Action::ChartCycleKind)
+                }
+                (false, true, KeyCode::Char('V')) | (false, false, KeyCode::Char('V')) => {
+                    Some(Action::ChartCycleValueCol)
+                }
+                (false, true, KeyCode::Char('L')) | (false, false, KeyCode::Char('L')) => {
+                    Some(Action::ChartCycleCategoryCol)
                 }
                 (false, false, KeyCode::Char('m')) => Some(Action::OpenResultsActions),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),

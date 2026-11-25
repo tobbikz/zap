@@ -9,11 +9,18 @@
 - Results grid: `>` / `<` widen / narrow the focused column by 4 chars (#31).
 - Studio mouse: click to focus panes, click explorer rows to select, wheel scrolls Explorer / Structure / Console / Results (#27).
 - Console horizontal scroll for long SQL lines; cursor past visible columns scrolls with `▶` overflow marker (#26).
-- SQL tab management keys (`t`/`+` new, `[`/`]` cycle, `x`/`Ctrl-W` close) shown in Discover and footer hints (#25).
+- SQL tab management keys (`t`/`+` new outside Results, `[`/`]` cycle, `x`/`Ctrl-W` close) shown in Discover and footer hints (#25).
 - Run statement at cursor: `Alt-Enter` / `Shift-F5` runs only the `;`-delimited statement under the caret, or the selection (#20).
+
+- Charts: `c` chart · `C` cycle kind (bar/line/pie) · `V` cycle value column · `L` cycle category column in Results (#110).
+- Transaction chords in Results: `t` begin · `x` rollback · `X` commit; `+` still opens a SQL tab (#28).
 
 ### Fixed
 
+- Data compare: deterministic ORDER BY (PK or col 1); don't collapse duplicate rows without PK; fix ClickHouse db.table resolution (#137).
+- `generate_schema_diff_ddl`: strip `?` nullable markers from DDL types; patch left (target) side for `+` objects; dialect-valid DROP (no CASCADE on SQLite/MSSQL); nullability drift emits SET/DROP NOT NULL (#134).
+- Structure pane: separate `structure_selected` from `structure_scroll`; ↑↓ moves selection with highlight; Enter acts on selected row (#29).
+- FK jump from Structure auto-expands target schema if not loaded (#30).
 - Postgres EXPLAIN uses plan-only `EXPLAIN (FORMAT TEXT)` instead of `EXPLAIN ANALYZE` to avoid executing DML/DDL (#38).
 - Auto-paging and table-open SQL use `SELECT TOP` / `OFFSET FETCH` on MSSQL instead of illegal `LIMIT` (#37).
 - Copy connection URI to clipboard from Explorer palette command (#35).
