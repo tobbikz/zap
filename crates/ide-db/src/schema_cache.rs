@@ -13,6 +13,9 @@ pub struct SchemaNameCache {
     pub schemas: Vec<String>,
     pub tables: Vec<String>,
     pub columns: HashMap<String, Vec<String>>,
+    /// Lazy caches for non-active schemas: `schema` → `(tables, columns)`.
+    /// Populated on first reference to `schema.` in completions or on table open (#33).
+    pub extra: HashMap<String, (Vec<String>, HashMap<String, Vec<String>>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,13 +236,36 @@ impl DbWorkspace {
         let pool = self.pools.get(&key_pool).context("not connected")?;
         let schemas = fetch_schema_list(pool, database.as_deref()).await.unwrap_or_default();
         let (tables, columns) = fetch_schema_names(pool, &schema, database.as_deref()).await?;
+        let extra = std::mem::take(&mut self.schema_cache.extra);
         self.schema_cache = SchemaNameCache {
             cache_key: key,
             schema,
             schemas,
             tables,
             columns,
+            extra,
         };
+        Ok(())
+    }
+
+    /// Lazy-fetch tables+columns for a non-active schema and store in `extra` (#33).
+    pub async fn warm_schema_cache(&mut self, schema: &str) -> Result<()> {
+        if schema.eq_ignore_ascii_case(&self.schema_cache.schema) {
+            return Ok(()); // already the active schema
+        }
+        if self.schema_cache.extra.contains_key(schema) {
+            return Ok(()); // already warmed
+        }
+        let Some(source_id) = self.active_source.clone() else {
+            return Ok(());
+        };
+        let database = self.active_database.clone();
+        let key_pool = Self::pool_key(&source_id, database.as_deref());
+        let Some(pool) = self.pools.get(&key_pool) else {
+            return Ok(());
+        };
+        let (tables, columns) = fetch_schema_names(pool, schema, database.as_deref()).await?;
+        self.schema_cache.extra.insert(schema.to_string(), (tables, columns));
         Ok(())
     }
 
@@ -260,6 +286,29 @@ impl DbWorkspace {
                     // Suggest tables; if this schema is the cached one, use cache.
                     if schema.eq_ignore_ascii_case(&self.schema_cache.schema) {
                         for t in &self.schema_cache.tables {
+                            if pl.is_empty() || t.to_ascii_lowercase().starts_with(&pl) {
+                                out.push(SqlCompletionItem {
+                                    label: t.clone(),
+                                    insert_text: t.clone(),
+                                    replace_start_col: start,
+                                    detail: Some(format!("table · {schema}")),
+                                });
+                            }
+                        }
+                    } else if let Some((extra_tables, _)) = self
+                        .schema_cache
+                        .extra
+                        .get(&schema)
+                        .or_else(|| {
+                            self.schema_cache
+                                .extra
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(&schema))
+                                .map(|(_, v)| v)
+                        })
+                    {
+                        // Lazy-fetched non-active schema tables (#33).
+                        for t in extra_tables {
                             if pl.is_empty() || t.to_ascii_lowercase().starts_with(&pl) {
                                 out.push(SqlCompletionItem {
                                     label: t.clone(),
@@ -293,6 +342,7 @@ impl DbWorkspace {
             }
 
             let table_key = table;
+            // Look up columns: active cache first, then extra schema caches (#33).
             let cols = self
                 .schema_cache
                 .columns
@@ -303,6 +353,19 @@ impl DbWorkspace {
                         .iter()
                         .find(|(t, _)| t.eq_ignore_ascii_case(&table_key))
                         .map(|(_, c)| c)
+                })
+                .or_else(|| {
+                    // Try extra schema caches (schema_opt or any).
+                    self.schema_cache.extra.values().find_map(|(_, cols_map)| {
+                        cols_map
+                            .get(&table_key)
+                            .or_else(|| {
+                                cols_map
+                                    .iter()
+                                    .find(|(t, _)| t.eq_ignore_ascii_case(&table_key))
+                                    .map(|(_, c)| c)
+                            })
+                    })
                 });
             if let Some(cols) = cols {
                 for c in cols {

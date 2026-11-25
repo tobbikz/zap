@@ -244,6 +244,14 @@ pub enum Action {
     CollapseAll,
     /// Explorer: collapse all siblings except the selection's ancestors (#34).
     CollapseOthers,
+    /// Run only the statement under the cursor (or selection) (#20).
+    RunQueryAtCursor,
+    /// Results: sort focused column ascending/descending/off (#31).
+    ToggleSortColumn,
+    /// Results: widen the focused column (#31).
+    WidenColumn,
+    /// Results: narrow the focused column (#31).
+    NarrowColumn,
 }
 
 pub struct Keymap;
@@ -595,6 +603,17 @@ impl Keymap {
                 _ => None,
             },
             KeyContext::Results => match (ctrl, shift, key.code) {
+                // Sort focused column toggle ASC/DESC/off (#31).
+                (false, false, KeyCode::Char('S')) | (false, true, KeyCode::Char('S')) => {
+                    Some(Action::ToggleSortColumn)
+                }
+                // Widen / narrow focused column (#31).
+                (false, true, KeyCode::Char('>')) | (false, false, KeyCode::Char('>')) => {
+                    Some(Action::WidenColumn)
+                }
+                (false, true, KeyCode::Char('<')) | (false, false, KeyCode::Char('<')) => {
+                    Some(Action::NarrowColumn)
+                }
                 (false, false, KeyCode::Char(']')) => Some(Action::ResultPageNext),
                 (false, false, KeyCode::Char('[')) => Some(Action::ResultPagePrev),
                 (true, false, KeyCode::Char(']')) => Some(Action::CycleDbSourceNext),
