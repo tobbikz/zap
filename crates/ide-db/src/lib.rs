@@ -50,6 +50,23 @@ pub use result_chart::{
 };
 pub use schema_cache::{expecting_relation, SchemaNameCache, SqlCompletionItem};
 
+/// Extract the SQL text under the cursor, or the selection if given (#20).
+/// Used by the app to get the statement text without going through `execute_sql_at_cursor`.
+pub fn statement_at_cursor_text(
+    sql: &str,
+    cursor_row: usize,
+    cursor_col: usize,
+    selection: Option<String>,
+) -> String {
+    if let Some(sel) = selection {
+        let sel = sel.trim().to_string();
+        if !sel.is_empty() {
+            return sel;
+        }
+    }
+    statement_at_cursor(sql, cursor_row, cursor_col)
+}
+
 use anyhow::{Context, Result, bail};
 use engines::{ClickhouseHttp, MssqlClient};
 use chrono::Local;
@@ -5561,6 +5578,33 @@ impl DbWorkspace {
         self.execute_sql_text(&sql).await
     }
 
+    /// Run the single statement under `cursor_row:cursor_col`, or the selection if given (#20).
+    pub async fn execute_sql_at_cursor(
+        &mut self,
+        cursor_row: usize,
+        cursor_col: usize,
+        selection: Option<String>,
+    ) -> Result<()> {
+        if let Some(sel) = selection {
+            let sel = sel.trim().to_string();
+            if !sel.is_empty() {
+                return self.execute_sql_text(&sel).await;
+            }
+        }
+        let stmt = statement_at_cursor(&self.sql, cursor_row, cursor_col);
+        let stmt = stmt.trim().to_string();
+        if stmt.is_empty() {
+            bail!("no statement at cursor");
+        }
+        self.execute_sql_text(&stmt).await
+    }
+
+    /// Return (start_row, end_row) of the statement under the cursor (0-based, inclusive).
+    /// Used by the UI to highlight the statement that will run (#20).
+    pub fn statement_range_at_cursor(&self, cursor_row: usize, cursor_col: usize) -> (usize, usize) {
+        statement_range_at_cursor(&self.sql, cursor_row, cursor_col)
+    }
+
     /// Run SQL for this session only (e.g. after substituting query params).
     pub async fn execute_sql_text(&mut self, sql: &str) -> Result<()> {
         let Some(source_id) = self.active_source.clone() else {
@@ -8885,6 +8929,170 @@ fn split_statements(sql: &str) -> Vec<String> {
         out.push(t);
     }
     out
+}
+
+/// Extract the SQL statement under the cursor position (0-based row, col).
+/// Uses `split_statements` boundaries mapped back to byte offsets (#20).
+fn statement_at_cursor(sql: &str, cursor_row: usize, cursor_col: usize) -> String {
+    let (start, end) = statement_range_at_cursor(sql, cursor_row, cursor_col);
+    let lines: Vec<&str> = sql.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let s = start.min(lines.len() - 1);
+    let e = end.min(lines.len() - 1);
+    lines[s..=e].join("\n")
+}
+
+/// Return (start_row, end_row) inclusive of the statement that contains `cursor_row:cursor_col`.
+/// Splits on `;` boundaries (respecting strings/comments) to find which statement the cursor is in.
+fn statement_range_at_cursor(sql: &str, cursor_row: usize, _cursor_col: usize) -> (usize, usize) {
+    let lines: Vec<&str> = sql.lines().collect();
+    if lines.is_empty() {
+        return (0, 0);
+    }
+    // Convert cursor_row to byte offset range.
+    let mut byte_starts: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut offset = 0usize;
+    for line in &lines {
+        byte_starts.push(offset);
+        offset += line.len() + 1; // +1 for '\n'
+    }
+    let cursor_byte = byte_starts.get(cursor_row).copied().unwrap_or(0);
+
+    // Walk the same state machine as split_statements, recording statement byte ranges.
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    let mut byte_i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut dollar_tag: Option<String> = None;
+    let mut stmt_start_byte = 0usize;
+    let mut ranges: Vec<(usize, usize)> = Vec::new(); // byte ranges [start, end)
+
+    while i < chars.len() {
+        let c = chars[i];
+        let c_len = c.len_utf8();
+
+        if let Some(ref tag) = dollar_tag {
+            let tag_chars: Vec<char> = tag.chars().collect();
+            if c == '$' && chars[i..].starts_with(&tag_chars) {
+                for ch in &tag_chars {
+                    byte_i += ch.len_utf8();
+                }
+                i += tag_chars.len();
+                dollar_tag = None;
+                continue;
+            }
+            byte_i += c_len;
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            byte_i += c_len;
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    byte_i += 1;
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            byte_i += c_len;
+            if c == '"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
+            while i < chars.len() && chars[i] != '\n' {
+                byte_i += chars[i].len_utf8();
+                i += 1;
+            }
+            continue;
+        }
+
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            byte_i += c_len;
+            byte_i += chars[i + 1].len_utf8();
+            i += 2;
+            while i < chars.len() {
+                byte_i += chars[i].len_utf8();
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    byte_i += chars[i + 1].len_utf8();
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if c == '$' {
+            if let Some(tag) = parse_dollar_tag(&chars, i) {
+                for ch in tag.chars() {
+                    byte_i += ch.len_utf8();
+                }
+                i += tag.chars().count();
+                dollar_tag = Some(tag);
+                continue;
+            }
+        }
+
+        match c {
+            '\'' => { in_single = true; byte_i += c_len; }
+            '"'  => { in_double = true; byte_i += c_len; }
+            ';'  => {
+                // Check if the accumulated text is non-empty.
+                let slice = &sql[stmt_start_byte..byte_i];
+                if !slice.trim().is_empty() {
+                    ranges.push((stmt_start_byte, byte_i));
+                }
+                byte_i += c_len;
+                stmt_start_byte = byte_i;
+            }
+            _ => { byte_i += c_len; }
+        }
+        i += 1;
+    }
+    // Last statement (no trailing `;`).
+    if stmt_start_byte < sql.len() {
+        let slice = &sql[stmt_start_byte..];
+        if !slice.trim().is_empty() {
+            ranges.push((stmt_start_byte, sql.len()));
+        }
+    }
+
+    // Find which range contains cursor_byte.
+    let line_count = lines.len();
+    for (s, e) in &ranges {
+        if cursor_byte >= *s && cursor_byte < *e {
+            let start_row = byte_starts.iter().rposition(|&b| b <= *s).unwrap_or(0);
+            let end_row = byte_starts
+                .iter()
+                .rposition(|&b| b < *e)
+                .unwrap_or(line_count - 1);
+            return (start_row, end_row);
+        }
+    }
+    // Cursor past last semicolon → last statement, or fallback to full buffer.
+    if let Some((s, e)) = ranges.last() {
+        let start_row = byte_starts.iter().rposition(|&b| b <= *s).unwrap_or(0);
+        let end_row = byte_starts
+            .iter()
+            .rposition(|&b| b < *e)
+            .unwrap_or(line_count - 1);
+        return (start_row, end_row);
+    }
+    (0, line_count.saturating_sub(1))
 }
 
 fn parse_dollar_tag(chars: &[char], start: usize) -> Option<String> {

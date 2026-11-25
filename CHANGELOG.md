@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- SQL completions cache columns for non-active schemas; `schema.table.` completes columns without switching the chip (#33).
+- Results grid: `S` toggles client-side sort (ASC → DESC → off) on the focused column; sort indicator in header (#31).
+- Results grid: `>` / `<` widen / narrow the focused column by 4 chars (#31).
+- Studio mouse: click to focus panes, click explorer rows to select, wheel scrolls Explorer / Structure / Console / Results (#27).
+- Console horizontal scroll for long SQL lines; cursor past visible columns scrolls with `▶` overflow marker (#26).
+- SQL tab management keys (`t`/`+` new, `[`/`]` cycle, `x`/`Ctrl-W` close) shown in Discover and footer hints (#25).
+- Run statement at cursor: `Alt-Enter` / `Shift-F5` runs only the `;`-delimited statement under the caret, or the selection (#20).
+
 ### Fixed
 
 - Panic hook restores terminal raw mode and alternate screen on crash; user shell stays usable (#75).
