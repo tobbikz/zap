@@ -34,6 +34,20 @@ pub fn paginate_select_sql_for(
     let offset = page.saturating_mul(page_size);
     match driver {
         DbDriver::Trino => format!("{trimmed} OFFSET {offset} LIMIT {page_size}"),
+        DbDriver::Mssql => {
+            if offset == 0 && !has_order_clause(trimmed) {
+                // Page 0 without ORDER BY: use SELECT TOP.
+                mssql_inject_top(trimmed, page_size)
+            } else {
+                // OFFSET/FETCH requires ORDER BY; add a deterministic one if missing.
+                let ordered = if has_order_clause(trimmed) {
+                    trimmed.to_string()
+                } else {
+                    format!("{trimmed} ORDER BY 1")
+                };
+                format!("{ordered} OFFSET {offset} ROWS FETCH NEXT {page_size} ROWS ONLY")
+            }
+        }
         _ => format!("{trimmed} LIMIT {page_size} OFFSET {offset}"),
     }
 }
@@ -42,6 +56,37 @@ pub fn is_paged_query(sql: &str) -> bool {
     let stripped = crate::strip_sql_comments(sql);
     let t = stripped.trim_start().to_ascii_lowercase();
     t.starts_with("select") || t.starts_with("with")
+}
+
+fn has_order_clause(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    lower.contains(" order ")
+        || lower.contains("\norder ")
+        || lower.contains("\torder ")
+}
+
+/// Inject `TOP (n)` after the first SELECT keyword for MSSQL page-0 queries.
+fn mssql_inject_top(sql: &str, n: usize) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if let Some(idx) = lower.find("select") {
+        let after = idx + "select".len();
+        // Preserve DISTINCT if present.
+        let rest = &sql[after..];
+        let rest_lower = rest.trim_start().to_ascii_lowercase();
+        if rest_lower.starts_with("distinct") {
+            let ws_len = rest.len() - rest.trim_start().len();
+            let after_distinct = after + ws_len + "distinct".len();
+            format!(
+                "{}SELECT DISTINCT TOP ({n}){}",
+                &sql[..idx],
+                &sql[after_distinct..]
+            )
+        } else {
+            format!("{}SELECT TOP ({n}){}", &sql[..idx], &sql[after..])
+        }
+    } else {
+        format!("{sql} OFFSET 0 ROWS FETCH NEXT {n} ROWS ONLY")
+    }
 }
 
 pub fn has_limit_clause(sql: &str) -> bool {
@@ -132,5 +177,48 @@ mod tests {
         assert_eq!(next_select_limit_preset(500), 0);
         assert_eq!(next_select_limit_preset(0), 50);
         assert_eq!(next_select_limit_preset(77), 50);
+    }
+
+    #[test]
+    fn mssql_page_zero_uses_top() {
+        let out = paginate_select_sql_for(DbDriver::Mssql, "SELECT * FROM t", 0, 50);
+        assert_eq!(out, "SELECT TOP (50) * FROM t");
+    }
+
+    #[test]
+    fn mssql_page_one_uses_offset_fetch() {
+        let out = paginate_select_sql_for(DbDriver::Mssql, "SELECT * FROM t", 1, 50);
+        assert_eq!(
+            out,
+            "SELECT * FROM t ORDER BY 1 OFFSET 50 ROWS FETCH NEXT 50 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn mssql_with_order_by_keeps_it() {
+        let out = paginate_select_sql_for(
+            DbDriver::Mssql,
+            "SELECT * FROM t ORDER BY id",
+            1,
+            50,
+        );
+        assert_eq!(
+            out,
+            "SELECT * FROM t ORDER BY id OFFSET 50 ROWS FETCH NEXT 50 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn mssql_page_zero_with_order_uses_offset_fetch() {
+        let out = paginate_select_sql_for(
+            DbDriver::Mssql,
+            "SELECT * FROM t ORDER BY id",
+            0,
+            50,
+        );
+        assert_eq!(
+            out,
+            "SELECT * FROM t ORDER BY id OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY"
+        );
     }
 }

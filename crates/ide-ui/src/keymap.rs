@@ -246,6 +246,18 @@ pub enum Action {
     CreateObjectToggleFlag,
     /// Left on type/flags: cycle type backward or toggle the same as Right for bools.
     CreateObjectNudgeBack,
+    /// Explorer: collapse all expanded tree nodes (#34).
+    CollapseAll,
+    /// Explorer: collapse all siblings except the selection's ancestors (#34).
+    CollapseOthers,
+    /// Run only the statement under the cursor (or selection) (#20).
+    RunQueryAtCursor,
+    /// Results: sort focused column ascending/descending/off (#31).
+    ToggleSortColumn,
+    /// Results: widen the focused column (#31).
+    WidenColumn,
+    /// Results: narrow the focused column (#31).
+    NarrowColumn,
 }
 
 pub struct Keymap;
@@ -557,6 +569,10 @@ impl Keymap {
                 (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
                 (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
                 (false, false, KeyCode::Char('o')) => Some(Action::OpenDbObjectPalette),
+                (false, false, KeyCode::Char('c')) => Some(Action::CollapseAll),
+                (false, true, KeyCode::Char('C')) | (false, false, KeyCode::Char('C')) => {
+                    Some(Action::CollapseOthers)
+                }
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
                 (false, true, KeyCode::Char('T')) | (false, false, KeyCode::Char('T')) => {
@@ -593,6 +609,17 @@ impl Keymap {
                 _ => None,
             },
             KeyContext::Results => match (ctrl, shift, key.code) {
+                // Sort focused column toggle ASC/DESC/off (#31).
+                (false, false, KeyCode::Char('S')) | (false, true, KeyCode::Char('S')) => {
+                    Some(Action::ToggleSortColumn)
+                }
+                // Widen / narrow focused column (#31).
+                (false, true, KeyCode::Char('>')) | (false, false, KeyCode::Char('>')) => {
+                    Some(Action::WidenColumn)
+                }
+                (false, true, KeyCode::Char('<')) | (false, false, KeyCode::Char('<')) => {
+                    Some(Action::NarrowColumn)
+                }
                 (false, false, KeyCode::Char(']')) => Some(Action::ResultPageNext),
                 (false, false, KeyCode::Char('[')) => Some(Action::ResultPagePrev),
                 (true, false, KeyCode::Char(']')) => Some(Action::CycleDbSourceNext),

@@ -37,6 +37,9 @@ impl Workspace {
         let root = root.as_ref().canonicalize().with_context(|| {
             format!("canonicalize workspace root {}", root.as_ref().display())
         })?;
+        // Strip the Windows `\\?\` extended-length prefix so external CLIs and
+        // the UI never see it (#87).
+        let root = strip_extended_prefix(&root);
         let tree = build_tree(&root, &root)?;
         let mut ws = Self {
             root,
@@ -297,5 +300,16 @@ fn restore_expanded(node: &mut FileNode, expanded: &[PathBuf]) {
         for c in &mut node.children {
             restore_expanded(c, expanded);
         }
+    }
+}
+
+/// Strip the Windows extended-length path prefix (`\\?\`) that `canonicalize()`
+/// adds. External CLIs and the UI should never see it (#87).
+pub fn strip_extended_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
     }
 }

@@ -443,14 +443,18 @@ fn expand_tilde(p: &str) -> PathBuf {
 
 pub fn find_rdp_client(preferred: &str) -> Option<&'static str> {
     let pref = preferred.trim();
+    // On Windows, prefer the built-in `mstsc` RDP client (#65).
     let order: &[&str] = if !pref.is_empty() {
-        // Prefer configured name if present on PATH.
         match pref {
-            "xfreerdp" => &["xfreerdp", "wlfreerdp", "remmina"],
-            "wlfreerdp" => &["wlfreerdp", "xfreerdp", "remmina"],
-            "remmina" => &["remmina", "xfreerdp", "wlfreerdp"],
+            "mstsc" => &["mstsc", "xfreerdp", "wlfreerdp", "remmina"],
+            "xfreerdp" => &["xfreerdp", "wlfreerdp", "remmina", "mstsc"],
+            "wlfreerdp" => &["wlfreerdp", "xfreerdp", "remmina", "mstsc"],
+            "remmina" => &["remmina", "xfreerdp", "wlfreerdp", "mstsc"],
+            _ if cfg!(windows) => &["mstsc", "xfreerdp", "wlfreerdp", "remmina"],
             _ => &["xfreerdp", "wlfreerdp", "remmina"],
         }
+    } else if cfg!(windows) {
+        &["mstsc", "xfreerdp", "wlfreerdp", "remmina"]
     } else {
         &["xfreerdp", "wlfreerdp", "remmina"]
     };
@@ -464,10 +468,26 @@ pub fn find_rdp_client(preferred: &str) -> Option<&'static str> {
 
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    // On Windows, check PATHEXT extensions (.exe, .cmd, etc.) (#65).
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .map(|e| e.to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
     for dir in std::env::split_paths(&path) {
         let c = dir.join(name);
         if c.is_file() {
             return Some(c);
+        }
+        for ext in &extensions {
+            let with_ext = dir.join(format!("{name}{ext}"));
+            if with_ext.is_file() {
+                return Some(with_ext);
+            }
         }
     }
     None
@@ -475,7 +495,7 @@ fn which(name: &str) -> Option<PathBuf> {
 
 fn spawn_rdp(profile: &SessionProfile) -> Result<Child> {
     let client = find_rdp_client(&profile.rdp_client)
-        .ok_or_else(|| anyhow::anyhow!("no RDP client (xfreerdp / wlfreerdp / remmina) in PATH"))?;
+        .ok_or_else(|| anyhow::anyhow!("no RDP client (xfreerdp / wlfreerdp / remmina / mstsc) in PATH"))?;
     let host = profile.host.trim();
     if host.is_empty() {
         bail!("RDP host empty");
@@ -490,6 +510,14 @@ fn spawn_rdp(profile: &SessionProfile) -> Result<Child> {
                 format!("rdp://{}@{host}:{}", profile.user.trim(), profile.port)
             };
             cmd.arg(uri);
+        }
+        "mstsc" => {
+            // Windows built-in RDP client (#65).
+            let port = if profile.port == 0 { 3389 } else { profile.port };
+            cmd.arg(format!("/v:{host}:{port}"));
+            if !profile.gateway.trim().is_empty() {
+                cmd.arg(format!("/g:{}", profile.gateway.trim()));
+            }
         }
         _ => {
             // FreeRDP family

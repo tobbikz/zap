@@ -211,6 +211,14 @@ pub struct UiState {
     pub table_filter_order_edit: String,
     /// Draft text while editing a table filter bar.
     pub table_filter_draft: String,
+    /// Console horizontal scroll offset for long SQL lines (#26).
+    pub db_scroll_col: usize,
+    /// Results: client-side sort column index (None = natural order) (#31).
+    pub results_sort_col: Option<usize>,
+    /// Results: sort direction (true = ascending, false = descending) (#31).
+    pub results_sort_asc: bool,
+    /// Results: per-column width override delta (col_index → delta chars) (#31).
+    pub results_col_width_delta: std::collections::HashMap<usize, isize>,
 }
 
 /// Which column is active on DB Home.
@@ -317,6 +325,10 @@ impl Default for UiState {
             table_filter_field: TableFilterField::Where,
             table_filter_draft: String::new(),
             table_filter_where_edit: String::new(),
+            db_scroll_col: 0,
+            results_sort_col: None,
+            results_sort_asc: true,
+            results_col_width_delta: std::collections::HashMap::new(),
             table_filter_order_edit: String::new(),
         }
     }
@@ -1576,6 +1588,7 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let line_count = lines.len().max(1);
     let gutter = line_count.ilog10() as usize + 1;
     let text_cols = width.saturating_sub(gutter + 3);
+    let h_scroll = ctx.ui.db_scroll_col;
     let start = ctx.ui.db_scroll_row;
     let end = (start + height).min(line_count);
     let cursor_row = ctx.ui.db_cursor.row;
@@ -1610,8 +1623,13 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         ];
         let hl = highlights.get(rel).cloned().unwrap_or_default();
         let chars: Vec<char> = text.chars().collect();
-        let visible_end = chars.len().min(text_cols);
-        let mut col = 0;
+        // Horizontal scroll: show chars[h_scroll..h_scroll+text_cols] (#26).
+        let vis_start = h_scroll.min(chars.len());
+        let visible_end = (vis_start + text_cols).min(chars.len());
+        // Overflow marker when content extends past the right edge.
+        let has_overflow_right = visible_end < chars.len();
+        let _has_overflow_left = vis_start > 0;
+        let mut col = vis_start;
         while col < visible_end {
             let kind = hl
                 .iter()
@@ -1644,9 +1662,14 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             spans.push(Span::styled(slice, style));
             col = run_end;
         }
-        if ctx.ui.db_sql_all_selected && visible_end == 0 {
+        // Faint overflow markers (#26).
+        if has_overflow_right && !spans.is_empty() {
+            spans.push(Span::styled("▶", theme::style_faint()));
+        }
+        let visible_char_count = visible_end.saturating_sub(vis_start);
+        if ctx.ui.db_sql_all_selected && visible_char_count == 0 {
             spans.push(Span::styled(" ", theme::style_selected()));
-        } else if on_cursor && visible_end == 0 {
+        } else if on_cursor && visible_char_count == 0 {
             spans.push(Span::styled(
                 " ",
                 Style::default().bg(theme::surface_2()),
@@ -1673,11 +1696,12 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 .map(|l| l.chars().count())
                 .unwrap_or(0);
             // gutter = accent bar (1) + line number + space
+            let vis_col = ctx.ui.db_cursor.col.min(line_len).saturating_sub(h_scroll);
             let x = inner.x
                 + 1
                 + (gutter as u16)
                 + 1
-                + ctx.ui.db_cursor.col.min(line_len).min(text_cols) as u16;
+                + vis_col.min(text_cols) as u16;
             let y = inner.y + row as u16;
             if x < inner.x + inner.width && y < inner.y + inner.height {
                 frame.set_cursor_position((x, y));
@@ -2674,7 +2698,14 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let h_scrolled = col_start > pinned || col_end < ncols;
 
     let col_indices: Vec<usize> = (0..pinned).chain(col_start..col_end).collect();
-    let col_widths = results_col_widths(result, &col_indices, grid_w, compact);
+    let mut col_widths = results_col_widths(result, &col_indices, grid_w, compact);
+    // Apply per-column width deltas (#31).
+    for (pos, &ci) in col_indices.iter().enumerate() {
+        if let Some(&delta) = ctx.ui.results_col_width_delta.get(&ci) {
+            let w = col_widths[pos] as isize + delta;
+            col_widths[pos] = w.clamp(4, 120) as usize;
+        }
+    }
 
     // Soft columns: space gutters only — no │ pipe lattice, no row-index gutter.
     let mut header_spans: Vec<Span<'static>> = Vec::new();
@@ -2690,7 +2721,14 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         } else {
             c.clone()
         };
-        let t = pad_display(&label, w);
+        // Sort indicator (#31).
+        let sort_indicator = if ctx.ui.results_sort_col == Some(ci) {
+            if ctx.ui.results_sort_asc { " ▲" } else { " ▼" }
+        } else {
+            ""
+        };
+        let full_label = format!("{label}{sort_indicator}");
+        let t = pad_display(&full_label, w);
         let style = if ci == result.cursor_col {
             theme::style_grid_cursor_header()
         } else {
@@ -2701,13 +2739,29 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let header: Line = Line::from(header_spans).style(Style::default().bg(theme::pane_fill()));
 
     let filter = db.results_filter.clone();
-    let filtered_idx: Vec<usize> = result
+    let mut filtered_idx: Vec<usize> = result
         .rows
         .iter()
         .enumerate()
         .filter(|(_, row)| ide_db::row_matches_filter(row, &filter))
         .map(|(i, _)| i)
         .collect();
+    // Client-side sort by focused column (#31).
+    if let Some(sort_col) = ctx.ui.results_sort_col {
+        if sort_col < result.columns.len() {
+            let asc = ctx.ui.results_sort_asc;
+            filtered_idx.sort_by(|&a, &b| {
+                let va = result.rows.get(a).and_then(|r| r.get(sort_col)).map(|s| s.as_str()).unwrap_or("");
+                let vb = result.rows.get(b).and_then(|r| r.get(sort_col)).map(|s| s.as_str()).unwrap_or("");
+                // Try numeric comparison first.
+                let cmp = match (va.parse::<f64>(), vb.parse::<f64>()) {
+                    (Ok(fa), Ok(fb)) => fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => va.cmp(vb),
+                };
+                if asc { cmp } else { cmp.reverse() }
+            });
+        }
+    }
     // Reserve space for the inline chart so it isn't clipped under a full grid (#105).
     let chart_h = result
         .chart
@@ -3502,20 +3556,28 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("y  Y", "yank cell · row"),
             ("a", "apply Changes"),
             ("t", "begin txn · x rollback · X commit"),
+            ("S", "sort column ASC/DESC/off"),
+            ("> <", "widen / narrow column"),
+            ("+", "new SQL tab"),
             ("Esc", "cancel running query (not kill)"),
             ("K", "kill session at cursor (confirm)"),
             ("P", "pin leading columns"),
+            ("t / +", "new SQL tab"),
+            ("[ ]", "prev / next page (tab if !Results)"),
             ("Shift-T", "cycle theme"),
         ],
         Focus::Editor => &[
             ("Ctrl-P", "command palette"),
-            ("Ctrl-W", "close SQL tab"),
             ("i", "insert"),
-            ("F5", "run"),
+            ("F5", "run all"),
+            ("Alt-Enter", "run statement at cursor"),
             ("Ctrl-E", "EXPLAIN"),
             ("b  s  o", "database · schema · table"),
             ("Alt-b/s/o", "same while Insert"),
             ("Alt-L", "cycle SELECT limit"),
+            ("t / +", "new SQL tab"),
+            ("[ ]", "prev / next tab"),
+            ("x / Ctrl-W", "close SQL tab"),
             ("Shift-T", "cycle theme"),
         ],
         Focus::Database => &[
@@ -4255,7 +4317,8 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
         Mode::Insert if ui.focus == Focus::Editor => {
             return vec![
                 ("Esc", "normal"),
-                ("F5", "run"),
+                ("F5", "run all"),
+                ("Alt-↵", "run at cursor"),
                 ("Alt-b/s/o", "db·schema·table"),
                 ("Alt-L", "limit"),
             ];
@@ -4280,6 +4343,8 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
                     ("f", "exit full"),
                     ("i", "insert"),
                     ("F5", "run"),
+                    ("Alt-↵", "cursor"),
+                    ("t", "tab"),
                     ("b/s/o", "db·schema·table"),
                 ]
             }
@@ -4308,6 +4373,8 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
         Focus::Editor => vec![
             ("i", "insert"),
             ("F5", "run"),
+            ("Alt-↵", "cursor"),
+            ("t", "new tab"),
             ("b/s/o", "db·schema·table"),
             ("Alt-L", "limit"),
         ],
