@@ -42,6 +42,9 @@ pub fn postgres_explain_grid(text: &str) -> Option<QueryResult> {
         cursor_col: 0,
         explain: Some(text.to_string()),
         chart: None,
+        chart_value_col: None,
+        chart_category_col: None,
+        chart_kind_name: None,
         page: 0,
         has_more: false,
     })

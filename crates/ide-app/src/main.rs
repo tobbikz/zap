@@ -52,7 +52,34 @@ async fn main() -> Result<()> {
 
     let root = first
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .unwrap_or_else(default_workspace_dir);
 
     app::run(root).await
+}
+
+/// Pick a sensible workspace root when none is passed on the CLI (#87).
+/// Avoid `Downloads` / transient dirs that litter queries/exports.
+fn default_workspace_dir() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if is_transient_dir(&cwd) {
+        // Prefer a stable local-data directory for the product.
+        if let Some(data) = ide_core::config_dir() {
+            let workspace = data.join("workspace");
+            let _ = std::fs::create_dir_all(&workspace);
+            return workspace;
+        }
+    }
+    cwd
+}
+
+fn is_transient_dir(p: &std::path::Path) -> bool {
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "downloads" | "desktop" | "tmp" | "temp"
+    )
 }

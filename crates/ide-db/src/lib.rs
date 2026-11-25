@@ -50,6 +50,23 @@ pub use result_chart::{
 };
 pub use schema_cache::{expecting_relation, SchemaNameCache, SqlCompletionItem};
 
+/// Extract the SQL text under the cursor, or the selection if given (#20).
+/// Used by the app to get the statement text without going through `execute_sql_at_cursor`.
+pub fn statement_at_cursor_text(
+    sql: &str,
+    cursor_row: usize,
+    cursor_col: usize,
+    selection: Option<String>,
+) -> String {
+    if let Some(sel) = selection {
+        let sel = sel.trim().to_string();
+        if !sel.is_empty() {
+            return sel;
+        }
+    }
+    statement_at_cursor(sql, cursor_row, cursor_col)
+}
+
 use anyhow::{Context, Result, bail};
 use engines::{ClickhouseHttp, MssqlClient};
 use chrono::Local;
@@ -513,19 +530,36 @@ pub fn build_table_data_sql(
         _ => {}
     }
     let qual = qualify_table_name(driver, schema, table);
-    let mut sql = format!("SELECT * FROM {qual}");
     let w = where_clause.trim().trim_end_matches(';').trim();
-    if !w.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(w);
-    }
     let o = order_by.trim().trim_end_matches(';').trim();
-    if !o.is_empty() {
-        sql.push_str(" ORDER BY ");
-        sql.push_str(o);
+    match driver {
+        DbDriver::Mssql => {
+            let mut sql = format!("SELECT TOP ({limit}) * FROM {qual}");
+            if !w.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(w);
+            }
+            if !o.is_empty() {
+                sql.push_str(" ORDER BY ");
+                sql.push_str(o);
+            }
+            sql.push_str(";\n");
+            sql
+        }
+        _ => {
+            let mut sql = format!("SELECT * FROM {qual}");
+            if !w.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(w);
+            }
+            if !o.is_empty() {
+                sql.push_str(" ORDER BY ");
+                sql.push_str(o);
+            }
+            sql.push_str(&format!(" LIMIT {limit};\n"));
+            sql
+        }
     }
-    sql.push_str(&format!(" LIMIT {limit};\n"));
-    sql
 }
 
 fn urlencoding_lite(s: &str) -> String {
@@ -801,6 +835,12 @@ pub struct QueryResult {
     pub explain: Option<String>,
     /// ASCII chart / sparkline text (Results footer).
     pub chart: Option<String>,
+    /// Chart: chosen value column index (None = auto-detect first numeric) (#110).
+    pub chart_value_col: Option<usize>,
+    /// Chart: chosen category/label column index (None = row indices) (#110).
+    pub chart_category_col: Option<usize>,
+    /// Chart: active kind name ("bar"/"line"/"pie"; None = default bar) (#110).
+    pub chart_kind_name: Option<String>,
     /// Zero-based page when results were fetched with LIMIT/OFFSET.
     pub page: usize,
     /// More rows may exist beyond this page.
@@ -813,6 +853,9 @@ pub struct QueryHistoryEntry {
     pub sql: String,
     #[serde(default)]
     pub elapsed_ms: u128,
+    /// Source that executed this query (empty for legacy entries) (#45).
+    #[serde(default)]
+    pub source_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -856,6 +899,9 @@ impl QueryResult {
             cursor_col: 0,
             explain: None,
             chart: None,
+            chart_value_col: None,
+            chart_category_col: None,
+            chart_kind_name: None,
             page: 0,
             has_more: false,
         }
@@ -1510,6 +1556,8 @@ pub struct DbWorkspace {
     pub structure_lines: Vec<StructureLine>,
     pub structure_title: String,
     pub structure_scroll: usize,
+    /// Logical selected row in structure — independent of scroll (#29).
+    pub structure_selected: usize,
     /// Console transaction open on `txn_pool_key` (held connection; not pool auto-commit).
     pub in_txn: bool,
     pools: HashMap<String, LivePool>,
@@ -1662,6 +1710,7 @@ impl Default for DbWorkspace {
             structure_lines: Vec::new(),
             structure_title: String::new(),
             structure_scroll: 0,
+            structure_selected: 0,
             in_txn: false,
             txn_pool_key: None,
             txn_conn: None,
@@ -2128,14 +2177,20 @@ impl DbWorkspace {
     }
 
     /// Palette items for recent query history (newest first).
+    /// Filters to active source when set; shows all when no source is active (#45).
     pub fn query_history_palette_items(&self) -> Vec<(String, String)> {
+        let active = self.active_source.as_deref().unwrap_or("");
         self.history
             .iter()
-            .rev()
-            .take(60)
             .enumerate()
-            .map(|(i, e)| {
-                let hist_idx = self.history.len().saturating_sub(1 + i);
+            .rev()
+            .filter(|(_, e)| {
+                active.is_empty()
+                    || e.source_id.is_empty()
+                    || e.source_id == active
+            })
+            .take(60)
+            .map(|(hist_idx, e)| {
                 (
                     e.label(56),
                     format!("hist:{hist_idx}"),
@@ -2202,6 +2257,26 @@ impl DbWorkspace {
         if self.selected >= self.flat.len() {
             self.selected = self.flat.len().saturating_sub(1);
         }
+    }
+
+    /// Collapse all expanded explorer tree nodes (#34).
+    pub fn collapse_all(&mut self) {
+        collapse_all_nodes(&mut self.tree);
+        self.rebuild_flat();
+        self.status = "collapsed all".into();
+    }
+
+    /// Collapse all explorer nodes except the selection's ancestors (#34).
+    pub fn collapse_others(&mut self) {
+        let keep_id = self
+            .flat
+            .get(self.selected)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        let ancestors = collect_ancestor_ids(&self.tree, &keep_id);
+        collapse_others(&mut self.tree, &ancestors);
+        self.rebuild_flat();
+        self.status = "collapsed others".into();
     }
 
     pub fn move_up(&mut self) {
@@ -3145,6 +3220,7 @@ impl DbWorkspace {
                 StructureLine::ddl("Enter / F5 runs the canned admin SELECT."),
             ];
             self.structure_scroll = 0;
+            self.structure_selected = 0;
             self.status = format!("admin: {}", entry.label);
         } else {
             self.status = "loaded into Console · F5 to run".into();
@@ -3367,6 +3443,7 @@ impl DbWorkspace {
             self.structure_lines.clear();
             self.structure_title.clear();
             self.structure_scroll = 0;
+            self.structure_selected = 0;
             return Ok(());
         };
         match entry.kind {
@@ -3464,6 +3541,7 @@ impl DbWorkspace {
         self.structure.clear();
         self.structure_title = format!("{} · properties", src.name);
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         let mut lines = vec![
             StructureLine::section("CONNECTION"),
             StructureLine::item(format!("name     {}", src.name)),
@@ -3526,6 +3604,7 @@ impl DbWorkspace {
         self.structure.clear();
         self.structure_title = format!("{name} · database");
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         self.structure_lines = vec![
             StructureLine::section("DATABASE"),
             StructureLine::item(format!("name   {name}")),
@@ -3542,6 +3621,7 @@ impl DbWorkspace {
         self.structure.clear();
         self.structure_title = format!("{schema} · schema");
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         self.structure_lines = vec![
             StructureLine::section("SCHEMA"),
             StructureLine::item(format!("name     {schema}")),
@@ -3640,6 +3720,7 @@ impl DbWorkspace {
     fn set_structure_query_hint(&mut self, preview: Option<String>) {
         self.structure.clear();
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         self.structure_title = String::new();
         let mut lines = vec![StructureLine::section("CONSOLE QUERY")];
         if let Some(p) = preview.filter(|s| !s.is_empty()) {
@@ -3708,6 +3789,7 @@ impl DbWorkspace {
             format!("{schema}.{table}")
         };
         self.structure_scroll = 0;
+        self.structure_selected = 0;
 
         let mut lines = Vec::new();
         if !stats.is_empty() {
@@ -3985,9 +4067,87 @@ impl DbWorkspace {
                 }
                 Ok(out)
             }
-            LivePool::Mssql(_)
-            | LivePool::Clickhouse(_)
-            | LivePool::Duckdb(_)
+            LivePool::Mssql(c) => {
+                if let Some(db) = database {
+                    let _ = engines::exec_mssql(c, &format!("USE [{}]", db.replace(']', "]]"))).await;
+                }
+                let qr = engines::exec_mssql(
+                    c,
+                    &format!(
+                        "SELECT fk.name AS constraint_name, \
+                                fc.name AS column_name, \
+                                rs.name AS ref_schema, \
+                                rt.name AS ref_table, \
+                                rc.name AS ref_column \
+                         FROM sys.foreign_keys fk \
+                         JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id \
+                         JOIN sys.columns fc ON fkc.parent_object_id = fc.object_id AND fkc.parent_column_id = fc.column_id \
+                         JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id \
+                         JOIN sys.schemas rs ON rt.schema_id = rs.schema_id \
+                         JOIN sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id \
+                         JOIN sys.tables pt ON fkc.parent_object_id = pt.object_id \
+                         JOIN sys.schemas ps ON pt.schema_id = ps.schema_id \
+                         WHERE ps.name = N'{}' AND pt.name = N'{}' \
+                         ORDER BY fk.name, fkc.constraint_column_id",
+                        schema.replace('\'', "''"),
+                        table.replace('\'', "''")
+                    ),
+                )
+                .await?;
+                Ok(group_fk_rows(
+                    source_id,
+                    db_owned.clone(),
+                    qr.rows.into_iter().filter_map(|r| {
+                        Some((
+                            r.first()?.clone(),
+                            r.get(1)?.clone(),
+                            r.get(2)?.clone(),
+                            r.get(3)?.clone(),
+                            r.get(4)?.clone(),
+                        ))
+                    }),
+                ))
+            }
+            LivePool::Duckdb(conn) => {
+                let qr = alt_engines::exec_duckdb(
+                    conn,
+                    &format!(
+                        "SELECT dc.constraint_text, \
+                                unnest(dc.constraint_column_names) AS col_name, \
+                                '{}' AS ref_schema, \
+                                rdc.table_name AS ref_table, \
+                                unnest(rdc.constraint_column_names) AS ref_col \
+                         FROM duckdb_constraints() dc \
+                         JOIN duckdb_constraints() rdc \
+                           ON dc.database_name = rdc.database_name \
+                          AND dc.schema_name = rdc.schema_name \
+                          AND rdc.constraint_type = 'PRIMARY KEY' \
+                          AND array_length(dc.constraint_column_names) = array_length(rdc.constraint_column_names) \
+                         WHERE dc.constraint_type = 'FOREIGN KEY' \
+                           AND dc.schema_name = '{}' AND dc.table_name = '{}' \
+                         ORDER BY dc.constraint_text",
+                        schema.replace('\'', "''"),
+                        schema.replace('\'', "''"),
+                        table.replace('\'', "''")
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| QueryResult::empty());
+                Ok(group_fk_rows(
+                    source_id,
+                    db_owned.clone(),
+                    qr.rows.into_iter().filter_map(|r| {
+                        Some((
+                            r.first()?.clone(),
+                            r.get(1)?.clone(),
+                            r.get(2)?.clone(),
+                            r.get(3)?.clone(),
+                            r.get(4)?.clone(),
+                        ))
+                    }),
+                ))
+            }
+            LivePool::Clickhouse(_)
             | LivePool::Redis(_)
             | LivePool::Mongo(_)
             | LivePool::CloudStub(_) | LivePool::Http(_) => Ok(Vec::new()),
@@ -5051,6 +5211,68 @@ impl DbWorkspace {
                 }
                 out
             }
+            LivePool::Mssql(c) => {
+                if let Some(db) = database {
+                    let _ = engines::exec_mssql(c, &format!("USE [{}]", db.replace(']', "]]"))).await;
+                }
+                let qr = engines::exec_mssql(
+                    c,
+                    &format!(
+                        "SELECT pt.name AS table_name, fc.name AS column_name, \
+                                rt.name AS ref_table, rc.name AS ref_column \
+                         FROM sys.foreign_keys fk \
+                         JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id \
+                         JOIN sys.tables pt ON fkc.parent_object_id = pt.object_id \
+                         JOIN sys.schemas ps ON pt.schema_id = ps.schema_id \
+                         JOIN sys.columns fc ON fkc.parent_object_id = fc.object_id AND fkc.parent_column_id = fc.column_id \
+                         JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id \
+                         JOIN sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id \
+                         WHERE ps.name = N'{}' \
+                         ORDER BY pt.name, fkc.constraint_column_id",
+                        schema.replace('\'', "''")
+                    ),
+                )
+                .await?;
+                qr.rows.into_iter().filter_map(|r| {
+                    Some((
+                        r.first()?.clone(),
+                        r.get(1)?.clone(),
+                        r.get(2)?.clone(),
+                        r.get(3)?.clone(),
+                    ))
+                }).collect()
+            }
+            LivePool::Duckdb(conn) => {
+                let qr = alt_engines::exec_duckdb(
+                    conn,
+                    &format!(
+                        "SELECT dc.table_name, \
+                                unnest(dc.constraint_column_names) AS col_name, \
+                                rdc.table_name AS ref_table, \
+                                unnest(rdc.constraint_column_names) AS ref_col \
+                         FROM duckdb_constraints() dc \
+                         JOIN duckdb_constraints() rdc \
+                           ON dc.database_name = rdc.database_name \
+                          AND dc.schema_name = rdc.schema_name \
+                          AND rdc.constraint_type = 'PRIMARY KEY' \
+                          AND array_length(dc.constraint_column_names) = array_length(rdc.constraint_column_names) \
+                         WHERE dc.constraint_type = 'FOREIGN KEY' \
+                           AND dc.schema_name = '{}' \
+                         ORDER BY dc.table_name",
+                        schema.replace('\'', "''")
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| QueryResult::empty());
+                qr.rows.into_iter().filter_map(|r| {
+                    Some((
+                        r.first()?.clone(),
+                        r.get(1)?.clone(),
+                        r.get(2)?.clone(),
+                        r.get(3)?.clone(),
+                    ))
+                }).collect()
+            }
             _ => {
                 return Ok(format!(
                     "# ER · {schema}\n(ER sketch not available for this engine)\n"
@@ -5561,6 +5783,33 @@ impl DbWorkspace {
         self.execute_sql_text(&sql).await
     }
 
+    /// Run the single statement under `cursor_row:cursor_col`, or the selection if given (#20).
+    pub async fn execute_sql_at_cursor(
+        &mut self,
+        cursor_row: usize,
+        cursor_col: usize,
+        selection: Option<String>,
+    ) -> Result<()> {
+        if let Some(sel) = selection {
+            let sel = sel.trim().to_string();
+            if !sel.is_empty() {
+                return self.execute_sql_text(&sel).await;
+            }
+        }
+        let stmt = statement_at_cursor(&self.sql, cursor_row, cursor_col);
+        let stmt = stmt.trim().to_string();
+        if stmt.is_empty() {
+            bail!("no statement at cursor");
+        }
+        self.execute_sql_text(&stmt).await
+    }
+
+    /// Return (start_row, end_row) of the statement under the cursor (0-based, inclusive).
+    /// Used by the UI to highlight the statement that will run (#20).
+    pub fn statement_range_at_cursor(&self, cursor_row: usize, cursor_col: usize) -> (usize, usize) {
+        statement_range_at_cursor(&self.sql, cursor_row, cursor_col)
+    }
+
     /// Run SQL for this session only (e.g. after substituting query params).
     pub async fn execute_sql_text(&mut self, sql: &str) -> Result<()> {
         let Some(source_id) = self.active_source.clone() else {
@@ -5662,6 +5911,7 @@ impl DbWorkspace {
                 self.history.push(QueryHistoryEntry {
                     sql: stmt.clone(),
                     elapsed_ms: last.elapsed_ms,
+                    source_id: source_id.clone(),
                 });
             }
             // Multi-statement: park intermediate result sets in new tabs.
@@ -6398,6 +6648,83 @@ impl DbWorkspace {
         Ok(chart)
     }
 
+    /// Cycle chart kind (bar → line → pie → bar) and re-render (#110).
+    pub fn chart_cycle_kind(&mut self) -> Result<String> {
+        let Some(result) = self.last_result.as_mut() else {
+            bail!("no results to chart");
+        };
+        let kinds = result_chart::CHART_KINDS;
+        let cur = result.chart_kind_name.as_deref().unwrap_or("bar");
+        let next_idx = kinds.iter().position(|k| *k == cur).map(|i| (i + 1) % kinds.len()).unwrap_or(0);
+        let next = kinds[next_idx].to_string();
+        result.chart_kind_name = Some(next.clone());
+        let vcol = result.chart_value_col.or(Some(result.cursor_col));
+        let lcol = result.chart_category_col;
+        let chart = chart_typed(result, &next, vcol, lcol)?;
+        result.chart = Some(chart.clone());
+        Ok(format!("chart:{next}"))
+    }
+
+    /// Cycle chart value column to next numeric column (#110).
+    pub fn chart_cycle_value_col(&mut self) -> Result<String> {
+        let Some(result) = self.last_result.as_mut() else {
+            bail!("no results to chart");
+        };
+        let ncols = result.columns.len();
+        if ncols == 0 {
+            bail!("no columns");
+        }
+        let cur = result.chart_value_col.unwrap_or(result.cursor_col);
+        let mut next = (cur + 1) % ncols;
+        let start = next;
+        loop {
+            let is_numeric = result.rows.iter().any(|r| {
+                r.get(next)
+                    .map(|c| c != "NULL" && c.parse::<f64>().is_ok())
+                    .unwrap_or(false)
+            });
+            if is_numeric { break; }
+            next = (next + 1) % ncols;
+            if next == start { break; }
+        }
+        result.chart_value_col = Some(next);
+        let col_name = result.columns.get(next).cloned().unwrap_or_default();
+        let kind = result.chart_kind_name.clone().unwrap_or_else(|| "bar".into());
+        let lcol = result.chart_category_col;
+        let chart = chart_typed(result, &kind, Some(next), lcol)?;
+        result.chart = Some(chart.clone());
+        Ok(format!("value:{col_name}"))
+    }
+
+    /// Cycle chart category/label column (#110).
+    pub fn chart_cycle_category_col(&mut self) -> Result<String> {
+        let Some(result) = self.last_result.as_mut() else {
+            bail!("no results to chart");
+        };
+        let ncols = result.columns.len();
+        if ncols == 0 {
+            bail!("no columns");
+        }
+        let cur = result.chart_category_col;
+        let next = match cur {
+            Some(c) => {
+                let n = (c + 1) % (ncols + 1);
+                if n == ncols { None } else { Some(n) }
+            }
+            None => Some(0),
+        };
+        result.chart_category_col = next;
+        let label = match next {
+            Some(ci) => result.columns.get(ci).cloned().unwrap_or_else(|| format!("col{ci}")),
+            None => "row#".into(),
+        };
+        let kind = result.chart_kind_name.clone().unwrap_or_else(|| "bar".into());
+        let vcol = result.chart_value_col.or(Some(result.cursor_col));
+        let chart = chart_typed(result, &kind, vcol, next)?;
+        result.chart = Some(chart.clone());
+        Ok(format!("label:{label}"))
+    }
+
     /// Clear inline `result.chart` overlay (#105).
     pub fn dismiss_chart(&mut self) -> bool {
         let Some(result) = self.last_result.as_mut() else {
@@ -6847,6 +7174,51 @@ impl DbWorkspace {
         false
     }
 
+    /// Expand the target schema in the explorer tree, then select the table (#30).
+    pub async fn expand_and_select_table(
+        &mut self,
+        source_id: &str,
+        database: Option<&str>,
+        schema: &str,
+        table: &str,
+    ) -> Result<bool> {
+        // Already present? Quick path.
+        if self.select_table_in_explorer(source_id, database, schema, table) {
+            return Ok(true);
+        }
+        self.ensure_connected(source_id, database).await?;
+        // Find the schema node and expand it if needed.
+        let schema_id = self.flat.iter().find_map(|e| {
+            if e.source_id == source_id
+                && e.database.as_deref() == database
+                && e.schema.as_deref() == Some(schema)
+                && e.kind == DbNodeKind::Schema
+            {
+                Some(e.id.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(sid) = schema_id {
+            let needs_load = find_node(&self.tree, &sid)
+                .map(|n| !n.expanded || n.children.is_empty())
+                .unwrap_or(true);
+            if needs_load {
+                if let Some(node) = find_node_mut(&mut self.tree, &sid) {
+                    node.expanded = true;
+                }
+                let children = self.introspect_tables(source_id, database, schema).await?;
+                if let Some(node) = find_node_mut(&mut self.tree, &sid) {
+                    if node.children.is_empty() {
+                        node.children = children;
+                    }
+                }
+                self.rebuild_flat();
+            }
+        }
+        Ok(self.select_table_in_explorer(source_id, database, schema, table))
+    }
+
     /// Explorer selection or bound table tab → `(source_id, database, schema, table)`.
     pub fn selected_table_context(&self) -> Option<(String, Option<String>, String, String)> {
         if let Some(e) = self.flat.get(self.selected) {
@@ -7123,7 +7495,8 @@ impl DbWorkspace {
             return self.finish_explain_result(driver, result);
         }
         let explain = match driver {
-            DbDriver::Postgres => format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {stmt}"),
+            // Plan-only: never ANALYZE writes; ANALYZE on non-SELECT is dangerous (#38).
+            DbDriver::Postgres => format!("EXPLAIN (FORMAT TEXT) {stmt}"),
             DbDriver::Mysql => format!("EXPLAIN {stmt}"),
             DbDriver::Sqlite | DbDriver::Duckdb => format!("EXPLAIN {stmt}"),
             DbDriver::Mssql => unreachable!("mssql explain handled above"),
@@ -8887,6 +9260,170 @@ fn split_statements(sql: &str) -> Vec<String> {
     out
 }
 
+/// Extract the SQL statement under the cursor position (0-based row, col).
+/// Uses `split_statements` boundaries mapped back to byte offsets (#20).
+fn statement_at_cursor(sql: &str, cursor_row: usize, cursor_col: usize) -> String {
+    let (start, end) = statement_range_at_cursor(sql, cursor_row, cursor_col);
+    let lines: Vec<&str> = sql.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let s = start.min(lines.len() - 1);
+    let e = end.min(lines.len() - 1);
+    lines[s..=e].join("\n")
+}
+
+/// Return (start_row, end_row) inclusive of the statement that contains `cursor_row:cursor_col`.
+/// Splits on `;` boundaries (respecting strings/comments) to find which statement the cursor is in.
+fn statement_range_at_cursor(sql: &str, cursor_row: usize, _cursor_col: usize) -> (usize, usize) {
+    let lines: Vec<&str> = sql.lines().collect();
+    if lines.is_empty() {
+        return (0, 0);
+    }
+    // Convert cursor_row to byte offset range.
+    let mut byte_starts: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut offset = 0usize;
+    for line in &lines {
+        byte_starts.push(offset);
+        offset += line.len() + 1; // +1 for '\n'
+    }
+    let cursor_byte = byte_starts.get(cursor_row).copied().unwrap_or(0);
+
+    // Walk the same state machine as split_statements, recording statement byte ranges.
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    let mut byte_i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut dollar_tag: Option<String> = None;
+    let mut stmt_start_byte = 0usize;
+    let mut ranges: Vec<(usize, usize)> = Vec::new(); // byte ranges [start, end)
+
+    while i < chars.len() {
+        let c = chars[i];
+        let c_len = c.len_utf8();
+
+        if let Some(ref tag) = dollar_tag {
+            let tag_chars: Vec<char> = tag.chars().collect();
+            if c == '$' && chars[i..].starts_with(&tag_chars) {
+                for ch in &tag_chars {
+                    byte_i += ch.len_utf8();
+                }
+                i += tag_chars.len();
+                dollar_tag = None;
+                continue;
+            }
+            byte_i += c_len;
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            byte_i += c_len;
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    byte_i += 1;
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            byte_i += c_len;
+            if c == '"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
+            while i < chars.len() && chars[i] != '\n' {
+                byte_i += chars[i].len_utf8();
+                i += 1;
+            }
+            continue;
+        }
+
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            byte_i += c_len;
+            byte_i += chars[i + 1].len_utf8();
+            i += 2;
+            while i < chars.len() {
+                byte_i += chars[i].len_utf8();
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    byte_i += chars[i + 1].len_utf8();
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if c == '$' {
+            if let Some(tag) = parse_dollar_tag(&chars, i) {
+                for ch in tag.chars() {
+                    byte_i += ch.len_utf8();
+                }
+                i += tag.chars().count();
+                dollar_tag = Some(tag);
+                continue;
+            }
+        }
+
+        match c {
+            '\'' => { in_single = true; byte_i += c_len; }
+            '"'  => { in_double = true; byte_i += c_len; }
+            ';'  => {
+                // Check if the accumulated text is non-empty.
+                let slice = &sql[stmt_start_byte..byte_i];
+                if !slice.trim().is_empty() {
+                    ranges.push((stmt_start_byte, byte_i));
+                }
+                byte_i += c_len;
+                stmt_start_byte = byte_i;
+            }
+            _ => { byte_i += c_len; }
+        }
+        i += 1;
+    }
+    // Last statement (no trailing `;`).
+    if stmt_start_byte < sql.len() {
+        let slice = &sql[stmt_start_byte..];
+        if !slice.trim().is_empty() {
+            ranges.push((stmt_start_byte, sql.len()));
+        }
+    }
+
+    // Find which range contains cursor_byte.
+    let line_count = lines.len();
+    for (s, e) in &ranges {
+        if cursor_byte >= *s && cursor_byte < *e {
+            let start_row = byte_starts.iter().rposition(|&b| b <= *s).unwrap_or(0);
+            let end_row = byte_starts
+                .iter()
+                .rposition(|&b| b < *e)
+                .unwrap_or(line_count - 1);
+            return (start_row, end_row);
+        }
+    }
+    // Cursor past last semicolon → last statement, or fallback to full buffer.
+    if let Some((s, e)) = ranges.last() {
+        let start_row = byte_starts.iter().rposition(|&b| b <= *s).unwrap_or(0);
+        let end_row = byte_starts
+            .iter()
+            .rposition(|&b| b < *e)
+            .unwrap_or(line_count - 1);
+        return (start_row, end_row);
+    }
+    (0, line_count.saturating_sub(1))
+}
+
 fn parse_dollar_tag(chars: &[char], start: usize) -> Option<String> {
     if start >= chars.len() || chars[start] != '$' {
         return None;
@@ -10087,6 +10624,46 @@ fn toggle_expand(nodes: &mut [DbTreeNode], id: &str) -> bool {
     false
 }
 
+/// Collapse every expanded node in the tree (#34).
+fn collapse_all_nodes(nodes: &mut [DbTreeNode]) {
+    for n in nodes {
+        n.expanded = false;
+        collapse_all_nodes(&mut n.children);
+    }
+}
+
+/// Collect ancestor node IDs of `target_id`.
+fn collect_ancestor_ids(nodes: &[DbTreeNode], target_id: &str) -> Vec<String> {
+    fn walk(nodes: &[DbTreeNode], target: &str, path: &mut Vec<String>) -> bool {
+        for n in nodes {
+            path.push(n.id.clone());
+            if n.id == target {
+                return true;
+            }
+            if walk(&n.children, target, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    walk(nodes, target_id, &mut path);
+    path
+}
+
+/// Collapse every node except those on the path to `keep_id` (#34).
+fn collapse_others(nodes: &mut [DbTreeNode], ancestors: &[String]) {
+    for n in nodes {
+        if ancestors.contains(&n.id) {
+            collapse_others(&mut n.children, ancestors);
+        } else {
+            n.expanded = false;
+            collapse_all_nodes(&mut n.children);
+        }
+    }
+}
+
 fn find_node_mut<'a>(nodes: &'a mut [DbTreeNode], id: &str) -> Option<&'a mut DbTreeNode> {
     for n in nodes {
         if n.id == id {
@@ -10198,6 +10775,7 @@ fn load_query_history() -> Vec<QueryHistoryEntry> {
                 .map(|sql| QueryHistoryEntry {
                     sql,
                     elapsed_ms: 0,
+                    source_id: String::new(),
                 })
                 .collect()
         })
@@ -11276,6 +11854,7 @@ impl DbWorkspace {
             StructureLine::item("indexes, FKs, constraints not compared (#124)"),
         ];
         self.structure_scroll = 0;
+        self.structure_selected = 0;
         self.status = if n == 0 {
             format!("schema diff · identical · {elapsed_ms} ms")
         } else {
@@ -11328,6 +11907,7 @@ impl DbWorkspace {
             let left_ty = row.get(2).map(|s| s.as_str()).unwrap_or("");
             let right_ty = row.get(3).map(|s| s.as_str()).unwrap_or("");
             match change {
+                // `+` objects exist only on right → patch left to gain them (#134).
                 "+" if object.starts_with("table ") => {
                     let t = object.trim_start_matches("table ").trim();
                     let cols = self
@@ -11343,7 +11923,7 @@ impl DbWorkspace {
                     if cols.is_empty() {
                         ddl.push_str(&format!("-- TODO: CREATE TABLE {t} (...);\n\n"));
                     } else {
-                        ddl.push_str(&ddl_create_table(driver, &right.schema, t, &cols));
+                        ddl.push_str(&ddl_create_table(driver, &left.schema, t, &cols));
                         ddl.push_str("\n\n");
                     }
                 }
@@ -11354,7 +11934,7 @@ impl DbWorkspace {
                 }
                 "+" if object.contains('.') => {
                     let (t, col) = object.split_once('.').unwrap_or((object, ""));
-                    ddl.push_str(&ddl_add_column(driver, &right.schema, t, col, right_ty));
+                    ddl.push_str(&ddl_add_column(driver, &left.schema, t, col, right_ty));
                     ddl.push_str("\n\n");
                 }
                 "-" if object.contains('.') => {
@@ -11589,15 +12169,21 @@ impl DbWorkspace {
             .table_primary_keys(source_id, side.database.as_deref(), &side.schema, &side.table)
             .await?;
         let qual = table_qual(driver, &side.schema, &side.table);
-        let sql = format!("SELECT * FROM {qual} LIMIT {limit}");
+        // Deterministic ORDER BY: use PK columns when available, else column 1 (#137).
+        let order = if !pks.is_empty() {
+            pks.iter().map(|c| ident_quote(driver, c)).collect::<Vec<_>>().join(", ")
+        } else {
+            "1".to_string()
+        };
+        let sql = format!("SELECT * FROM {qual} ORDER BY {order} LIMIT {limit}");
         let qr = match pool {
             LivePool::Pg(p) => exec_pg(p, &sql).await?,
             LivePool::Mysql(p) => {
-                let q = format!("SELECT * FROM {qual} LIMIT {limit}");
+                let q = format!("SELECT * FROM {qual} ORDER BY {order} LIMIT {limit}");
                 exec_mysql(p, &q).await?
             }
             LivePool::Sqlite(p) => {
-                let q = format!("SELECT * FROM {qual} LIMIT {limit}");
+                let q = format!("SELECT * FROM {qual} ORDER BY {order} LIMIT {limit}");
                 exec_sqlite(p, &q).await?
             }
             LivePool::Mssql(c) => {
@@ -11608,17 +12194,18 @@ impl DbWorkspace {
                     )
                     .await;
                 }
-                let q = format!("SELECT TOP ({limit}) * FROM {qual}");
+                let q = format!("SELECT TOP ({limit}) * FROM {qual} ORDER BY {order}");
                 engines::exec_mssql(c, &q).await?
             }
             LivePool::Clickhouse(ch) => {
-                let db = side.database.as_deref().unwrap_or(&side.schema);
+                let ch_db = side.database.as_deref().unwrap_or(&side.schema);
+                let ch_tbl = &side.table;
                 let q = format!(
-                    "SELECT * FROM `{}`.`{}` LIMIT {limit}",
-                    db.replace('`', "``"),
-                    side.table.replace('`', "``")
+                    "SELECT * FROM `{}`.`{}` ORDER BY {order} LIMIT {limit}",
+                    ch_db.replace('`', "``"),
+                    ch_tbl.replace('`', "``")
                 );
-                engines::exec_clickhouse(&ch.with_database(db), &q, None).await?
+                engines::exec_clickhouse(&ch.with_database(ch_db), &q, None).await?
             }
             LivePool::Duckdb(d) => alt_engines::exec_duckdb(d, &sql).await?,
             LivePool::Redis(_) | LivePool::Mongo(_) | LivePool::CloudStub(_) | LivePool::Http(_) => {
@@ -11626,7 +12213,7 @@ impl DbWorkspace {
             }
         };
         let mut out = Vec::new();
-        for row in &qr.rows {
+        for (row_idx, row) in qr.rows.iter().enumerate() {
             let digest = row_digest(row);
             let preview = row_preview(row, &qr.columns);
             let key = if !pks.is_empty() {
@@ -11635,7 +12222,8 @@ impl DbWorkspace {
                     .filter_map(|pk| qr.columns.iter().position(|c| c == pk))
                     .collect();
                 if idxs.is_empty() {
-                    digest.clone()
+                    // No PK columns matched — use row index to avoid digest collapse (#137).
+                    format!("__row_{row_idx}_{digest}")
                 } else {
                     idxs.iter()
                         .map(|i| row.get(*i).cloned().unwrap_or_default())
@@ -11643,7 +12231,8 @@ impl DbWorkspace {
                         .join("|")
                 }
             } else {
-                digest.clone()
+                // No PK — use row index so duplicates are not collapsed (#137).
+                format!("__row_{row_idx}_{digest}")
             };
             out.push((key, digest, preview));
         }
@@ -12216,7 +12805,10 @@ fn ddl_create_table(driver: DbDriver, schema: &str, table: &str, cols: &[ColumnI
 fn ddl_drop_table(driver: DbDriver, schema: &str, table: &str) -> String {
     let qual = table_qual(driver, schema, table);
     match driver {
-        DbDriver::Mssql => format!("DROP TABLE IF EXISTS {qual};"),
+        // SQLite/DuckDB/MSSQL do not support CASCADE on DROP TABLE (#134).
+        DbDriver::Sqlite | DbDriver::Duckdb | DbDriver::Mssql => {
+            format!("DROP TABLE IF EXISTS {qual};")
+        }
         DbDriver::Mysql | DbDriver::Clickhouse => format!("DROP TABLE IF EXISTS {qual};"),
         _ => format!("DROP TABLE IF EXISTS {qual} CASCADE;"),
     }
@@ -12224,24 +12816,25 @@ fn ddl_drop_table(driver: DbDriver, schema: &str, table: &str) -> String {
 
 fn ddl_add_column(driver: DbDriver, schema: &str, table: &str, col: &str, ty: &str) -> String {
     let qual = table_qual(driver, schema, table);
-    let ty = ty.trim();
-    let ty = if ty.is_empty() {
-        match driver {
+    // Strip trailing `?` that the diff marks nullable types with (#134).
+    let ty = ty.trim().trim_end_matches('?').trim();
+    let (ty, null_clause) = if ty.is_empty() {
+        (match driver {
             DbDriver::Mssql => "nvarchar(max)",
             DbDriver::Mysql => "TEXT",
             _ => "text",
-        }
+        }, "")
     } else {
-        ty
+        (ty, "")
     };
     // T-SQL: ADD col ty — the COLUMN keyword is illegal on ADD (#127).
     match driver {
         DbDriver::Mssql => format!(
-            "ALTER TABLE {qual} ADD {} {ty};",
+            "ALTER TABLE {qual} ADD {} {ty}{null_clause};",
             ident_quote(driver, col)
         ),
         _ => format!(
-            "ALTER TABLE {qual} ADD COLUMN {} {ty};",
+            "ALTER TABLE {qual} ADD COLUMN {} {ty}{null_clause};",
             ident_quote(driver, col)
         ),
     }
@@ -12295,27 +12888,51 @@ fn ddl_alter_column(
     schema: &str,
     table: &str,
     col: &str,
-    _from: &str,
+    from: &str,
     to: &str,
 ) -> String {
     let qual = table_qual(driver, schema, table);
-    let to = to.trim();
-    let ty = if to.is_empty() { "text" } else { to.trim_end_matches('?') };
+    // Strip trailing `?` nullable marker from both sides (#134).
+    let from_trimmed = from.trim().trim_end_matches('?').trim();
+    let to_trimmed = to.trim().trim_end_matches('?').trim();
+    let ty = if to_trimmed.is_empty() { "text" } else { to_trimmed };
+    // Detect pure-nullability drift: same base type but `?` suffix changed (#134).
+    let from_nullable = from.trim().ends_with('?');
+    let to_nullable = to.trim().ends_with('?');
+    let type_same = norm_type(from_trimmed) == norm_type(to_trimmed);
+    let mut stmts = Vec::new();
     match driver {
-        DbDriver::Postgres => format!(
-            "ALTER TABLE {qual} ALTER COLUMN {} TYPE {ty};",
-            ident_quote(driver, col)
-        ),
-        DbDriver::Mysql | DbDriver::Clickhouse => format!(
-            "ALTER TABLE {qual} MODIFY COLUMN {} {ty};",
-            ident_quote(driver, col)
-        ),
-        DbDriver::Mssql => format!(
-            "ALTER TABLE {qual} ALTER COLUMN {} {ty};",
-            ident_quote(driver, col)
-        ),
+        DbDriver::Postgres => {
+            if !type_same {
+                stmts.push(format!(
+                    "ALTER TABLE {qual} ALTER COLUMN {} TYPE {ty};",
+                    ident_quote(driver, col)
+                ));
+            }
+            if from_nullable != to_nullable {
+                let null_action = if to_nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
+                stmts.push(format!(
+                    "ALTER TABLE {qual} ALTER COLUMN {} {null_action};",
+                    ident_quote(driver, col)
+                ));
+            }
+        }
+        DbDriver::Mysql | DbDriver::Clickhouse => {
+            let null_kw = if to_nullable { " NULL" } else { " NOT NULL" };
+            stmts.push(format!(
+                "ALTER TABLE {qual} MODIFY COLUMN {} {ty}{null_kw};",
+                ident_quote(driver, col)
+            ));
+        }
+        DbDriver::Mssql => {
+            let null_kw = if to_nullable { " NULL" } else { " NOT NULL" };
+            stmts.push(format!(
+                "ALTER TABLE {qual} ALTER COLUMN {} {ty}{null_kw};",
+                ident_quote(driver, col)
+            ));
+        }
         DbDriver::Sqlite | DbDriver::Duckdb => {
-            format!("-- SQLite/DuckDB: recreate table to change {} to {ty}", col)
+            stmts.push(format!("-- SQLite/DuckDB: recreate table to change {} to {ty}", col));
         }
         DbDriver::Redis
         | DbDriver::Mongo
@@ -12323,8 +12940,13 @@ fn ddl_alter_column(
         | DbDriver::Bigquery
         | DbDriver::Elasticsearch
         | DbDriver::Trino => {
-            format!("-- DDL not supported for {}", driver.label())
+            stmts.push(format!("-- DDL not supported for {}", driver.label()));
         }
+    }
+    if stmts.is_empty() {
+        format!("-- no change for {col}")
+    } else {
+        stmts.join("\n")
     }
 }
 

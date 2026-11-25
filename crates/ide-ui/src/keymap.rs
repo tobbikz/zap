@@ -192,6 +192,12 @@ pub enum Action {
     ResultPageNext,
     ResultPagePrev,
     ChartResults,
+    /// Cycle chart kind (bar → line → pie) (#110).
+    ChartCycleKind,
+    /// Cycle chart value column to next numeric (#110).
+    ChartCycleValueCol,
+    /// Cycle chart category/label column (#110).
+    ChartCycleCategoryCol,
     SaveResultTemp,
     SaveResultView,
     CancelQuery,
@@ -240,6 +246,18 @@ pub enum Action {
     CreateObjectToggleFlag,
     /// Left on type/flags: cycle type backward or toggle the same as Right for bools.
     CreateObjectNudgeBack,
+    /// Explorer: collapse all expanded tree nodes (#34).
+    CollapseAll,
+    /// Explorer: collapse all siblings except the selection's ancestors (#34).
+    CollapseOthers,
+    /// Run only the statement under the cursor (or selection) (#20).
+    RunQueryAtCursor,
+    /// Results: sort focused column ascending/descending/off (#31).
+    ToggleSortColumn,
+    /// Results: widen the focused column (#31).
+    WidenColumn,
+    /// Results: narrow the focused column (#31).
+    NarrowColumn,
 }
 
 pub struct Keymap;
@@ -551,6 +569,10 @@ impl Keymap {
                 (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
                 (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
                 (false, false, KeyCode::Char('o')) => Some(Action::OpenDbObjectPalette),
+                (false, false, KeyCode::Char('c')) => Some(Action::CollapseAll),
+                (false, true, KeyCode::Char('C')) | (false, false, KeyCode::Char('C')) => {
+                    Some(Action::CollapseOthers)
+                }
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
                 (false, true, KeyCode::Char('T')) | (false, false, KeyCode::Char('T')) => {
@@ -587,6 +609,17 @@ impl Keymap {
                 _ => None,
             },
             KeyContext::Results => match (ctrl, shift, key.code) {
+                // Sort focused column toggle ASC/DESC/off (#31).
+                (false, false, KeyCode::Char('S')) | (false, true, KeyCode::Char('S')) => {
+                    Some(Action::ToggleSortColumn)
+                }
+                // Widen / narrow focused column (#31).
+                (false, true, KeyCode::Char('>')) | (false, false, KeyCode::Char('>')) => {
+                    Some(Action::WidenColumn)
+                }
+                (false, true, KeyCode::Char('<')) | (false, false, KeyCode::Char('<')) => {
+                    Some(Action::NarrowColumn)
+                }
                 (false, false, KeyCode::Char(']')) => Some(Action::ResultPageNext),
                 (false, false, KeyCode::Char('[')) => Some(Action::ResultPagePrev),
                 (true, false, KeyCode::Char(']')) => Some(Action::CycleDbSourceNext),
@@ -621,6 +654,12 @@ impl Keymap {
                 (false, false, KeyCode::Char('n')) => Some(Action::OpenCreateMenu),
                 (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
                 (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
+                // Transaction chords: Results shortcuts so they're not palette-only (#28).
+                (false, false, KeyCode::Char('t')) => Some(Action::BeginTransaction),
+                (false, false, KeyCode::Char('x')) => Some(Action::RollbackTransaction),
+                (false, false, KeyCode::Char('X')) | (false, true, KeyCode::Char('X')) => {
+                    Some(Action::CommitTransaction)
+                }
                 (false, false, KeyCode::Char('D')) => Some(Action::ToggleResultsDensity),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Enter) => Some(Action::OpenCellModal),
@@ -631,6 +670,16 @@ impl Keymap {
                 }
                 (true, false, KeyCode::Char('c') | KeyCode::Char('C')) => {
                     Some(Action::YankResultCell)
+                }
+                (false, false, KeyCode::Char('c')) => Some(Action::ChartResults),
+                (false, true, KeyCode::Char('C')) | (false, false, KeyCode::Char('C')) => {
+                    Some(Action::ChartCycleKind)
+                }
+                (false, true, KeyCode::Char('V')) | (false, false, KeyCode::Char('V')) => {
+                    Some(Action::ChartCycleValueCol)
+                }
+                (false, true, KeyCode::Char('L')) | (false, false, KeyCode::Char('L')) => {
+                    Some(Action::ChartCycleCategoryCol)
                 }
                 (false, false, KeyCode::Char('m')) => Some(Action::OpenResultsActions),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),

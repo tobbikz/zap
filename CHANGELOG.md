@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- SQL completions cache columns for non-active schemas; `schema.table.` completes columns without switching the chip (#33).
+- Results grid: `S` toggles client-side sort (ASC → DESC → off) on the focused column; sort indicator in header (#31).
+- Results grid: `>` / `<` widen / narrow the focused column by 4 chars (#31).
+- Studio mouse: click to focus panes, click explorer rows to select, wheel scrolls Explorer / Structure / Console / Results (#27).
+- Console horizontal scroll for long SQL lines; cursor past visible columns scrolls with `▶` overflow marker (#26).
+- SQL tab management keys (`t`/`+` new outside Results, `[`/`]` cycle, `x`/`Ctrl-W` close) shown in Discover and footer hints (#25).
+- Run statement at cursor: `Alt-Enter` / `Shift-F5` runs only the `;`-delimited statement under the caret, or the selection (#20).
+
+- Charts: `c` chart · `C` cycle kind (bar/line/pie) · `V` cycle value column · `L` cycle category column in Results (#110).
+- Transaction chords in Results: `t` begin · `x` rollback · `X` commit; `+` still opens a SQL tab (#28).
+
 ### Fixed
 
 - SQL completions: stop rewriting the footer status on every keystroke; popup is sufficient (#32).
@@ -9,6 +22,22 @@
 - MSSQL dump: prefer `mssql-scripter` over broken `sqlcmd SELECT *` grid path that produced non-restorable output (#109).
 - MSSQL fallback dump: include full type specs (varchar length, decimal precision/scale), N-prefix string literals, GO batch separators (#113).
 - dbt/seed/golden: `seed_fixtures` concatenates all `testdata/*.sql` in sorted order instead of silently keeping only the last file; `golden_diff` picks the newest CSV in `testdata/golden/` instead of hardcoding `latest.csv`; persona help notes dbt commands are recipes, schema diff is table+col only (#144).
+- Data compare: deterministic ORDER BY (PK or col 1); don't collapse duplicate rows without PK; fix ClickHouse db.table resolution (#137).
+- `generate_schema_diff_ddl`: strip `?` nullable markers from DDL types; patch left (target) side for `+` objects; dialect-valid DROP (no CASCADE on SQLite/MSSQL); nullability drift emits SET/DROP NOT NULL (#134).
+- Structure pane: separate `structure_selected` from `structure_scroll`; ↑↓ moves selection with highlight; Enter acts on selected row (#29).
+- FK jump from Structure auto-expands target schema if not loaded (#30).
+- Postgres EXPLAIN uses plan-only `EXPLAIN (FORMAT TEXT)` instead of `EXPLAIN ANALYZE` to avoid executing DML/DDL (#38).
+- Auto-paging and table-open SQL use `SELECT TOP` / `OFFSET FETCH` on MSSQL instead of illegal `LIMIT` (#37).
+- Copy connection URI to clipboard from Explorer palette command (#35).
+- Collapse-all (`c`) and collapse-others (`C`) actions in the database explorer tree (#34).
+- Query history and bookmarks filter by active `source_id`; cross-engine entries still visible when no source is active (#45).
+- ER sketch and FK introspection implemented for MSSQL (`sys.foreign_keys`) and DuckDB (`duckdb_constraints()`) (#117).
+- Panic hook restores terminal raw mode and alternate screen on crash; user shell stays usable (#75).
+- Windows truecolor: detect WT_SESSION / COLORTERM and enable full 24-bit palettes instead of forcing 16-color (#74).
+- Agents/Sessions Windows defaults: use `powershell`/`python`/`where.exe`/`mstsc` on Windows; `which()` checks PATHEXT (#65).
+- Default workspace avoids Downloads/Desktop/tmp; strip `\\?\` extended-length prefix from canonicalized paths (#87).
+- Clipboard copy/paste retries on transient `OpenClipboard` failures; OSC 52 fallback for SSH/WSL (#161).
+- Agents/Sessions keep current product mode (Database) instead of forcing Code; `db_agent_seed` always provides DB context when a source is connected (#90).
 - BigQuery: poll `jobComplete` until done (~60 s timeout); fix `test_data_source` pool key mismatch (#157).
 - Snowflake: `snowflake_configured` accepts env-only host/user; `output_format=csv`; CSV fallback; first-seen column order (#158).
 - Redis/Mongo/ES: `guard_writable` allows read commands; Redis keys carry type-aware `query_sql`; `open_selected_table_tab` uses it; driver-specific studio starter (#91).

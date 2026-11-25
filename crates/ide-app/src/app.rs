@@ -49,6 +49,78 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+/// Clipboard set with retry for transient `OpenClipboard` failures on Windows (#161).
+fn clipboard_set_text(text: String) -> Result<(), arboard::Error> {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// Clipboard get with retry for transient `OpenClipboard` failures on Windows (#161).
+fn clipboard_get_text() -> Result<String, arboard::Error> {
+    let mut last_err = None;
+    for _ in 0..5 {
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// Write text via OSC 52 escape (remote/SSH clipboard fallback) (#161).
+fn osc52_set_clipboard(text: &str) {
+    use std::io::Write;
+    let encoded = base64_encode(text.as_bytes());
+    // OSC 52 ; c ; <base64> ST
+    let esc = format!("\x1b]52;c;{encoded}\x07");
+    let _ = std::io::stdout().write_all(esc.as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Try arboard first; fall back to OSC 52 on failure (SSH/WSL) (#161).
+fn clipboard_set_or_osc52(text: &str) {
+    match clipboard_set_text(text.to_string()) {
+        Ok(()) => {}
+        Err(_) => osc52_set_clipboard(text),
+    }
+}
+
 pub struct App {
     workspace: Workspace,
     buffers: BufferSet,
@@ -103,6 +175,8 @@ pub struct App {
     theme_before_preview: Option<String>,
     /// Origin for restrained TUI motion (spinner / pulse).
     anim_origin: Instant,
+    /// Last known terminal width for horizontal-scroll calculations (#26).
+    last_term_width: u16,
 }
 
 impl App {
@@ -150,6 +224,7 @@ impl App {
             health_activity_tick: 0,
             theme_before_preview: None,
             anim_origin: Instant::now(),
+            last_term_width: 120,
         };
         app.config.remember_project(&app.workspace.root);
         app.db.query_timeout_secs = app.config.database.query_timeout_secs;
@@ -1136,6 +1211,9 @@ impl App {
             cursor_col: 0,
             explain: None,
             chart: None,
+            chart_value_col: None,
+            chart_category_col: None,
+            chart_kind_name: None,
             page: 0,
             has_more: false,
         });
@@ -1412,6 +1490,103 @@ impl App {
             };
             self.ui.db_fullscreen = Some(pane);
             self.set_status("fullscreen · f / Esc exit", false);
+        }
+    }
+
+    /// Handle mouse events in Database Studio: click to focus panes, wheel to scroll (#27).
+    async fn handle_studio_mouse(&mut self, me: MouseEvent, _term_w: u16, term_h: u16) {
+        // Approximate Studio layout: row 0 = ribbon, row 1.. = panes.
+        // Left half: Explorer (top) + Structure (bottom) ≈ studio_left_width.
+        // Right half: Console (top) + Results (bottom).
+        let left_w = self.ui.studio_left_width;
+        let body_top = 1u16; // ribbon height
+        let body_h = term_h.saturating_sub(body_top + 1); // minus status
+        let results_h = (body_h as u32 * self.ui.results_pct as u32 / 100).max(3) as u16;
+        let console_h = body_h.saturating_sub(results_h);
+        let results_top = body_top + console_h;
+
+        let pane = if me.row < body_top {
+            None // ribbon
+        } else if me.column < left_w {
+            if me.row < body_top + body_h / 2 {
+                Some(Focus::Database)
+            } else {
+                Some(Focus::Structure)
+            }
+        } else if me.row < results_top {
+            Some(Focus::Editor)
+        } else {
+            Some(Focus::Results)
+        };
+
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(focus) = pane {
+                    if self.ui.focus != focus {
+                        self.ui.focus = focus;
+                        self.ui.mode = Mode::Normal;
+                        self.ui.show_completions = false;
+                        self.ui.completions.clear();
+                    }
+                    // Click in Explorer: select row under mouse.
+                    if focus == Focus::Database && me.row > body_top {
+                        let row_in_pane = (me.row - body_top) as usize;
+                        let idx = self.db.explorer_scroll + row_in_pane;
+                        if idx < self.db.flat.len() {
+                            self.db.selected = idx;
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(focus) = pane {
+                    match focus {
+                        Focus::Database => {
+                            self.db.explorer_scroll = self.db.explorer_scroll.saturating_sub(3);
+                        }
+                        Focus::Structure => {
+                            self.db.structure_scroll = self.db.structure_scroll.saturating_sub(3);
+                        }
+                        Focus::Editor => {
+                            self.ui.db_scroll_row = self.ui.db_scroll_row.saturating_sub(3);
+                        }
+                        Focus::Results => {
+                            if let Some(r) = self.db.last_result.as_mut() {
+                                r.cursor_row = r.cursor_row.saturating_sub(3);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(focus) = pane {
+                    match focus {
+                        Focus::Database => {
+                            if self.db.explorer_scroll + 3 < self.db.flat.len() {
+                                self.db.explorer_scroll += 3;
+                            }
+                        }
+                        Focus::Structure => {
+                            if self.db.structure_scroll + 3 < self.db.structure_lines.len() {
+                                self.db.structure_scroll += 3;
+                            }
+                        }
+                        Focus::Editor => {
+                            let max = self.db_line_count().saturating_sub(1);
+                            self.ui.db_scroll_row = (self.ui.db_scroll_row + 3).min(max);
+                        }
+                        Focus::Results => {
+                            if let Some(r) = self.db.last_result.as_mut() {
+                                let max = r.rows.len().saturating_sub(1);
+                                r.cursor_row = (r.cursor_row + 3).min(max);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1700,6 +1875,31 @@ impl App {
         }
     }
 
+    /// Copy the active connection's URI to the host clipboard (#35).
+    fn copy_connection_uri(&mut self) {
+        let source_id = self
+            .selected_connection_id()
+            .or_else(|| self.db.active_source.clone());
+        let Some(source_id) = source_id else {
+            self.set_status("copy URI: no active connection", true);
+            return;
+        };
+        let Some(src) = self.db.sources.iter().find(|s| s.id == source_id) else {
+            self.set_status("copy URI: source not found", true);
+            return;
+        };
+        // Redact password in the copied URI.
+        let mut redacted = src.clone();
+        if !redacted.password.is_empty() {
+            redacted.password = "****".into();
+        }
+        let uri = redacted.url();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(uri.clone())) {
+            Ok(()) => self.set_status(format!("copied URI · {uri}"), false),
+            Err(e) => self.set_status(format!("clipboard: {e}"), true),
+        }
+    }
+
     fn yank_result_cell(&mut self) {
         let Some(result) = self.db.last_result.as_ref() else {
             self.set_status("copy: no results", true);
@@ -1714,7 +1914,7 @@ impl App {
             return;
         };
         let text = if cell == "NULL" { "" } else { cell.as_str() };
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
+        match clipboard_set_text(text.to_string()) {
             Ok(()) => {
                 let preview = if text.is_empty() {
                     "NULL".into()
@@ -1743,7 +1943,7 @@ impl App {
             .map(|c| if c == "NULL" { "" } else { c.as_str() })
             .collect::<Vec<_>>()
             .join("\t");
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+        match clipboard_set_text(text.clone()) {
             Ok(()) => self.set_status(
                 format!("copied row · {} cols TSV", row.len()),
                 false,
@@ -1774,7 +1974,7 @@ impl App {
             n += 1;
         }
         let text = lines.join("\n");
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+        match clipboard_set_text(text) {
             Ok(()) => self.set_status(
                 if filt.is_empty() {
                     format!("copied all · {n} rows TSV")
@@ -1803,18 +2003,16 @@ impl App {
             self.set_status("yank: unnamed register empty (\"\" )", true);
             return Ok(());
         }
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
-            Ok(()) => self.set_status(
-                format!("yank → host clipboard ({} chars)", text.chars().count()),
-                false,
-            ),
-            Err(e) => self.set_status(format!("clipboard set: {e}"), true),
-        }
+        clipboard_set_or_osc52(&text);
+        self.set_status(
+            format!("yank → host clipboard ({} chars)", text.chars().count()),
+            false,
+        );
         Ok(())
     }
 
     async fn paste_host_clipboard_to_nvim(&mut self) -> Result<()> {
-        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+        let text = match clipboard_get_text() {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(format!("clipboard get: {e}"), true);
@@ -1869,6 +2067,18 @@ impl App {
         } else if self.ui.db_cursor.row >= self.ui.db_scroll_row + view_h {
             self.ui.db_scroll_row = self.ui.db_cursor.row.saturating_sub(view_h.saturating_sub(1));
         }
+        // Horizontal scroll: keep caret inside visible columns (#26).
+        let line_count = self.db_line_count();
+        let gutter = (line_count.max(1).ilog10() as usize) + 1;
+        // Approximate text_cols from last known terminal width (conservative).
+        let text_cols = (self.last_term_width as usize).saturating_sub(gutter + 3 + 30);
+        let text_cols = text_cols.max(20);
+        let col = self.ui.db_cursor.col;
+        if col < self.ui.db_scroll_col {
+            self.ui.db_scroll_col = col;
+        } else if col >= self.ui.db_scroll_col + text_cols {
+            self.ui.db_scroll_col = col.saturating_sub(text_cols.saturating_sub(1));
+        }
     }
 
     fn explorer_view_h(term_rows: u16) -> usize {
@@ -1910,18 +2120,26 @@ impl App {
     }
 
     async fn structure_confirm(&mut self, term_rows: u16) -> Result<()> {
-        let Some(line) = self.db.structure_lines.get(self.db.structure_scroll).cloned() else {
+        let Some(line) = self.db.structure_lines.get(self.db.structure_selected).cloned() else {
             return Ok(());
         };
         let Some(nav) = line.nav else {
             return Ok(());
         };
-        if self.db.select_table_in_explorer(
+        // Auto-expand the target schema if needed (#30).
+        let found = match self.db.expand_and_select_table(
             &nav.source_id,
             nav.database.as_deref(),
             &nav.schema,
             &nav.table,
-        ) {
+        ).await {
+            Ok(f) => f,
+            Err(e) => {
+                self.set_status(format!("FK expand: {e:#}"), true);
+                return Ok(());
+            }
+        };
+        if found {
             self.db
                 .ensure_explorer_visible(Self::explorer_view_h(term_rows));
             match self.db.open_selected_table_tab().await {
@@ -1935,7 +2153,7 @@ impl App {
         } else {
             self.set_status(
                 format!(
-                    "FK → {}.{} (table not in explorer — expand schema)",
+                    "FK → {}.{} (table not found in explorer)",
                     nav.schema, nav.table
                 ),
                 false,
@@ -2224,7 +2442,7 @@ impl App {
             self.set_status("copy: nothing to copy", true);
             return;
         };
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+        match clipboard_set_text(text.clone()) {
             Ok(()) => self.set_status(
                 format!("copied {} chars", text.chars().count()),
                 false,
@@ -2333,7 +2551,7 @@ impl App {
     }
 
     fn clipboard_paste_sql_or_editor(&mut self) {
-        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+        let text = match clipboard_get_text() {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(format!("clipboard: {e}"), true);
@@ -2592,6 +2810,49 @@ impl App {
         Ok(())
     }
 
+    /// Run the statement under the cursor, or the selection if present (#20).
+    async fn run_query_at_cursor(&mut self) -> Result<()> {
+        let selection = if self.ui.db_sql_all_selected {
+            Some(self.db.sql.clone())
+        } else {
+            None // TODO: visual selection (future enhancement)
+        };
+        let (s_row, e_row) = self.db.statement_range_at_cursor(
+            self.ui.db_cursor.row,
+            self.ui.db_cursor.col,
+        );
+        let stmt = ide_db::statement_at_cursor_text(
+            &self.db.sql,
+            self.ui.db_cursor.row,
+            self.ui.db_cursor.col,
+            selection,
+        );
+        let stmt = stmt.trim().to_string();
+        if stmt.is_empty() {
+            self.set_status("no statement at cursor", true);
+            return Ok(());
+        }
+        if self.maybe_confirm_destructive_sql(stmt.clone()) {
+            return Ok(());
+        }
+        self.set_status(
+            format!("running statement (lines {}–{})…", s_row + 1, e_row + 1),
+            false,
+        );
+        self.ui.busy_label = Some("RUNNING…".into());
+        self.pending_db_query = false;
+        let result = self.db.execute_sql_text(&stmt).await;
+        self.finish_query_ui();
+        match result {
+            Ok(()) => {
+                self.ui.focus = Focus::Results;
+                self.set_status(self.db.status.clone(), false);
+            }
+            Err(e) => self.show_query_error(format!("{e:#}")),
+        }
+        Ok(())
+    }
+
     /// If persona wants a gate and SQL looks destructive, open confirm modal (#173).
     fn maybe_confirm_destructive_sql(&mut self, sql: String) -> bool {
         if !self.db.should_confirm_destructive(&sql) {
@@ -2631,6 +2892,9 @@ impl App {
         self.ui.results_col_window = 0;
         self.ui.cell_modal = false;
         self.ui.cell_modal_drill = false;
+        // Reset client-side sort on new results (#31).
+        self.ui.results_sort_col = None;
+        self.ui.results_sort_asc = true;
     }
 
     fn show_query_error(&mut self, msg: String) {
@@ -2656,6 +2920,9 @@ impl App {
             cursor_col: 0,
             explain: None,
             chart: None,
+            chart_value_col: None,
+            chart_category_col: None,
+            chart_kind_name: None,
             page: 0,
             has_more: false,
         });
@@ -3486,6 +3753,9 @@ impl App {
                     cursor_col: 0,
                     explain: None,
                     chart: None,
+                    chart_value_col: None,
+                    chart_category_col: None,
+                    chart_kind_name: None,
                     page: 0,
                     has_more: false,
                 });
@@ -3580,6 +3850,9 @@ impl App {
                         cursor_col: 0,
                         explain: None,
                         chart: None,
+                        chart_value_col: None,
+                        chart_category_col: None,
+                        chart_kind_name: None,
                         page: 0,
                         has_more: false,
                     });
@@ -3966,10 +4239,8 @@ impl App {
         self.agent_form_field_mut().pop();
     }
 
+    /// Always provide DB context to agents when a source is connected (#90).
     fn db_agent_seed(&self) -> Option<String> {
-        if self.ui.product != ProductMode::Database {
-            return None;
-        }
         let sid = self.db.active_source.as_ref()?;
         let src = self.db.sources.iter().find(|s| &s.id == sid)?;
         let schema = ""; // keep generic — explorer selection optional later
@@ -5862,8 +6133,12 @@ impl App {
                         self.db_explorer_moved(term_rows).await;
                     }
                     Focus::Structure => {
-                        self.db.structure_scroll =
-                            self.db.structure_scroll.saturating_sub(1);
+                        // Move selection, then adjust scroll to keep it visible (#29).
+                        self.db.structure_selected =
+                            self.db.structure_selected.saturating_sub(1);
+                        if self.db.structure_selected < self.db.structure_scroll {
+                            self.db.structure_scroll = self.db.structure_selected;
+                        }
                     }
                     Focus::Results => {
                         if let Some(result) = self.db.last_result.as_mut() {
@@ -5924,8 +6199,14 @@ impl App {
                     }
                     Focus::Structure => {
                         let max = self.db.structure_lines.len().saturating_sub(1);
-                        if self.db.structure_scroll < max {
-                            self.db.structure_scroll += 1;
+                        if self.db.structure_selected < max {
+                            self.db.structure_selected += 1;
+                        }
+                        // Adjust scroll to keep selected row visible (#29).
+                        let view_h = term_rows.saturating_sub(6).max(2) as usize;
+                        if self.db.structure_selected >= self.db.structure_scroll + view_h {
+                            self.db.structure_scroll =
+                                self.db.structure_selected.saturating_sub(view_h - 1);
                         }
                     }
                     Focus::Results => {
@@ -6560,6 +6841,14 @@ impl App {
             }
             Action::CycleDbSourceNext => self.cycle_db_source(1).await,
             Action::CycleDbSourcePrev => self.cycle_db_source(-1).await,
+            Action::CollapseAll => {
+                self.db.collapse_all();
+                self.set_status(self.db.status.clone(), false);
+            }
+            Action::CollapseOthers => {
+                self.db.collapse_others();
+                self.set_status(self.db.status.clone(), false);
+            }
             Action::DeleteDataSource => {
                 if let Some(id) = self.selected_connection_id() {
                     self.start_delete_connection(&id);
@@ -6579,6 +6868,45 @@ impl App {
             Action::OpenDbSourceSlot(n) => self.open_db_source_slot(n).await,
             Action::OpenDatabase => self.enter_database_mode(),
             Action::RunQuery => self.run_query().await?,
+            Action::RunQueryAtCursor => self.run_query_at_cursor().await?,
+            Action::ToggleSortColumn => {
+                if let Some(result) = &self.db.last_result {
+                    let col = result.cursor_col;
+                    if self.ui.results_sort_col == Some(col) {
+                        if self.ui.results_sort_asc {
+                            self.ui.results_sort_asc = false;
+                            let name = result.columns.get(col).map(|s| s.as_str()).unwrap_or("?");
+                            self.set_status(format!("sort {name} DESC"), false);
+                        } else {
+                            self.ui.results_sort_col = None;
+                            self.set_status("sort off", false);
+                        }
+                    } else {
+                        self.ui.results_sort_col = Some(col);
+                        self.ui.results_sort_asc = true;
+                        let name = result.columns.get(col).map(|s| s.as_str()).unwrap_or("?");
+                        self.set_status(format!("sort {name} ASC"), false);
+                    }
+                }
+            }
+            Action::WidenColumn => {
+                if let Some(result) = &self.db.last_result {
+                    let col = result.cursor_col;
+                    let d = self.ui.results_col_width_delta.entry(col).or_insert(0);
+                    *d += 4;
+                    let val = *d;
+                    self.set_status(format!("column +4 (delta {val})"), false);
+                }
+            }
+            Action::NarrowColumn => {
+                if let Some(result) = &self.db.last_result {
+                    let col = result.cursor_col;
+                    let d = self.ui.results_col_width_delta.entry(col).or_insert(0);
+                    *d = (*d - 4).max(-20);
+                    let val = *d;
+                    self.set_status(format!("column -4 (delta {val})"), false);
+                }
+            }
             Action::ResultPageNext => match self.db.next_result_page().await {
                 Ok(()) => {
                     self.ui.focus = Focus::Results;
@@ -6596,9 +6924,21 @@ impl App {
             Action::ChartResults => match self.db.chart_last_result(None) {
                 Ok(_) => {
                     self.ui.focus = Focus::Results;
-                    self.set_status("chart in Results", false);
+                    self.set_status("chart in Results · C kind · V value-col · L label-col", false);
                 }
                 Err(e) => self.set_status(format!("chart: {e:#}"), true),
+            },
+            Action::ChartCycleKind => match self.db.chart_cycle_kind() {
+                Ok(label) => self.set_status(format!("chart → {label}"), false),
+                Err(e) => self.set_status(format!("chart kind: {e:#}"), true),
+            },
+            Action::ChartCycleValueCol => match self.db.chart_cycle_value_col() {
+                Ok(label) => self.set_status(format!("chart → {label}"), false),
+                Err(e) => self.set_status(format!("chart value col: {e:#}"), true),
+            },
+            Action::ChartCycleCategoryCol => match self.db.chart_cycle_category_col() {
+                Ok(label) => self.set_status(format!("chart → {label}"), false),
+                Err(e) => self.set_status(format!("chart label col: {e:#}"), true),
             },
             Action::SaveResultTemp => self.start_save_result(true),
             Action::SaveResultView => self.start_save_result(false),
@@ -6840,14 +7180,7 @@ impl App {
                 }
             }
             Action::OpenSessions => {
-                // Home dashboard has no sidebar — jump to Editor chrome so Sessions list is visible.
-                if self.ui.product != ProductMode::Code {
-                    self.ui.product = ProductMode::Code;
-                }
-                if self.ui.code_surface != CodeSurface::Editor {
-                    self.ui.code_surface = CodeSurface::Editor;
-                    self.last_code_surface = CodeSurface::Editor;
-                }
+                // Keep current product mode — don't switch to Code (#90).
                 self.ui.mode = Mode::Normal;
                 self.ui.sidebar = Sidebar::Sessions;
                 self.ui.focus = Focus::Sessions;
@@ -6941,13 +7274,7 @@ impl App {
                 };
             }
             Action::OpenAgents => {
-                if self.ui.product != ProductMode::Code {
-                    self.ui.product = ProductMode::Code;
-                }
-                if self.ui.code_surface != CodeSurface::Editor {
-                    self.ui.code_surface = CodeSurface::Editor;
-                    self.last_code_surface = CodeSurface::Editor;
-                }
+                // Keep current product mode — don't switch to Code (#90).
                 self.ui.mode = Mode::Normal;
                 self.ui.sidebar = Sidebar::Agents;
                 self.ui.focus = Focus::Agents;
@@ -7467,6 +7794,9 @@ impl App {
                         cursor_col: 0,
                         explain: None,
                         chart: None,
+                        chart_value_col: None,
+                        chart_category_col: None,
+                        chart_kind_name: None,
                         page: 0,
                         has_more: false,
                     });
@@ -7494,6 +7824,9 @@ impl App {
                         cursor_col: 0,
                         explain: None,
                         chart: None,
+                        chart_value_col: None,
+                        chart_category_col: None,
+                        chart_kind_name: None,
                         page: 0,
                         has_more: false,
                     });
@@ -7756,6 +8089,9 @@ impl App {
                     cursor_col: 0,
                     explain: None,
                     chart: None,
+                    chart_value_col: None,
+                    chart_category_col: None,
+                    chart_kind_name: None,
                     page: 0,
                     has_more: false,
                 });
@@ -8370,6 +8706,17 @@ impl App {
                 let cmd = id.trim_start_matches("plugin:");
                 self.run_plugin_command(cmd).await?;
             }
+            "copy_connection_uri" => {
+                self.copy_connection_uri();
+            }
+            "collapse_all" => {
+                self.db.collapse_all();
+                self.set_status(self.db.status.clone(), false);
+            }
+            "collapse_others" => {
+                self.db.collapse_others();
+                self.set_status(self.db.status.clone(), false);
+            }
             "add_datasource" => self.start_add_connection(),
             "edit_connection" => {
                 if let Some(id) = self.selected_connection_id() {
@@ -8438,9 +8785,7 @@ impl App {
                 self.set_status("terminal · Ctrl-` toggle", false);
             }
             "sessions" => {
-                self.ui.product = ProductMode::Code;
-                self.ui.code_surface = CodeSurface::Editor;
-                self.last_code_surface = CodeSurface::Editor;
+                // Keep current product mode — don't force Code (#90).
                 self.ui.mode = Mode::Normal;
                 self.ui.sidebar = Sidebar::Sessions;
                 self.ui.focus = Focus::Sessions;
@@ -8450,9 +8795,7 @@ impl App {
                 self.set_status("Sessions · Enter connect · a/A add", false);
             }
             "agents" => {
-                self.ui.product = ProductMode::Code;
-                self.ui.code_surface = CodeSurface::Editor;
-                self.last_code_surface = CodeSurface::Editor;
+                // Keep current product mode — don't force Code (#90).
                 self.ui.mode = Mode::Normal;
                 self.ui.sidebar = Sidebar::Agents;
                 self.ui.focus = Focus::Agents;
@@ -8915,6 +9258,7 @@ async fn event_loop(
         app.poll_dap().await;
 
         let size = terminal.size()?;
+        app.last_term_width = size.width;
         let agents_workspace = app.ui.product == ProductMode::Code
             && app.ui.code_surface == CodeSurface::Editor
             && app.ui.sidebar == Sidebar::Agents;
@@ -9295,6 +9639,13 @@ async fn event_loop(
                                         .await;
                                 }
                             }
+                        }
+                        // Database Studio mouse: click to focus panes, wheel to scroll (#27).
+                        if app.ui.product == ProductMode::Database
+                            && app.ui.db_surface == DbSurface::Studio
+                            && !app.nvim_active()
+                        {
+                            app.handle_studio_mouse(me, size.width, size.height).await;
                         }
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
@@ -10023,6 +10374,10 @@ async fn event_loop(
                             }
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
                                 || key.modifiers.contains(KeyModifiers::SUPER);
+                            if is_run_at_cursor_key(key) {
+                                app.handle_action(Action::RunQueryAtCursor, view_h, term_rows).await?;
+                                continue;
+                            }
                             if is_run_query_key(key) {
                                 app.handle_action(Action::RunQuery, view_h, term_rows).await?;
                                 continue;
@@ -10151,9 +10506,11 @@ async fn event_loop(
                                 }
 
                                 // In Explorer, bare `x` deletes the connection (confirm modal).
+                                // In Results, `x` / `X` are rollback / commit (#28).
                                 // Elsewhere `x` / Ctrl-W closes the SQL tab.
                                 let close_tab = (!ctrl
                                     && app.ui.focus != Focus::Database
+                                    && app.ui.focus != Focus::Results
                                     && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X')))
                                     || (ctrl
                                         && matches!(
@@ -10182,13 +10539,16 @@ async fn event_loop(
                                     continue;
                                 }
                                 // Lowercase `t` / `+` only — Shift+T is CycleTheme (#85).
+                                // Results uses `t` to begin a transaction (#28); `+` still opens a tab.
+                                let new_tab_key = match key.code {
+                                    KeyCode::Char('+') => true,
+                                    KeyCode::Char('t') if app.ui.focus != Focus::Results => true,
+                                    _ => false,
+                                };
                                 if !ctrl
                                     && !alt
                                     && !key.modifiers.contains(KeyModifiers::SHIFT)
-                                    && matches!(
-                                        key.code,
-                                        KeyCode::Char('t') | KeyCode::Char('+')
-                                    )
+                                    && new_tab_key
                                 {
                                     app.db.new_query_tab();
                                     app.ui.db_cursor = Cursor::default();
@@ -10681,6 +11041,17 @@ fn nvim_visual_mode(mode: &str) -> bool {
 
 fn nvim_normal_mode(mode: &str) -> bool {
     mode.is_empty() || mode == "n" || (mode.starts_with('n') && !mode.starts_with("ni"))
+}
+
+/// Alt-Enter / Shift-F5: run the statement under the cursor, not the whole buffer (#20).
+fn is_run_at_cursor_key(key: KeyEvent) -> bool {
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('\n') if alt => true,
+        KeyCode::F(5) if shift => true,
+        _ => false,
+    }
 }
 
 /// Studio run chords. Plain terminals often emit Ctrl-J (LF) for Ctrl-Enter;
