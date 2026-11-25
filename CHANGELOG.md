@@ -17,6 +17,11 @@
 
 ### Fixed
 
+- SQL completions: stop rewriting the footer status on every keystroke; popup is sufficient (#32).
+- Schema diff: document scope as table + column name/type/null only; note indexes/FKs/constraints not compared (#124).
+- MSSQL dump: prefer `mssql-scripter` over broken `sqlcmd SELECT *` grid path that produced non-restorable output (#109).
+- MSSQL fallback dump: include full type specs (varchar length, decimal precision/scale), N-prefix string literals, GO batch separators (#113).
+- dbt/seed/golden: `seed_fixtures` concatenates all `testdata/*.sql` in sorted order instead of silently keeping only the last file; `golden_diff` picks the newest CSV in `testdata/golden/` instead of hardcoding `latest.csv`; persona help notes dbt commands are recipes, schema diff is table+col only (#144).
 - Data compare: deterministic ORDER BY (PK or col 1); don't collapse duplicate rows without PK; fix ClickHouse db.table resolution (#137).
 - `generate_schema_diff_ddl`: strip `?` nullable markers from DDL types; patch left (target) side for `+` objects; dialect-valid DROP (no CASCADE on SQLite/MSSQL); nullability drift emits SET/DROP NOT NULL (#134).
 - Structure pane: separate `structure_selected` from `structure_scroll`; ↑↓ moves selection with highlight; Enter acts on selected row (#29).

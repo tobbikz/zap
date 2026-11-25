@@ -5362,9 +5362,9 @@ impl App {
                 "no SQL completions"
             };
             self.set_status(hint, false);
-        } else {
-            self.set_status(format!("{n} completions · Tab accept · Ctrl-n/p"), false);
         }
+        // When completions ARE found the popup is sufficient; do not spam the
+        // footer status on every keystroke (#32).
     }
 
     async fn request_completion(&mut self) {
@@ -8338,12 +8338,21 @@ impl App {
             "seed_fixtures" => {
                 let dir = self.workspace.root.join("testdata");
                 let mut n = 0usize;
-                if let Ok(rd) = std::fs::read_dir(&dir) {
-                    for e in rd.flatten() {
+                let mut combined = String::new();
+                if let Ok(entries) = std::fs::read_dir(&dir).map(|rd| {
+                    let mut v: Vec<_> = rd.flatten().collect();
+                    v.sort_by_key(|e| e.file_name());
+                    v
+                }) {
+                    for e in entries {
                         let p = e.path();
                         if p.extension().and_then(|s| s.to_str()) == Some("sql") {
                             if let Ok(sql) = std::fs::read_to_string(&p) {
-                                self.db.sql = sql;
+                                if !combined.is_empty() {
+                                    combined.push('\n');
+                                }
+                                combined.push_str(&format!("-- fixture: {}\n", p.display()));
+                                combined.push_str(&sql);
                                 n += 1;
                             }
                         }
@@ -8355,19 +8364,43 @@ impl App {
                         true,
                     );
                 } else {
+                    self.db.sql = combined;
                     self.set_status(
-                        format!("loaded last of {n} fixture(s) from testdata/ — F5 to apply"),
+                        format!("loaded {n} fixture(s) from testdata/ — F5 to apply"),
                         false,
                     );
                 }
             }
             "golden_diff" => {
-                let golden = self
-                    .workspace
-                    .root
-                    .join("testdata")
-                    .join("golden")
-                    .join("latest.csv");
+                let golden_dir = self.workspace.root.join("testdata").join("golden");
+                let golden = if golden_dir.is_dir() {
+                    let mut candidates: Vec<_> = std::fs::read_dir(&golden_dir)
+                        .ok()
+                        .into_iter()
+                        .flat_map(|rd| rd.flatten())
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s == "csv")
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    candidates.sort_by_key(|e| {
+                        std::cmp::Reverse(
+                            e.metadata()
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                        )
+                    });
+                    candidates
+                        .first()
+                        .map(|e| e.path())
+                        .unwrap_or_else(|| golden_dir.join("latest.csv"))
+                } else {
+                    golden_dir.join("latest.csv")
+                };
                 match self.db.last_result.as_ref() {
                     Some(r) => match ide_db::golden_diff(r, &golden) {
                         Ok(msg) => {

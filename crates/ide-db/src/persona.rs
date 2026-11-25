@@ -897,9 +897,9 @@ pub fn studio_help_personas() -> &'static str {
     "\n\
      ══ Personas (100%) ══\n\
      Analyst   save/bookmark queries · Chart bar/line/pie · Export result pack\n\
-     Architect ER canvas PK/FK · schema diff · naming hints · schema ADR note\n\
-     DE        dbt detect/run · Airflow link · lineage · quality strip · CDC lag\n\
-     AE        dbt compile/test · schema.yml stubs · model docs\n\
+     Architect ER canvas PK/FK · schema diff (table+col only) · naming hints · schema ADR note\n\
+     DE        dbt detect/recipe · Airflow link · lineage · quality strip · CDC lag\n\
+     AE        dbt compile/test (recipe) · schema.yml stubs · model docs\n\
      BI        persona.toml Superset/Metabase URL · deep-link · CSV/Parquet path\n\
      DS        vector recipes · sample SQL · Agents Jupyter/python presets\n\
      MLOps     Agents mlflow/serve presets · batch score recipe · registry URL\n\
