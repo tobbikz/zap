@@ -14,6 +14,12 @@
 
 ### Fixed
 
+- Postgres EXPLAIN uses plan-only `EXPLAIN (FORMAT TEXT)` instead of `EXPLAIN ANALYZE` to avoid executing DML/DDL (#38).
+- Auto-paging and table-open SQL use `SELECT TOP` / `OFFSET FETCH` on MSSQL instead of illegal `LIMIT` (#37).
+- Copy connection URI to clipboard from Explorer palette command (#35).
+- Collapse-all (`c`) and collapse-others (`C`) actions in the database explorer tree (#34).
+- Query history and bookmarks filter by active `source_id`; cross-engine entries still visible when no source is active (#45).
+- ER sketch and FK introspection implemented for MSSQL (`sys.foreign_keys`) and DuckDB (`duckdb_constraints()`) (#117).
 - Panic hook restores terminal raw mode and alternate screen on crash; user shell stays usable (#75).
 - Windows truecolor: detect WT_SESSION / COLORTERM and enable full 24-bit palettes instead of forcing 16-color (#74).
 - Agents/Sessions Windows defaults: use `powershell`/`python`/`where.exe`/`mstsc` on Windows; `which()` checks PATHEXT (#65).

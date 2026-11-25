@@ -240,6 +240,10 @@ pub enum Action {
     CreateObjectToggleFlag,
     /// Left on type/flags: cycle type backward or toggle the same as Right for bools.
     CreateObjectNudgeBack,
+    /// Explorer: collapse all expanded tree nodes (#34).
+    CollapseAll,
+    /// Explorer: collapse all siblings except the selection's ancestors (#34).
+    CollapseOthers,
     /// Run only the statement under the cursor (or selection) (#20).
     RunQueryAtCursor,
     /// Results: sort focused column ascending/descending/off (#31).
@@ -559,6 +563,10 @@ impl Keymap {
                 (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
                 (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
                 (false, false, KeyCode::Char('o')) => Some(Action::OpenDbObjectPalette),
+                (false, false, KeyCode::Char('c')) => Some(Action::CollapseAll),
+                (false, true, KeyCode::Char('C')) | (false, false, KeyCode::Char('C')) => {
+                    Some(Action::CollapseOthers)
+                }
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
                 (false, true, KeyCode::Char('T')) | (false, false, KeyCode::Char('T')) => {

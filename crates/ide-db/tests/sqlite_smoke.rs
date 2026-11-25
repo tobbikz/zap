@@ -245,6 +245,7 @@ fn wave10_pin_history_backup_help() {
     ws.history.push(ide_db::QueryHistoryEntry {
         sql: "SELECT 42".into(),
         elapsed_ms: 3,
+        source_id: String::new(),
     });
     let items = ws.query_history_palette_items();
     assert_eq!(items.len(), 1);
