@@ -513,9 +513,11 @@ const SQL_KEYWORDS: &[&str] = &[
 async fn fetch_schema_list(pool: &LivePool, database: Option<&str>) -> Result<Vec<String>> {
     match pool {
         LivePool::Pg(p) => {
+            // Hide catalog + temp schemas (`pg_temp_*`, `pg_toast_temp_*`, …) — #283.
             let rows = sqlx::query(
                 "SELECT schema_name FROM information_schema.schemata \
-                 WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast') \
+                 WHERE schema_name NOT IN ('information_schema') \
+                   AND schema_name !~ '^pg_' \
                  ORDER BY 1",
             )
             .fetch_all(p)
@@ -523,6 +525,7 @@ async fn fetch_schema_list(pool: &LivePool, database: Option<&str>) -> Result<Ve
             Ok(rows
                 .into_iter()
                 .filter_map(|r| r.try_get::<String, _>("schema_name").ok())
+                .filter(|name| crate::is_user_pg_schema(name))
                 .collect())
         }
         LivePool::Mysql(p) => {

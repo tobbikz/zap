@@ -1528,12 +1528,22 @@ impl App {
                         self.ui.show_completions = false;
                         self.ui.completions.clear();
                     }
-                    // Click in Explorer: select row under mouse.
+                    // Click in Explorer: select row under mouse (#284 dwell for tables/views).
                     if focus == Focus::Database && me.row > body_top {
                         let row_in_pane = (me.row - body_top) as usize;
                         let idx = self.db.explorer_scroll + row_in_pane;
                         if idx < self.db.flat.len() {
                             self.db.selected = idx;
+                            let heavy = self
+                                .db
+                                .flat
+                                .get(idx)
+                                .is_some_and(|e| matches!(e.kind, DbNodeKind::Table | DbNodeKind::View));
+                            if heavy {
+                                self.db.schedule_structure_dwell();
+                            } else {
+                                let _ = self.db.refresh_structure_for_selection().await;
+                            }
                         }
                     }
                 }
@@ -2111,11 +2121,29 @@ impl App {
                     .unwrap_or_else(|| "source".into());
                 Some((name, msg))
             });
-        if let Err(e) = self.db.refresh_structure_for_selection().await {
+        // Heavy Structure/STATS: dwell 3s on table/view so fast Explorer nav stays fluid (#284).
+        let heavy = self
+            .db
+            .flat
+            .get(self.db.selected)
+            .is_some_and(|e| matches!(e.kind, DbNodeKind::Table | DbNodeKind::View));
+        if heavy {
+            self.db.schedule_structure_dwell();
+        } else if let Err(e) = self.db.refresh_structure_for_selection().await {
             self.set_status(format!("structure: {e:#}"), true);
         }
         if let Some((name, msg)) = connect_err {
             self.set_status(format!("{name} · connect error · {msg}"), true);
+        }
+    }
+
+    /// Fire deferred Structure load after Explorer dwell (#284).
+    async fn maybe_flush_structure_dwell(&mut self) {
+        if !self.db.structure_dwell_ready(Duration::from_secs(3)) {
+            return;
+        }
+        if let Err(e) = self.db.refresh_structure_for_selection().await {
+            self.set_status(format!("structure: {e:#}"), true);
         }
     }
 
@@ -9536,6 +9564,13 @@ async fn event_loop(
         tokio::select! {
             _ = tick.tick() => {
                 app.clear_expired_status();
+                // Explorer Structure dwell → load after 3s rest (#284).
+                if app.ui.product == ProductMode::Database
+                    && !app.db.query_running
+                    && !app.pending_db_query
+                {
+                    app.maybe_flush_structure_dwell().await;
+                }
                 // ~ every 45s: mark stale + re-ping up to 3 sources (Wave 7).
                 app.health_tick_counter = app.health_tick_counter.saturating_add(1);
                 if app.health_tick_counter >= 1360 {
