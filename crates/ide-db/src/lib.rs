@@ -83,7 +83,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -462,6 +462,15 @@ fn append_mysql_ssl_query(url: &mut String, ssl_mode: &str, ssl_ca: &str) {
         url.push_str("&ssl-ca=");
         url.push_str(&urlencoding_lite(ssl_ca.trim()));
     }
+}
+
+/// Postgres schemas shown in Explorer / completions (#283).
+/// Hides catalog + temp namespaces (`pg_catalog`, `pg_temp_*`, `pg_toast_temp_*`, …).
+pub fn is_user_pg_schema(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && !name.eq_ignore_ascii_case("information_schema")
+        && !name.starts_with("pg_")
 }
 
 fn pg_quote_ident(name: &str) -> String {
@@ -1558,6 +1567,11 @@ pub struct DbWorkspace {
     pub structure_scroll: usize,
     /// Logical selected row in structure — independent of scroll (#29).
     pub structure_selected: usize,
+    /// Explorer dwell: wait before heavy Structure/STATS introspect (#284).
+    pub structure_dwell_selected: Option<usize>,
+    pub structure_dwell_since: Option<Instant>,
+    /// Structure pane shows spinner while dwelling / loading (#284).
+    pub structure_loading: bool,
     /// Console transaction open on `txn_pool_key` (held connection; not pool auto-commit).
     pub in_txn: bool,
     pools: HashMap<String, LivePool>,
@@ -1711,6 +1725,9 @@ impl Default for DbWorkspace {
             structure_title: String::new(),
             structure_scroll: 0,
             structure_selected: 0,
+            structure_dwell_selected: None,
+            structure_dwell_since: None,
+            structure_loading: false,
             in_txn: false,
             txn_pool_key: None,
             txn_conn: None,
@@ -3437,13 +3454,47 @@ impl DbWorkspace {
         Ok(())
     }
 
+    /// Schedule Structure/STATS load after Explorer dwell (#284).
+    pub fn schedule_structure_dwell(&mut self) {
+        let label = self
+            .flat
+            .get(self.selected)
+            .map(|e| e.label.clone())
+            .unwrap_or_default();
+        self.structure_dwell_selected = Some(self.selected);
+        self.structure_dwell_since = Some(Instant::now());
+        self.structure_loading = true;
+        self.structure_title = label;
+        self.structure_scroll = 0;
+        self.structure_selected = 0;
+        self.structure_lines = vec![
+            StructureLine::section("STATS"),
+            StructureLine::item("loading…"),
+        ];
+    }
+
+    pub fn clear_structure_dwell(&mut self) {
+        self.structure_dwell_selected = None;
+        self.structure_dwell_since = None;
+    }
+
+    /// True when Explorer selection rested long enough for Structure load (#284).
+    pub fn structure_dwell_ready(&self, wait: Duration) -> bool {
+        match (self.structure_dwell_selected, self.structure_dwell_since) {
+            (Some(sel), Some(since)) => sel == self.selected && since.elapsed() >= wait,
+            _ => false,
+        }
+    }
+
     pub async fn refresh_structure_for_selection(&mut self) -> Result<()> {
+        self.clear_structure_dwell();
         let Some(entry) = self.flat.get(self.selected).cloned() else {
             self.structure.clear();
             self.structure_lines.clear();
             self.structure_title.clear();
             self.structure_scroll = 0;
             self.structure_selected = 0;
+            self.structure_loading = false;
             return Ok(());
         };
         match entry.kind {
@@ -3451,26 +3502,36 @@ impl DbWorkspace {
                 let schema = entry.schema.as_deref().unwrap_or("");
                 let table = entry.table.as_deref().unwrap_or("");
                 if schema.is_empty() || table.is_empty() {
+                    self.structure_loading = false;
                     return Ok(());
                 }
                 let db = entry.database.as_deref();
+                self.structure_loading = true;
                 self.ensure_connected(&entry.source_id, db).await?;
-                self.load_structure_for(&entry.source_id, db, schema, table)
-                    .await?;
+                let res = self
+                    .load_structure_for(&entry.source_id, db, schema, table)
+                    .await;
+                self.structure_loading = false;
+                res?;
             }
             DbNodeKind::Source => {
+                self.structure_loading = false;
                 self.fill_structure_source_properties(&entry.source_id);
             }
             DbNodeKind::Database => {
+                self.structure_loading = false;
                 self.fill_structure_database_properties(&entry);
             }
             DbNodeKind::Schema => {
+                self.structure_loading = false;
                 self.fill_structure_schema_properties(&entry);
             }
             DbNodeKind::Column => {
+                self.structure_loading = false;
                 // Keep current structure when walking columns (legacy trees).
             }
             _ => {
+                self.structure_loading = false;
                 // Keep last structure when navigating parents so the pane stays useful.
             }
         }
@@ -3750,9 +3811,19 @@ impl DbWorkspace {
         schema: &str,
         table: &str,
     ) -> Result<()> {
-        let cols = self
+        // Immediate loads (Enter / properties) cancel any Explorer dwell (#284).
+        self.clear_structure_dwell();
+        self.structure_loading = true;
+        let cols = match self
             .introspect_column_info(source_id, database, schema, table)
-            .await?;
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.structure_loading = false;
+                return Err(e);
+            }
+        };
         let indexes = self
             .introspect_indexes(source_id, database, schema, table)
             .await
@@ -3896,6 +3967,7 @@ impl DbWorkspace {
             }
         }
         self.structure_lines = lines;
+        self.structure_loading = false;
         Ok(())
     }
 
@@ -5495,19 +5567,24 @@ impl DbWorkspace {
         let db_owned = database.map(|s| s.to_string());
         match pool {
             LivePool::Pg(p) => {
+                // Hide catalog + temp schemas (`pg_temp_*`, `pg_toast_temp_*`, …) — #283.
                 let rows = sqlx::query(
                     "SELECT schema_name FROM information_schema.schemata \
-                     WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast') \
+                     WHERE schema_name NOT IN ('information_schema') \
+                       AND schema_name !~ '^pg_' \
                      ORDER BY 1",
                 )
                 .fetch_all(p)
                 .await?;
                 Ok(rows
                     .into_iter()
-                    .map(|r| {
+                    .filter_map(|r| {
                         let name: String = r.get("schema_name");
+                        if !is_user_pg_schema(&name) {
+                            return None;
+                        }
                         let id_db = db_owned.clone().unwrap_or_default();
-                        DbTreeNode {
+                        Some(DbTreeNode {
                             id: format!("{source_id}::schema::{id_db}::{name}"),
                             label: name.clone(),
                             kind: DbNodeKind::Schema,
@@ -5518,7 +5595,7 @@ impl DbWorkspace {
                             query_sql: None,
                             children: Vec::new(),
                             expanded: false,
-                        }
+                        })
                     })
                     .collect())
             }
@@ -13229,6 +13306,36 @@ fn strip_sql_comments(sql: &str) -> String {
 }
 
 #[cfg(test)]
+mod explorer_schema_filter_tests {
+    use super::*;
+
+    #[test]
+    fn is_user_pg_schema_hides_catalog_and_temp() {
+        assert!(is_user_pg_schema("public"));
+        assert!(is_user_pg_schema("app"));
+        assert!(!is_user_pg_schema("information_schema"));
+        assert!(!is_user_pg_schema("pg_catalog"));
+        assert!(!is_user_pg_schema("pg_toast"));
+        assert!(!is_user_pg_schema("pg_temp_20"));
+        assert!(!is_user_pg_schema("pg_toast_temp_20"));
+        assert!(!is_user_pg_schema(""));
+    }
+
+    #[test]
+    fn structure_dwell_ready_after_wait() {
+        let mut ws = DbWorkspace::default();
+        ws.selected = 3;
+        ws.schedule_structure_dwell();
+        assert!(ws.structure_loading);
+        assert!(!ws.structure_dwell_ready(Duration::from_secs(3)));
+        ws.structure_dwell_since = Some(Instant::now() - Duration::from_secs(4));
+        assert!(ws.structure_dwell_ready(Duration::from_secs(3)));
+        ws.selected = 4;
+        assert!(!ws.structure_dwell_ready(Duration::from_secs(3)));
+    }
+}
+
+#[cfg(test)]
 mod dba_engines_tests {
     use super::*;
 
@@ -13934,3 +14041,4 @@ mod mssql_alter_ddl_tests {
         assert!(sql.contains("ADD COLUMN"), "{sql}");
     }
 }
+

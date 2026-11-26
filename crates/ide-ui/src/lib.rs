@@ -1289,7 +1289,13 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
     let _ = border;
 }
 
-fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focused: bool) {
+fn render_db_structure(
+    frame: &mut Frame,
+    area: Rect,
+    db: Option<&DbWorkspace>,
+    focused: bool,
+    anim: &Anim,
+) {
     let border = theme::border(focused);
     // Gray properties strip (requested franja) — keyed off Explorer selection.
     let strip = db.and_then(|w| w.selection_properties_strip());
@@ -1305,6 +1311,40 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
     let area = list_area;
     let inner_h = area.height.saturating_sub(2) as usize;
     let (title, items) = match db {
+        Some(ws) if ws.structure_loading => {
+            let title_budget = area.width.saturating_sub(14).max(6) as usize;
+            let fitted = fit_dot_title(&ws.structure_title, title_budget);
+            let title = if focused {
+                if fitted.is_empty() {
+                    " Structure ".into()
+                } else {
+                    format!(" Structure · {fitted} ")
+                }
+            } else if fitted.is_empty() {
+                " structure ".into()
+            } else {
+                format!(" structure · {fitted} ")
+            };
+            let inner_w = area.width.saturating_sub(2) as usize;
+            let spin = anim.braille();
+            let sec = icons::structure_section("STATS");
+            let head = if sec.is_empty() {
+                "STATS".to_string()
+            } else {
+                format!("{sec} STATS")
+            };
+            let items = vec![
+                ListItem::new(Line::from(Span::styled(
+                    truncate_chars(&head, inner_w),
+                    theme::style_text().add_modifier(Modifier::BOLD),
+                ))),
+                ListItem::new(Line::from(Span::styled(
+                    truncate_chars(&format!("  {spin} loading…"), inner_w),
+                    theme::style_muted(),
+                ))),
+            ];
+            (title, items)
+        }
         Some(ws) if !ws.structure_lines.is_empty() => {
             let title_budget = area.width.saturating_sub(14).max(6) as usize;
             let fitted = fit_dot_title(&ws.structure_title, title_budget);
@@ -4238,7 +4278,13 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
             .constraints([Constraint::Length(explor_w), Constraint::Min(10)])
             .split(top[0]);
         render_db_tree(frame, left[0], ctx.db, ctx.ui.focus == Focus::Database);
-        render_db_structure(frame, left[1], ctx.db, ctx.ui.focus == Focus::Structure);
+        render_db_structure(
+            frame,
+            left[1],
+            ctx.db,
+            ctx.ui.focus == Focus::Structure,
+            &ctx.anim,
+        );
         render_sql_editor(frame, top[1], ctx);
         render_bottom(frame, body[1], ctx);
         render_studio_footer(frame, root[2], ctx);
@@ -4251,7 +4297,7 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
                 render_db_tree(frame, root[1], ctx.db, true);
             }
             Focus::Structure => {
-                render_db_structure(frame, root[1], ctx.db, true);
+                render_db_structure(frame, root[1], ctx.db, true, &ctx.anim);
             }
             Focus::Editor => {
                 render_sql_editor(frame, root[1], ctx);
@@ -4290,7 +4336,13 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
             ])
             .split(top[0]);
         render_db_tree(frame, left[0], ctx.db, ctx.ui.focus == Focus::Database);
-        render_db_structure(frame, left[1], ctx.db, ctx.ui.focus == Focus::Structure);
+        render_db_structure(
+            frame,
+            left[1],
+            ctx.db,
+            ctx.ui.focus == Focus::Structure,
+            &ctx.anim,
+        );
         render_sql_editor(frame, top[1], ctx);
         render_results_grid(frame, body[1], ctx);
     }
