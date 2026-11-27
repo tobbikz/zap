@@ -11491,6 +11491,18 @@ fn postgres_health_folder(source_id: &str) -> DbTreeNode {
             admin_query_node(source_id, "health-locks", "Locks", PG_HEALTH_LOCKS),
             admin_query_node(source_id, "health-bloat", "Bloat", PG_HEALTH_BLOAT),
             admin_query_node(source_id, "health-indexes", "Index health", PG_HEALTH_INDEXES),
+            admin_query_node(
+                source_id,
+                "health-databases",
+                "Databases",
+                "SELECT d.datname, pg_catalog.pg_get_userbyid(d.datdba) AS owner,\n\
+                 \tpg_catalog.pg_encoding_to_char(d.encoding) AS encoding,\n\
+                 \tpg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) AS size,\n\
+                 \td.datcollate, d.datctype\n\
+                 FROM pg_catalog.pg_database d\n\
+                 WHERE d.datistemplate = false\n\
+                 ORDER BY 1;",
+            ),
         ],
     )
 }
@@ -11708,6 +11720,13 @@ fn mssql_health_folder(source_id: &str) -> DbTreeNode {
                 "Index fragmentation",
                 MSSQL_HEALTH_INDEXES,
             ),
+            admin_query_node(
+                source_id,
+                "health-databases",
+                "Databases",
+                "SELECT name, state_desc, recovery_model_desc, compatibility_level\n\
+                 FROM sys.databases ORDER BY name;",
+            ),
         ],
     )
 }
@@ -11770,15 +11789,15 @@ pub const PG_HEALTH_OVERVIEW: &str = "\
 SELECT metric, value FROM (
   SELECT 1 AS ord, 'databases' AS metric, count(*)::text AS value FROM pg_database WHERE NOT datistemplate
   UNION ALL
-  SELECT 2, 'backends', count(*)::text FROM pg_stat_activity
+  SELECT 2, 'max_connections', current_setting('max_connections')
   UNION ALL
-  SELECT 3, 'active', count(*)::text FROM pg_stat_activity WHERE state = 'active'
+  SELECT 3, 'backends', count(*)::text FROM pg_stat_activity
   UNION ALL
-  SELECT 4, 'idle_in_xact', count(*)::text FROM pg_stat_activity WHERE state = 'idle in transaction'
+  SELECT 4, 'active', count(*)::text FROM pg_stat_activity WHERE state = 'active'
   UNION ALL
   SELECT 5, 'waiting', count(*)::text FROM pg_stat_activity WHERE wait_event_type IS NOT NULL AND state <> 'idle'
   UNION ALL
-  SELECT 6, 'max_connections', current_setting('max_connections')
+  SELECT 6, 'idle_in_xact', count(*)::text FROM pg_stat_activity WHERE state = 'idle in transaction'
 ) x ORDER BY ord;";
 
 pub const PG_HEALTH_ACTIVITY: &str = "\
@@ -12122,51 +12141,9 @@ fn admin_folder_for(
 ) -> DbTreeNode {
     let mut children = match driver {
         DbDriver::Postgres => {
-            // Sessions live under Health → Activity (#290) — no legacy duplicate.
-            // Locks live under Health (#admin-ux). Roles cascade under Admin.
+            // Health (incl. Databases) · Roles · Maintenance — Settings leaf at end.
             let mut v = vec![
                 postgres_roles_folder(source_id),
-                admin_query_node(
-                    source_id,
-                    "databases",
-                    "Databases",
-                    "SELECT d.datname, pg_catalog.pg_get_userbyid(d.datdba) AS owner,\n\
-                     \tpg_catalog.pg_encoding_to_char(d.encoding) AS encoding,\n\
-                     \tpg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) AS size,\n\
-                     \td.datcollate, d.datctype\n\
-                     FROM pg_catalog.pg_database d\n\
-                     WHERE d.datistemplate = false\n\
-                     ORDER BY 1;",
-                ),
-                admin_query_node(
-                    source_id,
-                    "settings",
-                    "Settings",
-                    "SELECT name, setting, unit, short_desc\n\
-                     FROM pg_settings\n\
-                     WHERE name IN (\n\
-                     \t'max_connections','shared_buffers','work_mem','maintenance_work_mem',\n\
-                     \t'effective_cache_size','checkpoint_completion_target','wal_buffers',\n\
-                     \t'default_statistics_target','random_page_cost','effective_io_concurrency',\n\
-                     \t'max_worker_processes','max_parallel_workers','listen_addresses','port',\n\
-                     \t'timezone','log_min_duration_statement'\n\
-                     )\n\
-                     ORDER BY name;",
-                ),
-                admin_query_node(
-                    source_id,
-                    "prepared",
-                    "Prepared xacts",
-                    "SELECT gid, prepared, owner, database\n\
-                     FROM pg_prepared_xacts\n\
-                     ORDER BY prepared;",
-                ),
-                admin_query_node(
-                    source_id,
-                    "backup-history",
-                    "Backup history (archiver)",
-                    PG_BACKUP_HISTORY,
-                ),
                 maintenance_folder(
                     source_id,
                     "Vacuum (analyze) table…",
@@ -12256,14 +12233,7 @@ fn admin_folder_for(
                     "REBUILD indexes…",
                 ),
                 mssql_roles_folder(source_id),
-                // Sessions live under Health → Activity (#290).
-                admin_query_node(
-                    source_id,
-                    "databases",
-                    "Databases",
-                    "SELECT name, state_desc, recovery_model_desc, compatibility_level
-                     FROM sys.databases ORDER BY name;",
-                ),
+                // Sessions + Databases live under Health. No Backup history leaf.
                 admin_query_node(
                     source_id,
                     "tables",
@@ -12271,12 +12241,6 @@ fn admin_folder_for(
                     "SELECT TOP 50 s.name AS [schema], t.name AS [table], t.create_date
                      FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
                      ORDER BY t.create_date DESC;",
-                ),
-                admin_query_node(
-                    source_id,
-                    "backup-history",
-                    "Backup history",
-                    MSSQL_BACKUP_HISTORY,
                 ),
             ];
             v.insert(0, mssql_health_folder(source_id));
@@ -12396,23 +12360,27 @@ fn admin_folder_for(
         ],
         false,
     ));
-    // Begin/Commit/Rollback live on Console chrome (toolbar + t/x/X), not Admin (#294).
-    children.push(admin_group_folder(
-        source_id,
-        "results-tools",
-        "Results & queries",
-        vec![
-            admin_action_node(source_id, "chart-results", "Chart results…"),
-            admin_action_node(source_id, "save-result-temp", "Save result as temp table…"),
-            admin_action_node(source_id, "save-result-view", "Save result as view…"),
-            admin_action_node(source_id, "save-query", "Save current SQL…"),
-            admin_action_node(source_id, "sync-push", "Sync queries push"),
-            admin_action_node(source_id, "sync-pull", "Sync queries pull"),
-        ],
-        false,
-    ));
+    // Chart / save-result / sync live on Console / Results actions — not Admin.
     children.push(saved_queries_folder(source_id, queries_dir));
     children.push(history_folder(source_id, history, bookmarks));
+    // Settings last, ungrouped leaf.
+    if matches!(driver, DbDriver::Postgres) {
+        children.push(admin_query_node(
+            source_id,
+            "settings",
+            "Settings",
+            "SELECT name, setting, unit, short_desc\n\
+             FROM pg_settings\n\
+             WHERE name IN (\n\
+             \t'max_connections','shared_buffers','work_mem','maintenance_work_mem',\n\
+             \t'effective_cache_size','checkpoint_completion_target','wal_buffers',\n\
+             \t'default_statistics_target','random_page_cost','effective_io_concurrency',\n\
+             \t'max_worker_processes','max_parallel_workers','listen_addresses','port',\n\
+             \t'timezone','log_min_duration_statement'\n\
+             )\n\
+             ORDER BY name;",
+        ));
+    }
     DbTreeNode {
         id: format!("{source_id}::admin"),
         label: "Admin".into(),
