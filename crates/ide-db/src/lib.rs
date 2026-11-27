@@ -1764,6 +1764,8 @@ pub struct DbWorkspace {
     pub recent_tables: Vec<String>,
     /// Last Explorer Table selection (Vacuum/Reindex when AdminAction is focused) (#138).
     pub last_table_sel: Option<(String, Option<String>, String, String)>,
+    /// Explicit target from Maintenance picker modal (source, db, schema, table).
+    pub picker_maint_target: Option<(String, Option<String>, String, String)>,
     /// Optional Results row filter (substring, case-insensitive).
     pub results_filter: String,
     /// When true, Studio re-runs Health · Activity periodically (~5s).
@@ -1912,6 +1914,7 @@ impl Default for DbWorkspace {
             duck_interrupt: None,
             recent_tables: Vec::new(),
             last_table_sel: None,
+            picker_maint_target: None,
             results_filter: String::new(),
             health_activity_auto_refresh: false,
             pending_row_deletes: Vec::new(),
@@ -8493,28 +8496,30 @@ impl DbWorkspace {
         }
     }
 
-    /// Strict table pick for Vacuum/Reindex — current Explorer Table only (#292 / #138).
-    /// No silent `last_table_sel` fallback; the UI opens a target picker first.
+    /// Table for Vacuum/Reindex — picker target wins, else current Explorer Table (#292).
     pub fn selected_maintenance_table(
         &self,
     ) -> Result<(String, Option<String>, String, String, DbDriver)> {
-        let e = self
-            .flat
-            .get(self.selected)
-            .context("pick a table target first")?;
-        if !matches!(e.kind, DbNodeKind::Table) {
-            bail!("pick a table target (views / Admin rows are blocked)");
-        }
-        let schema = e
-            .schema
-            .clone()
-            .context("select a table with a schema")?;
-        let table = e.table.clone().context("missing table")?;
+        let (source_id, database, schema, table) = if let Some(t) = &self.picker_maint_target {
+            t.clone()
+        } else {
+            let e = self
+                .flat
+                .get(self.selected)
+                .context("pick a table target first")?;
+            if !matches!(e.kind, DbNodeKind::Table) {
+                bail!("pick a table target (views / Admin rows are blocked)");
+            }
+            let schema = e
+                .schema
+                .clone()
+                .context("select a table with a schema")?;
+            let table = e.table.clone().context("missing table")?;
+            (e.source_id.clone(), e.database.clone(), schema, table)
+        };
         if table == "er_sketch" || table == "er_canvas" || table == "wide_cell" {
             bail!("synthetic result tables cannot be vacuumed");
         }
-        let source_id = e.source_id.clone();
-        let database = e.database.clone();
         let driver = self
             .source_cfg(&source_id)
             .map(|s| s.driver)
@@ -8563,6 +8568,7 @@ impl DbWorkspace {
         if !suggest_only {
             self.execute_sql_text(&sql).await?;
         }
+        self.picker_maint_target = None;
         let elapsed_ms = start.elapsed().as_millis();
         self.status = if suggest_only {
             format!("{label} · {schema}.{table} · {driver:?} (not executed)")
@@ -11408,9 +11414,20 @@ fn health_folder(
     source_id: &str,
     children: Vec<DbTreeNode>,
 ) -> DbTreeNode {
+    admin_group_folder(source_id, "health", "Health", children, true)
+}
+
+/// Collapsible Admin subgroup (Health / Connection / Dump / Maintenance).
+fn admin_group_folder(
+    source_id: &str,
+    slug: &str,
+    label: &str,
+    children: Vec<DbTreeNode>,
+    expanded: bool,
+) -> DbTreeNode {
     DbTreeNode {
-        id: format!("{source_id}::admin::health"),
-        label: "Health".into(),
+        id: format!("{source_id}::admin::{slug}"),
+        label: label.into(),
         kind: DbNodeKind::Admin,
         source_id: source_id.into(),
         database: None,
@@ -11418,8 +11435,49 @@ fn health_folder(
         table: None,
         query_sql: None,
         children,
-        expanded: true,
+        expanded,
     }
+}
+
+fn maintenance_folder(source_id: &str, vacuum: &str, analyze: &str, reindex: &str) -> DbTreeNode {
+    admin_group_folder(
+        source_id,
+        "maintenance",
+        "Maintenance",
+        vec![
+            admin_action_node(source_id, "vacuum-analyze", vacuum),
+            admin_action_node(source_id, "analyze-table", analyze),
+            admin_action_node(source_id, "reindex-table", reindex),
+        ],
+        true,
+    )
+}
+
+fn connection_folder(source_id: &str) -> DbTreeNode {
+    admin_group_folder(
+        source_id,
+        "connection",
+        "Connection",
+        vec![
+            admin_action_node(source_id, "edit-connection", "Edit connection…"),
+            admin_action_node(source_id, "duplicate-connection", "Duplicate connection…"),
+            admin_action_node(source_id, "delete-connection", "Delete connection…"),
+        ],
+        true,
+    )
+}
+
+fn dump_restore_folder(source_id: &str) -> DbTreeNode {
+    admin_group_folder(
+        source_id,
+        "dump-restore",
+        "Dump & restore",
+        vec![
+            admin_action_node(source_id, "dump", "Dump database"),
+            admin_action_node(source_id, "restore", "Restore dump…"),
+        ],
+        true,
+    )
 }
 
 fn postgres_health_folder(source_id: &str) -> DbTreeNode {
@@ -12109,18 +12167,24 @@ fn admin_folder_for(
                     "Backup history (archiver)",
                     PG_BACKUP_HISTORY,
                 ),
-                admin_action_node(source_id, "vacuum-analyze", "Vacuum (analyze) table…"),
-                admin_action_node(source_id, "analyze-table", "Analyze table…"),
-                admin_action_node(source_id, "reindex-table", "Reindex table…"),
+                maintenance_folder(
+                    source_id,
+                    "Vacuum (analyze) table…",
+                    "Analyze table…",
+                    "Reindex table…",
+                ),
             ];
             v.insert(0, postgres_health_folder(source_id));
             v
         }
         DbDriver::Mysql => {
             let mut v = vec![
-                admin_action_node(source_id, "vacuum-analyze", "OPTIMIZE TABLE…"),
-                admin_action_node(source_id, "analyze-table", "ANALYZE TABLE…"),
-                admin_action_node(source_id, "reindex-table", "OPTIMIZE (reindex)…"),
+                maintenance_folder(
+                    source_id,
+                    "OPTIMIZE TABLE…",
+                    "ANALYZE TABLE…",
+                    "OPTIMIZE (reindex)…",
+                ),
                 mysql_roles_folder(source_id),
                 // Processlist lives under Health → Activity (#290).
                 admin_query_node(
@@ -12152,9 +12216,12 @@ fn admin_folder_for(
             v
         }
         DbDriver::Sqlite => vec![
-            admin_action_node(source_id, "vacuum-analyze", "VACUUM…"),
-            admin_action_node(source_id, "analyze-table", "ANALYZE table…"),
-            admin_action_node(source_id, "reindex-table", "REINDEX table…"),
+            maintenance_folder(
+                source_id,
+                "VACUUM…",
+                "ANALYZE table…",
+                "REINDEX table…",
+            ),
             admin_query_node(
                 source_id,
                 "database_list",
@@ -12182,9 +12249,12 @@ fn admin_folder_for(
         ],
         DbDriver::Mssql => {
             let mut v = vec![
-                admin_action_node(source_id, "vacuum-analyze", "UPDATE STATS + REBUILD…"),
-                admin_action_node(source_id, "analyze-table", "UPDATE STATISTICS…"),
-                admin_action_node(source_id, "reindex-table", "REBUILD indexes…"),
+                maintenance_folder(
+                    source_id,
+                    "UPDATE STATS + REBUILD…",
+                    "UPDATE STATISTICS…",
+                    "REBUILD indexes…",
+                ),
                 mssql_roles_folder(source_id),
                 // Sessions live under Health → Activity (#290).
                 admin_query_node(
@@ -12214,9 +12284,12 @@ fn admin_folder_for(
         }
         DbDriver::Clickhouse => {
             let mut v = vec![
-                admin_action_node(source_id, "vacuum-analyze", "OPTIMIZE TABLE FINAL…"),
-                admin_action_node(source_id, "analyze-table", "FLUSH LOGS…"),
-                admin_action_node(source_id, "reindex-table", "OPTIMIZE FINAL…"),
+                maintenance_folder(
+                    source_id,
+                    "OPTIMIZE TABLE FINAL…",
+                    "FLUSH LOGS…",
+                    "OPTIMIZE FINAL…",
+                ),
                 admin_query_node(
                     source_id,
                     "databases",
@@ -12256,9 +12329,12 @@ fn admin_folder_for(
             v
         }
         DbDriver::Duckdb => vec![
-            admin_action_node(source_id, "vacuum-analyze", "CHECKPOINT…"),
-            admin_action_node(source_id, "analyze-table", "ANALYZE table…"),
-            admin_action_node(source_id, "reindex-table", "FORCE CHECKPOINT…"),
+            maintenance_folder(
+                source_id,
+                "CHECKPOINT…",
+                "ANALYZE table…",
+                "FORCE CHECKPOINT…",
+            ),
             admin_query_node(
                 source_id,
                 "tables",
@@ -12307,45 +12383,34 @@ fn admin_folder_for(
         )],
         DbDriver::Trino => Vec::new(),
     };
-    children.push(admin_action_node(
+    children.push(connection_folder(source_id));
+    children.push(dump_restore_folder(source_id));
+    children.push(admin_group_folder(
         source_id,
-        "edit-connection",
-        "Edit connection…",
+        "compare",
+        "Compare",
+        vec![
+            admin_action_node(source_id, "schema-diff", "Schema diff…"),
+            admin_action_node(source_id, "schema-diff-ddl", "Schema diff → DDL…"),
+            admin_action_node(source_id, "data-compare", "Data compare…"),
+        ],
+        false,
     ));
-    children.push(admin_action_node(
-        source_id,
-        "duplicate-connection",
-        "Duplicate connection…",
-    ));
-    children.push(admin_action_node(
-        source_id,
-        "delete-connection",
-        "Delete connection…",
-    ));
-    children.push(admin_action_node(source_id, "dump", "Dump database"));
-    children.push(admin_action_node(source_id, "restore", "Restore dump…"));
-    children.push(admin_action_node(source_id, "schema-diff", "Schema diff…"));
-    children.push(admin_action_node(
-        source_id,
-        "schema-diff-ddl",
-        "Schema diff → DDL…",
-    ));
-    children.push(admin_action_node(source_id, "data-compare", "Data compare…"));
     // Begin/Commit/Rollback live on Console chrome (toolbar + t/x/X), not Admin (#294).
-    children.push(admin_action_node(source_id, "chart-results", "Chart results…"));
-    children.push(admin_action_node(
+    children.push(admin_group_folder(
         source_id,
-        "save-result-temp",
-        "Save result as temp table…",
+        "results-tools",
+        "Results & queries",
+        vec![
+            admin_action_node(source_id, "chart-results", "Chart results…"),
+            admin_action_node(source_id, "save-result-temp", "Save result as temp table…"),
+            admin_action_node(source_id, "save-result-view", "Save result as view…"),
+            admin_action_node(source_id, "save-query", "Save current SQL…"),
+            admin_action_node(source_id, "sync-push", "Sync queries push"),
+            admin_action_node(source_id, "sync-pull", "Sync queries pull"),
+        ],
+        false,
     ));
-    children.push(admin_action_node(
-        source_id,
-        "save-result-view",
-        "Save result as view…",
-    ));
-    children.push(admin_action_node(source_id, "save-query", "Save current SQL…"));
-    children.push(admin_action_node(source_id, "sync-push", "Sync queries push"));
-    children.push(admin_action_node(source_id, "sync-pull", "Sync queries pull"));
     children.push(saved_queries_folder(source_id, queries_dir));
     children.push(history_folder(source_id, history, bookmarks));
     DbTreeNode {

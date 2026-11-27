@@ -1211,15 +1211,17 @@ impl App {
         self.ui.mode = Mode::ConfirmDeleteSource;
     }
 
-    /// Open table picker first, then confirm (#292) — never silent first-table default.
-    fn start_maintenance_flow(&mut self, op: PostgresMaintenance) {
+    /// Open table picker modal, then confirm (#292) — catalog fallback if Explorer empty.
+    async fn start_maintenance_flow(&mut self, op: PostgresMaintenance) {
         let key = match op {
             PostgresMaintenance::VacuumAnalyze => "vacuum_analyze",
             PostgresMaintenance::Analyze => "analyze",
             PostgresMaintenance::Reindex => "reindex",
         };
         self.ui.pending_maintenance = Some(key.into());
-        let items: Vec<(String, String, String)> = self
+        self.db.picker_maint_target = None;
+
+        let mut actions: Vec<(String, String)> = self
             .db
             .flat
             .iter()
@@ -1230,21 +1232,81 @@ impl App {
                     (Some(s), Some(t)) => format!("{s}.{t}"),
                     _ => e.label.clone(),
                 };
-                let sub = e
-                    .database
-                    .clone()
-                    .unwrap_or_else(|| e.source_id.clone());
-                (label, sub, i.to_string())
+                (label, format!("dbobj:{i}"))
             })
             .collect();
-        if items.is_empty() {
+
+        if actions.is_empty() {
+            self.set_status("loading tables for maintenance…", false);
+            match self.db.search_catalog("", 250).await {
+                Ok(hits) => {
+                    for h in hits {
+                        if h.kind != "table" {
+                            continue;
+                        }
+                        let schema = h.schema.clone().unwrap_or_else(|| "public".into());
+                        let label = format!("{schema}.{}", h.name);
+                        let id = format!(
+                            "maint:{}|{}|{}|{}",
+                            h.source_id,
+                            h.database.as_deref().unwrap_or(""),
+                            schema,
+                            h.name
+                        );
+                        actions.push((label, id));
+                    }
+                }
+                Err(e) => {
+                    self.ui.pending_maintenance = None;
+                    self.set_status(format!("maintenance catalog: {e:#}"), true);
+                    return;
+                }
+            }
+        }
+
+        if actions.is_empty() {
             self.ui.pending_maintenance = None;
-            self.set_status("expand a schema and pick tables first", true);
+            self.set_status("no tables found — connect and expand a database first", true);
             return;
         }
+
         self.ui.mode = Mode::Palette;
-        self.ui.palette = Palette::open_db_objects(items);
-        self.set_status("pick maintenance target · Enter confirm", false);
+        self.ui.palette = Palette::open_actions(actions);
+        self.set_status("maintenance · pick table · Enter confirm", false);
+    }
+
+    fn apply_maintenance_palette_pick(&mut self, item_id: &str) -> bool {
+        if let Some(idx_str) = item_id.strip_prefix("dbobj:") {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                if self.db.select_flat_index(idx) {
+                    if let Some(e) = self.db.flat.get(idx) {
+                        if let (Some(schema), Some(table)) = (&e.schema, &e.table) {
+                            self.db.picker_maint_target = Some((
+                                e.source_id.clone(),
+                                e.database.clone(),
+                                schema.clone(),
+                                table.clone(),
+                            ));
+                        }
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Some(rest) = item_id.strip_prefix("maint:") {
+            let mut parts = rest.splitn(4, '|');
+            let source_id = parts.next().unwrap_or("").to_string();
+            let database = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+            let schema = parts.next().unwrap_or("public").to_string();
+            let table = parts.next().unwrap_or("").to_string();
+            if source_id.is_empty() || table.is_empty() {
+                return false;
+            }
+            self.db.picker_maint_target = Some((source_id, database, schema, table));
+            return true;
+        }
+        false
     }
 
     fn start_maintenance_confirm(&mut self, op: PostgresMaintenance) {
@@ -2480,12 +2542,15 @@ impl App {
                     }
                     Some("vacuum-analyze") => {
                         self.start_maintenance_flow(PostgresMaintenance::VacuumAnalyze)
+                            .await
                     }
                     Some("analyze-table") => {
                         self.start_maintenance_flow(PostgresMaintenance::Analyze)
+                            .await
                     }
                     Some("reindex-table") => {
                         self.start_maintenance_flow(PostgresMaintenance::Reindex)
+                            .await
                     }
                     Some("dump") => self.start_dump_options(),
                     Some("restore") => self.start_restore_dump(),
@@ -8230,6 +8295,25 @@ impl App {
             // Enter keeps the previewed theme — persist happens in theme_* handlers.
             self.theme_before_preview = None;
         }
+        // Maintenance picker uses CodeActions palette with dbobj:/maint: ids (#292).
+        if self.ui.pending_maintenance.is_some()
+            && (item.id.starts_with("dbobj:") || item.id.starts_with("maint:"))
+        {
+            if self.apply_maintenance_palette_pick(&item.id) {
+                if let Some(key) = self.ui.pending_maintenance.take() {
+                    let op = match key.as_str() {
+                        "analyze" => PostgresMaintenance::Analyze,
+                        "reindex" => PostgresMaintenance::Reindex,
+                        _ => PostgresMaintenance::VacuumAnalyze,
+                    };
+                    self.start_maintenance_confirm(op);
+                }
+            } else {
+                self.ui.pending_maintenance = None;
+                self.set_status("maintenance: could not resolve table", true);
+            }
+            return Ok(());
+        }
         if mode == PaletteMode::CodeActions {
             if item.id.starts_with("cmd:") {
                 self.set_status(format!("command not wired: {}", item.id), true);
@@ -8304,6 +8388,7 @@ impl App {
             if mode == PaletteMode::DbObjects {
                 // Maintenance target picker → confirm (#292).
                 if let Some(key) = self.ui.pending_maintenance.take() {
+                    let _ = self.apply_maintenance_palette_pick(&item.id);
                     let op = match key.as_str() {
                         "analyze" => PostgresMaintenance::Analyze,
                         "reindex" => PostgresMaintenance::Reindex,
