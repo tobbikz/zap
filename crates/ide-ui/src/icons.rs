@@ -148,32 +148,32 @@ pub fn driver(driver: DbDriver) -> &'static str {
 }
 
 /// The glyph of a Structure section, from its heading (`COLUMNS (12)` → table_column).
+/// Safe/Ascii: no cryptic `%` / `▪` prefixes — plain section words only (#24).
 pub fn structure_section(text: &str) -> &'static str {
-    if theme::glyph_set() == GlyphSet::Ascii {
+    if theme::glyph_set() != GlyphSet::Nerd {
         return "";
     }
-    let safe = theme::glyph_set() == GlyphSet::Safe;
     let head = text.trim_start().to_ascii_uppercase();
     if head.starts_with("COLUMNS") {
-        if safe { "\u{25aa}" } else { COLUMN }
+        COLUMN
     } else if head.starts_with("INDEXES") {
-        if safe { "#" } else { "\u{f027b}" }
+        "\u{f027b}"
     } else if head.starts_with("FOREIGN KEYS") {
-        if safe { "~" } else { LINK }
+        LINK
     } else if head.starts_with("TRIGGERS") {
-        if safe { "!" } else { "\u{f140b}" }
+        "\u{f140b}"
     } else if head.starts_with("ROUTINES") {
-        if safe { "f" } else { ROUTINE }
+        ROUTINE
     } else if head.starts_with("GRANTS") {
-        if safe { "+" } else { "\u{f132}" }
+        "\u{f132}"
     } else if head.starts_with("STATS") {
-        if safe { "%" } else { "\u{f080}" }
+        "\u{f080}"
     } else if head.starts_with("ER") {
-        if safe { "+" } else { "\u{f0e8}" }
+        "\u{f0e8}"
     } else if head.starts_with("DDL") || head.starts_with("SCHEMA DIFF") {
-        if safe { "#" } else { "\u{f121}" }
+        "\u{f121}"
     } else if head.starts_with("ADMIN QUERY") {
-        if safe { ">" } else { QUERY }
+        QUERY
     } else {
         ""
     }

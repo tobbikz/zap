@@ -132,7 +132,14 @@ pub fn classify_font(face: &str) -> FontClass {
     if f.is_empty() {
         return FontClass::Unknown;
     }
-    if f.contains("nerd") || f.contains(" nf") || f.ends_with("nf") {
+    // Nerd Font / NF / "CaskaydiaCove Nerd Font" / "CascadiaMono NF" (#3).
+    if f.contains("nerd")
+        || f.contains(" nf")
+        || f.ends_with("nf")
+        || f.contains("nerd font")
+        || f.contains("symbols nerd")
+        || f.contains("caskaydia")
+    {
         return FontClass::Nerd;
     }
     const MODERN: &[&str] = &[
@@ -610,16 +617,63 @@ pub fn surface_2() -> Color {
     active().surface_2
 }
 pub fn surface_3() -> Color {
-    active().surface_3
+    degrade_rgb(active().surface_3)
 }
 pub fn modal() -> Color {
     active().modal
 }
+/// Opaque modal wash — dark but not pure black so Studio chrome can peek (#286).
 pub fn scrim() -> Color {
     if light() {
-        rgb(220, 220, 220)
+        rgb(200, 200, 205)
+    } else if truecolor() {
+        rgb(6, 8, 12)
     } else {
-        rgb(0, 0, 0)
+        Color::Black
+    }
+}
+/// Dither fg for frosted scrim (half-shade cells).
+pub fn scrim_dither() -> Color {
+    if light() {
+        rgb(160, 160, 168)
+    } else if truecolor() {
+        rgb(28, 32, 40)
+    } else {
+        Color::DarkGray
+    }
+}
+
+/// Soft list/explorer selection fill — never reverse-video white on chromatic themes (#21).
+pub fn selection_bg() -> Color {
+    if is_mono() {
+        text()
+    } else if truecolor() {
+        surface_3()
+    } else {
+        // Legacy 16-color hosts: DarkGray slab, not White invert.
+        Color::DarkGray
+    }
+}
+
+/// Soften RGB tokens when the host cannot do 24-bit (#21 / #74).
+fn degrade_rgb(c: Color) -> Color {
+    if truecolor() {
+        return c;
+    }
+    match c {
+        Color::Rgb(r, g, b) => {
+            let lum = (u16::from(r) + u16::from(g) + u16::from(b)) / 3;
+            if lum < 48 {
+                Color::Black
+            } else if lum < 120 {
+                Color::DarkGray
+            } else if lum < 200 {
+                Color::Gray
+            } else {
+                Color::White
+            }
+        }
+        other => other,
     }
 }
 pub fn border_idle() -> Color {
@@ -719,10 +773,10 @@ pub fn style_selected() -> Style {
     if is_mono() {
         style_mono_invert()
     } else {
-        // Soft row selection (Explorer / lists) — never a full reverse-video wash.
+        // Soft row selection (Explorer / lists) — never a full reverse-video wash (#21).
         Style::default()
             .fg(text())
-            .bg(surface_3())
+            .bg(selection_bg())
             .add_modifier(Modifier::BOLD)
     }
 }
@@ -732,7 +786,7 @@ pub fn style_grid_cursor_row() -> Style {
     if is_mono() {
         style_mono_invert()
     } else {
-        Style::default().bg(surface_3()).fg(text())
+        Style::default().bg(selection_bg()).fg(text())
     }
 }
 
@@ -770,7 +824,7 @@ pub fn style_tab_active() -> Style {
     } else {
         Style::default()
             .fg(text())
-            .bg(surface_3())
+            .bg(selection_bg())
             .add_modifier(Modifier::BOLD)
     }
 }
@@ -965,6 +1019,8 @@ mod tests {
         assert_eq!(classify_font("Cascadia Mono"), FontClass::Modern);
         assert_eq!(classify_font("JetBrainsMono Nerd Font"), FontClass::Nerd);
         assert_eq!(classify_font("FiraCode NF"), FontClass::Nerd);
+        assert_eq!(classify_font("CaskaydiaCove Nerd Font"), FontClass::Nerd);
+        assert_eq!(classify_font("CascadiaMono NF"), FontClass::Nerd);
     }
 
     #[test]
@@ -977,10 +1033,32 @@ mod tests {
 
     #[test]
     fn role_selection_is_soft_not_reverse_default() {
-        // Soft selection uses surface_3 + bold text (DataRig), not Hop reverse wash.
+        // Soft selection uses selection_bg + bold text (DataRig), not Hop reverse wash.
         set_mode_name("dark");
+        set_truecolor(true);
         let s = Role::Selection.style();
-        assert_eq!(s.bg, Some(surface_3()));
+        assert_eq!(s.bg, Some(selection_bg()));
+        assert_ne!(s.bg, Some(text()), "chromatic must not invert to white wash");
+    }
+
+    #[test]
+    fn selection_stays_soft_when_glyphs_are_safe() {
+        set_mode_name("zap");
+        set_truecolor(true);
+        set_glyph_set(GlyphSet::Safe);
+        let s = style_selected();
+        assert_eq!(s.bg, Some(selection_bg()));
+        assert_ne!(s.bg, Some(Color::White));
+        assert!(!s.add_modifier.contains(Modifier::REVERSED));
+        set_glyph_set(GlyphSet::Nerd);
+    }
+
+    #[test]
+    fn selection_bg_is_darkgray_without_truecolor() {
+        set_mode_name("zap");
+        set_truecolor(false);
+        assert_eq!(selection_bg(), Color::DarkGray);
+        set_truecolor(true);
     }
 
     #[test]

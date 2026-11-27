@@ -1192,7 +1192,8 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     // AMOLED: invert — grey slab on pure black reads as “dirty”, not mono.
                     (theme::bg(), theme::text())
                 } else if selected {
-                    (theme::text(), theme::surface_3())
+                    // Soft selection fill — never reverse-video white wash (#21).
+                    (theme::text(), theme::selection_bg())
                 } else {
                     (theme::text(), theme::bg())
                 };
@@ -1387,7 +1388,7 @@ fn render_db_structure(
                     };
                     // Highlight the selected row (#29).
                     if focused && idx == selected {
-                        style = style.bg(theme::surface_3());
+                        style = style.bg(theme::selection_bg());
                     }
                     let max = inner_w.saturating_sub(prefix.chars().count()).max(4);
                     let mut text = format!("{prefix}{}", truncate_chars(&line.text, max));
@@ -3879,6 +3880,17 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
                 "Ctrl+arrows resize pane · D density · Space discover",
                 theme::style_muted(),
             )),
+            Line::from(Span::styled(
+                format!(
+                    "icons: {} · [theme] icons = nerd|safe|ascii · ZAP_ICONS",
+                    match theme::glyph_set() {
+                        theme::GlyphSet::Nerd => "nerd",
+                        theme::GlyphSet::Safe => "safe",
+                        theme::GlyphSet::Ascii => "ascii",
+                    }
+                ),
+                theme::style_faint(),
+            )),
             Line::from(""),
             Line::from(Span::styled(
                 "? / Esc close",
@@ -6304,7 +6316,8 @@ fn console_toolbar_spans(
     )]
 }
 
-/// Drop whole ` · `-separated tokens from the right before mid-glyph ellipsis.
+/// Drop whole ` · `-separated tokens from the **left** before mid-glyph ellipsis.
+/// Structure titles are `db · schema.table` — keep `schema.table` when tight (#24).
 fn fit_dot_title(title: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -6316,13 +6329,13 @@ fn fit_dot_title(title: &str, max: usize) -> String {
     if parts.len() <= 1 {
         return truncate_chars(title, max);
     }
-    for keep in (1..parts.len()).rev() {
-        let candidate = parts[..keep].join(" · ");
+    for skip in 0..parts.len() {
+        let candidate = parts[skip..].join(" · ");
         if candidate.chars().count() <= max {
             return candidate;
         }
     }
-    truncate_chars(parts[0], max)
+    truncate_chars(parts[parts.len() - 1], max)
 }
 
 /// Source row label: prefer `Name (Driver) [role]`, then drop driver, then role,
@@ -6377,11 +6390,17 @@ mod explorer_label_tests {
     }
 
     #[test]
-    fn structure_title_drops_right_tokens() {
-        let s = fit_dot_title("query · rag · public.session_notes", 18);
-        assert_eq!(s, "query · rag");
-        assert!(!s.ends_with('·'));
-        assert!(!s.contains("session"));
+    fn structure_title_keeps_schema_table() {
+        // Drop connection/db from the left; keep schema.table (#24).
+        let s = fit_dot_title("datalake · public.session_notes", 22);
+        assert_eq!(s, "public.session_notes");
+        assert!(!s.contains("datalake"));
+    }
+
+    #[test]
+    fn structure_title_drops_left_when_tight() {
+        let s = fit_dot_title("query · rag · public.users", 12);
+        assert_eq!(s, "public.users");
     }
 
     #[test]
