@@ -95,11 +95,12 @@ fn default_query_timeout() -> u64 {
     120
 }
 fn default_explorer_width() -> u16 {
-    28
+    // Wider default so long schema/table names stay readable (#18).
+    36
 }
 fn default_studio_left_width() -> u16 {
-    // Explorer (≤28) + Structure (≥24) needs ~52+; prefer readable Structure empty state.
-    56
+    // Explorer (≤36) + Structure (≥24) needs ~60+; prefer readable Structure empty state.
+    60
 }
 fn default_results_pct() -> u16 {
     40

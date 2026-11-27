@@ -193,6 +193,8 @@ pub struct UiState {
     pub home_favorite_selected: usize,
     /// `?` keymap cheat overlay.
     pub show_help: bool,
+    /// One-shot Studio tip for Ctrl+arrows resize on narrow hosts (#19).
+    pub resize_tip_shown: bool,
     /// Transient chrome busy label (`connecting…` / `RUNNING…`).
     pub busy_label: Option<String>,
     /// Space discoverability overlay (DataRig-style: what can follow).
@@ -294,8 +296,8 @@ impl Default for UiState {
             confirm_delete_label: String::new(),
             save_materialize_temp: true,
             results_compact: true,
-            explorer_width: 28,
-            studio_left_width: 56,
+            explorer_width: 36,
+            studio_left_width: 60,
             results_pct: 40,
             results_pinned_cols: 1,
             oauth_paste_pending: false,
@@ -317,6 +319,7 @@ impl Default for UiState {
             home_recent_selected: 0,
             home_favorite_selected: 0,
             show_help: false,
+            resize_tip_shown: false,
             busy_label: None,
             show_discover: false,
             query_error: None,
@@ -1219,8 +1222,11 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 };
                 let inner_w = area.width.saturating_sub(2) as usize;
                 // Chromatic: solid accent rail cell. AMOLED: invert row (no grey wash).
+                // Source: filled ● when pool live, ○ when disconnected (#12).
                 let glyph_part = if matches!(e.kind, DbNodeKind::Source) {
-                    format!("● {glyph} ")
+                    let live = ws.is_source_connected(&e.source_id);
+                    let mark = if live { "●" } else { "○" };
+                    format!("{mark} {glyph} ")
                 } else {
                     format!("{glyph} ")
                 };
@@ -1590,10 +1596,12 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             n => n.to_string(),
         };
         let insert = ctx.ui.mode == Mode::Insert;
+        let in_txn = ctx.db.map(|d| d.in_txn).unwrap_or(false);
         let spans = console_toolbar_spans(
             running,
             focused,
             insert,
+            in_txn,
             &db_label,
             &schema_label,
             &table_label,
@@ -3690,6 +3698,7 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("Esc", "cancel running query (not kill)"),
             ("K", "kill session at cursor (confirm)"),
             ("P", "pin leading columns"),
+            ("Ctrl+↑↓", "resize results height"),
             ("t / +", "new SQL tab"),
             ("[ ]", "prev / next page (tab if !Results)"),
             ("Shift-T", "cycle theme"),
@@ -3700,18 +3709,24 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("F5", "run all"),
             ("Alt-Enter", "run statement at cursor"),
             ("Ctrl-E", "EXPLAIN"),
+            ("t  x  X", "begin · rollback · commit txn"),
+            ("Ctrl+←→", "resize console / left stack"),
+            ("Ctrl+↑↓", "resize results height"),
             ("b  s  o", "database · schema · table"),
             ("Alt-b/s/o", "same while Insert"),
             ("Alt-L", "cycle SELECT limit"),
-            ("t / +", "new SQL tab"),
+            ("+", "new SQL tab"),
             ("[ ]", "prev / next tab"),
-            ("x / Ctrl-W", "close SQL tab"),
+            ("Ctrl-W", "close SQL tab"),
             ("Shift-T", "cycle theme"),
         ],
         Focus::Database => &[
             ("Ctrl-P", "command palette"),
             ("Ctrl-W", "close SQL tab"),
             ("Enter", "open / expand"),
+            ("c  u", "connect · disconnect source"),
+            ("Ctrl+←→", "resize explorer width"),
+            ("Ctrl+↑↓", "resize results height"),
             ("b  s  o", "database · schema · table"),
             ("d", "Go to DDL"),
             ("n", "Create…"),
@@ -3723,6 +3738,8 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("Ctrl-W", "close SQL tab"),
             ("Enter", "FK jump / open"),
             ("↑↓", "move"),
+            ("Ctrl+←→", "resize explorer / structure"),
+            ("Ctrl+↑↓", "resize results height"),
             ("b  s  o", "database · schema · table"),
             ("d", "Go to DDL"),
             ("Tab", "cycle focus"),
@@ -4511,28 +4528,29 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
     match ui.focus {
         Focus::Database => vec![
             ("Enter", "open"),
+            ("c/u", "conn"),
+            ("Ctrl+←→", "resize"),
             ("b/s/o", "db·schema·table"),
-            ("Ctrl-P", "palette"),
             ("Tab", "focus"),
         ],
         Focus::Structure => vec![
             ("Enter", "FK jump"),
-            ("↑↓", "move"),
+            ("Ctrl+←→", "resize"),
             ("b/s/o", "db·schema·table"),
             ("Tab", "focus"),
         ],
         Focus::Editor => vec![
             ("i", "insert"),
             ("F5", "run"),
-            ("Alt-↵", "cursor"),
-            ("t", "new tab"),
+            ("t/x/X", "txn"),
+            ("Ctrl+←→", "resize"),
             ("b/s/o", "db·schema·table"),
             ("Alt-L", "limit"),
         ],
         Focus::Results => vec![
             ("Space", "keys"),
+            ("Ctrl+↑↓", "resize"),
             ("b/s", "db·schema"),
-            ("Ctrl-⇧P", "table"),
             ("m", "actions"),
         ],
         Focus::Search => vec![("↑↓", "move"), ("Enter", "open"), ("Esc", "back")],
@@ -6223,10 +6241,12 @@ fn pad_display(s: &str, width: usize) -> String {
 }
 
 /// Build Console toolbar spans; drop chips as whole tokens when narrow (#8).
+/// TXN chip lives here (not Explorer Admin) — begin/commit/rollback (#294).
 fn console_toolbar_spans(
     running: bool,
     console_focused: bool,
     insert: bool,
+    in_txn: bool,
     db_label: &str,
     schema_label: &str,
     table_label: &str,
@@ -6250,6 +6270,13 @@ fn console_toolbar_spans(
         )
     };
     let sep = Span::styled(" · ", theme::Role::Faint.style());
+    let txn = if in_txn {
+        Span::styled(" TXN t/x/X ", theme::style_warn().add_modifier(Modifier::BOLD))
+    } else if insert {
+        Span::styled(" auto ", theme::Role::Faint.style())
+    } else {
+        Span::styled(" t begin ", theme::style_chip())
+    };
     // Insert mode: bare b/s/o type SQL — show Alt chords that actually work.
     let (db_key, schema_key, table_key, lim_key) = if insert {
         ("Alt-b", "Alt-s", "Alt-o", "Alt-L")
@@ -6269,6 +6296,8 @@ fn console_toolbar_spans(
             Span::raw(" "),
             run.clone(),
             sep.clone(),
+            txn.clone(),
+            sep.clone(),
             chip(db_chip.clone()),
             sep.clone(),
             chip(schema_chip.clone()),
@@ -6281,6 +6310,8 @@ fn console_toolbar_spans(
             Span::raw(" "),
             run.clone(),
             sep.clone(),
+            txn.clone(),
+            sep.clone(),
             chip(db_chip.clone()),
             sep.clone(),
             chip(schema_chip.clone()),
@@ -6291,11 +6322,21 @@ fn console_toolbar_spans(
             Span::raw(" "),
             run.clone(),
             sep.clone(),
+            txn.clone(),
+            sep.clone(),
             chip(db_chip.clone()),
             sep.clone(),
             chip(lim_chip.clone()),
         ],
-        vec![Span::raw(" "), run.clone(), sep.clone(), chip(lim_chip.clone())],
+        vec![
+            Span::raw(" "),
+            run.clone(),
+            sep.clone(),
+            txn.clone(),
+            sep.clone(),
+            chip(lim_chip.clone()),
+        ],
+        vec![Span::raw(" "), run.clone(), sep.clone(), txn.clone()],
         vec![Span::raw(" "), run],
     ];
 

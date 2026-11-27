@@ -1364,6 +1364,14 @@ impl App {
             format!("Studio · {conn} · p props · n New · 3 Console"),
             false,
         );
+        // First-run tip when Explorer is still narrow (#19).
+        if !self.ui.resize_tip_shown && self.ui.explorer_width <= 30 {
+            self.ui.resize_tip_shown = true;
+            self.set_status(
+                "tip · Ctrl+←→ widen Explorer · Ctrl+↑↓ Results height · Space discover",
+                false,
+            );
+        }
     }
 
     fn cycle_db_pane(&mut self) {
@@ -2149,6 +2157,12 @@ impl App {
         }
         if let Some((name, msg)) = connect_err {
             self.set_status(format!("{name} · connect error · {msg}"), true);
+        } else if let Some(full) = self.db.selection_full_path() {
+            // Echo full path when the painted Explorer label is truncated (#18).
+            let budget = self.ui.explorer_width.saturating_sub(8) as usize;
+            if full.chars().count() > budget.max(8) {
+                self.set_status(format!("→ {full}"), false);
+            }
         }
     }
 
@@ -10592,12 +10606,92 @@ async fn event_loop(
                                     }
                                 }
 
+                                // Explorer: `c` connect · `u` disconnect source (#12).
+                                if !ctrl
+                                    && !alt
+                                    && app.ui.mode == Mode::Normal
+                                    && app.ui.focus == Focus::Database
+                                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('u'))
+                                {
+                                    if let Some(id) = app.selected_connection_id() {
+                                        match key.code {
+                                            KeyCode::Char('c') => {
+                                                match app.db.connect_source(&id).await {
+                                                    Ok(()) => {
+                                                        app.set_status(app.db.status.clone(), false)
+                                                    }
+                                                    Err(e) => app.set_status(
+                                                        format!("connect: {e:#}"),
+                                                        true,
+                                                    ),
+                                                }
+                                            }
+                                            _ => match app.db.disconnect_source(&id).await {
+                                                Ok(()) => {
+                                                    app.set_status(app.db.status.clone(), false)
+                                                }
+                                                Err(e) => app
+                                                    .set_status(format!("disconnect: {e:#}"), true),
+                                            },
+                                        }
+                                    } else {
+                                        app.set_status(
+                                            "select a connection row · c connect · u disconnect",
+                                            true,
+                                        );
+                                    }
+                                    continue;
+                                }
+                                // Console Normal: txn chords on the Console itself (#294).
+                                if !ctrl
+                                    && !alt
+                                    && app.ui.mode == Mode::Normal
+                                    && app.ui.focus == Focus::Editor
+                                    && matches!(
+                                        key.code,
+                                        KeyCode::Char('t')
+                                            | KeyCode::Char('x')
+                                            | KeyCode::Char('X')
+                                    )
+                                {
+                                    match key.code {
+                                        KeyCode::Char('t') => {
+                                            match app.db.begin_transaction().await {
+                                                Ok(()) => {
+                                                    app.set_status(app.db.status.clone(), false)
+                                                }
+                                                Err(e) => {
+                                                    app.set_status(format!("begin txn: {e:#}"), true)
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('x') => {
+                                            match app.db.rollback_transaction().await {
+                                                Ok(()) => {
+                                                    app.set_status(app.db.status.clone(), false)
+                                                }
+                                                Err(e) => app.set_status(
+                                                    format!("rollback txn: {e:#}"),
+                                                    true,
+                                                ),
+                                            }
+                                        }
+                                        _ => match app.db.commit_transaction().await {
+                                            Ok(()) => app.set_status(app.db.status.clone(), false),
+                                            Err(e) => {
+                                                app.set_status(format!("commit txn: {e:#}"), true)
+                                            }
+                                        },
+                                    }
+                                    continue;
+                                }
                                 // In Explorer, bare `x` deletes the connection (confirm modal).
-                                // In Results, `x` / `X` are rollback / commit (#28).
+                                // In Results/Console, `x` / `X` are rollback / commit (#28 / #294).
                                 // Elsewhere `x` / Ctrl-W closes the SQL tab.
                                 let close_tab = (!ctrl
                                     && app.ui.focus != Focus::Database
                                     && app.ui.focus != Focus::Results
+                                    && app.ui.focus != Focus::Editor
                                     && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X')))
                                     || (ctrl
                                         && matches!(
@@ -10626,10 +10720,17 @@ async fn event_loop(
                                     continue;
                                 }
                                 // Lowercase `t` / `+` only — Shift+T is CycleTheme (#85).
-                                // Results uses `t` to begin a transaction (#28); `+` still opens a tab.
+                                // Results/Console use `t` for begin txn (#28 / #294); `+` opens a tab.
                                 let new_tab_key = match key.code {
                                     KeyCode::Char('+') => true,
-                                    KeyCode::Char('t') if app.ui.focus != Focus::Results => true,
+                                    KeyCode::Char('t')
+                                        if !matches!(
+                                            app.ui.focus,
+                                            Focus::Results | Focus::Editor
+                                        ) =>
+                                    {
+                                        true
+                                    }
                                     _ => false,
                                 };
                                 if !ctrl
