@@ -2489,12 +2489,19 @@ fn filter_field_span(label: &str, value: &str, focused: bool, field_w: usize) ->
             " ".repeat(well_w.saturating_sub(value.chars().count()))
         )
     };
+    // Focused well: keep body ink on a dark plate. Avoid fg(bg())+bg(text()) invert —
+    // on Windows Terminal / 16-color paths, ANSI black as fg often collapses to default
+    // (light) ink → white-on-white while typing WHERE/ORDER (#295).
     let (bracket, well) = if focused {
         (
             Style::default().fg(theme::accent()).add_modifier(Modifier::BOLD),
             Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
+                .fg(theme::text())
+                .bg(if theme::is_mono() {
+                    theme::bg()
+                } else {
+                    theme::surface_3()
+                })
                 .add_modifier(Modifier::BOLD),
         )
     } else if empty {
@@ -5731,8 +5738,14 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             height: 1,
         },
     );
+    let is_activity = view.contains("activity")
+        || view.contains("processlist")
+        || view == "sessions";
+    let live = is_activity && db.health_activity_auto_refresh;
     let hint = if is_overview {
         " r refresh   Esc close "
+    } else if live {
+        " ↑↓ row   live ~5s   r refresh   Esc close "
     } else {
         " ↑↓ row   r refresh   Esc close "
     };

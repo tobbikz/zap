@@ -266,8 +266,23 @@ impl App {
         self.db.select_limit = ide_db::next_select_limit_preset(self.db.select_limit);
         self.config.database.select_limit = self.db.select_limit;
         let _ = self.config.save();
+        // Table data tabs embed LIMIT in SQL — rewrite to match the lim chip (#17).
+        let table_synced = if self.db.active_is_table_tab() {
+            self.db.sync_table_sql_from_filters().is_ok()
+        } else {
+            false
+        };
         let msg = if self.db.select_limit == 0 {
-            "SELECT limit · off (no auto LIMIT)".to_string()
+            if table_synced {
+                "SELECT limit · off · table SQL updated · F5 re-run".to_string()
+            } else {
+                "SELECT limit · off (no auto LIMIT)".to_string()
+            }
+        } else if table_synced {
+            format!(
+                "SELECT limit · {} · table SQL updated · F5 re-run",
+                self.db.select_limit
+            )
         } else {
             format!(
                 "SELECT limit · {} · Alt-L cycle · applies when SQL has no LIMIT",
@@ -2233,16 +2248,29 @@ impl App {
                         if let Some((label, slug)) = meta {
                             self.ui.admin_modal = true;
                             self.ui.admin_modal_title = label;
-                            self.ui.admin_modal_view = slug;
+                            self.ui.admin_modal_view = slug.clone();
                             self.ui.admin_modal_row = 0;
+                            // Activity is a live ops surface — auto-refresh while open (#287).
+                            if admin_view_is_activity(&slug) {
+                                self.db.health_activity_auto_refresh = true;
+                                self.health_activity_tick = 0;
+                            }
                         }
                         // Keep Explorer focus under the modal so Esc isn't stolen by Results.
                         self.ui.focus = Focus::Database;
+                        let live = admin_view_is_activity(&self.ui.admin_modal_view);
                         self.set_status(
-                            format!(
-                                "admin · {} · r refresh · Esc",
-                                self.ui.admin_modal_title
-                            ),
+                            if live {
+                                format!(
+                                    "admin · {} · live ~5s · r refresh · Esc",
+                                    self.ui.admin_modal_title
+                                )
+                            } else {
+                                format!(
+                                    "admin · {} · r refresh · Esc",
+                                    self.ui.admin_modal_title
+                                )
+                            },
                             false,
                         );
                         self.run_query().await?;
@@ -9579,19 +9607,28 @@ async fn event_loop(
                         app.db.refresh_stale_health().await;
                     }
                 }
-                // ~ every 5s: re-run Health · Activity when auto-refresh is on (Wave 9).
-                // Skip while a modal/palette is open so completion cannot wipe ui.mode (#188).
+                // ~ every 5s: re-run Health · Activity when auto-refresh is on (Wave 9 / #287).
+                // Admin Activity modal refreshes in place; other modals/palette still skip (#188).
+                let activity_tab = app.db.active_tab_is_health_activity() && !app.ui.admin_modal;
+                let activity_modal = app.ui.admin_modal
+                    && admin_view_is_activity(&app.ui.admin_modal_view)
+                    && app.ui.confirm_run_sql.is_none()
+                    && app.ui.confirm_delete_source_id.is_none();
                 if app.db.health_activity_auto_refresh
                     && app.ui.product == ProductMode::Database
                     && app.ui.mode == Mode::Normal
                     && !app.db.query_running
                     && !app.pending_db_query
-                    && app.db.active_tab_is_health_activity()
+                    && (activity_tab || activity_modal)
                 {
                     app.health_activity_tick = app.health_activity_tick.saturating_add(1);
                     if app.health_activity_tick >= 150 {
                         app.health_activity_tick = 0;
-                        app.queue_db_query();
+                        if activity_modal {
+                            let _ = app.run_query().await;
+                        } else {
+                            app.queue_db_query();
+                        }
                     }
                 } else {
                     app.health_activity_tick = 0;
@@ -11064,6 +11101,12 @@ async fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Admin modal / Health slug for live Activity views (#287).
+fn admin_view_is_activity(view: &str) -> bool {
+    let v = view.trim().to_ascii_lowercase();
+    v.contains("activity") || v.contains("processlist") || v == "sessions"
 }
 
 fn nvim_typing_mode(mode: &str) -> bool {
