@@ -48,6 +48,8 @@ pub enum FindTarget {
     Sql,
     /// Explorer name filter (#9).
     Explorer,
+    /// Admin/Health modal grid filter (#289).
+    AdminModal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,8 +147,12 @@ pub struct UiState {
     pub admin_modal_title: String,
     /// View slug from the tree node (`health-overview`, `health-blocking`, …).
     pub admin_modal_view: String,
-    /// Selected row inside the admin table body.
+    /// Selected row inside the admin table body (index into the filtered page).
     pub admin_modal_row: usize,
+    /// Substring filter for Admin/Health grids (#289).
+    pub admin_modal_filter: String,
+    /// Zero-based page for Admin/Health grids (#289).
+    pub admin_modal_page: usize,
     pub stack_frames: Vec<StackFrameView>,
     pub debug_frame_selected: usize,
     pub variables: Vec<VariableView>,
@@ -301,6 +307,8 @@ impl Default for UiState {
             admin_modal_title: String::new(),
             admin_modal_view: String::new(),
             admin_modal_row: 0,
+            admin_modal_filter: String::new(),
+            admin_modal_page: 0,
             stack_frames: Vec::new(),
             debug_frame_selected: 0,
             variables: Vec::new(),
@@ -727,6 +735,7 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
                 Mode::Find => (
                     match ctx.ui.find_target {
                         FindTarget::Explorer => "explorer/ ",
+                        FindTarget::AdminModal => "admin/ ",
                         FindTarget::Sql => "sql/ ",
                         FindTarget::Results => "results/ ",
                         FindTarget::Buffer => "find> ",
@@ -960,6 +969,7 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
             Mode::Find => (
                 match ctx.ui.find_target {
                     FindTarget::Explorer => "explorer/ ",
+                    FindTarget::AdminModal => "admin/ ",
                     FindTarget::Sql => "sql/ ",
                     FindTarget::Results => "results/ ",
                     FindTarget::Buffer => "find> ",
@@ -5818,6 +5828,26 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         },
     );
 
+    let is_activity = view.contains("activity")
+        || view.contains("processlist")
+        || view == "sessions";
+    let filter = ctx.ui.admin_modal_filter.trim();
+    let page_size = ADMIN_MODAL_PAGE_SIZE;
+    let filtered_idxs = db
+        .last_result
+        .as_ref()
+        .map(|r| admin_filtered_row_idxs(r, filter))
+        .unwrap_or_default();
+    let total_filtered = filtered_idxs.len();
+    let page_count = total_filtered.div_ceil(page_size).max(1);
+    let page = ctx.ui.admin_modal_page.min(page_count.saturating_sub(1));
+    let page_start = page.saturating_mul(page_size);
+    let page_idxs: Vec<usize> = filtered_idxs
+        .iter()
+        .copied()
+        .skip(page_start)
+        .take(page_size)
+        .collect();
     let (nrows, ncols, ms) = db
         .last_result
         .as_ref()
@@ -5825,7 +5855,11 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         .unwrap_or((0, 0, 0));
     let mut chips: Vec<Span> = vec![
         Span::styled(
-            format!(" {nrows} rows "),
+            if filter.is_empty() {
+                format!(" {nrows} rows ")
+            } else {
+                format!(" {total_filtered}/{nrows} ")
+            },
             Style::default().fg(theme::muted()).bg(theme::surface_2()),
         ),
         Span::raw(" "),
@@ -5839,6 +5873,23 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             Style::default().fg(theme::muted()).bg(theme::surface_2()),
         ),
     ];
+    if !is_overview {
+        chips.push(Span::raw(" "));
+        chips.push(Span::styled(
+            format!(" p{}/{} ", page + 1, page_count),
+            Style::default().fg(theme::muted()).bg(theme::surface_2()),
+        ));
+    }
+    if !filter.is_empty() {
+        chips.push(Span::raw(" "));
+        chips.push(Span::styled(
+            format!(" /{filter} "),
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if is_blocking && nrows > 0 {
         chips.push(Span::raw(" "));
         chips.push(Span::styled(
@@ -5888,6 +5939,7 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     };
     let body_w = body.width as usize;
     let body_h = body.height as usize;
+    let sel = ctx.ui.admin_modal_row.min(page_idxs.len().saturating_sub(1));
 
     let lines: Vec<Line> = match db.last_result.as_ref() {
         None => vec![Line::from(Span::styled(
@@ -5898,16 +5950,24 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             admin_overview_kpi_lines(result, body_w)
         }
         Some(result) if is_blocking => {
-            match admin_blocking_lines(result, ctx.ui.admin_modal_row, body_w) {
+            match admin_blocking_lines(result, page_idxs.get(sel).copied().unwrap_or(0), body_w)
+            {
                 Some(l) => l,
-                None => admin_ops_table_lines(result, ctx.ui.admin_modal_row, body_w),
+                None => admin_ops_table_lines(
+                    result,
+                    &page_idxs,
+                    sel,
+                    body_w,
+                    is_activity,
+                ),
             }
         }
-        Some(result) => admin_ops_table_lines(result, ctx.ui.admin_modal_row, body_w),
+        Some(result) => {
+            admin_ops_table_lines(result, &page_idxs, sel, body_w, is_activity)
+        }
     };
 
     let scroll = {
-        let sel = ctx.ui.admin_modal_row;
         // Blocking cards are ~3 rendered lines each — scroll in line units (#132).
         let approx = if is_blocking {
             sel.saturating_mul(3)
@@ -5932,16 +5992,13 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             height: 1,
         },
     );
-    let is_activity = view.contains("activity")
-        || view.contains("processlist")
-        || view == "sessions";
     let live = is_activity && db.health_activity_auto_refresh;
     let hint = if is_overview {
         " r refresh   Esc close "
     } else if live {
-        " ↑↓ row   live ~5s   r refresh   Esc close "
+        " ↑↓ · [/] page · / filter · live ~5s · r · Esc "
     } else {
-        " ↑↓ row   r refresh   Esc close "
+        " ↑↓ row · [/] page · / filter · r refresh · Esc "
     };
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -5955,6 +6012,39 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             height: 1,
         },
     );
+}
+
+pub const ADMIN_MODAL_PAGE_SIZE: usize = 40;
+
+pub fn admin_modal_filtered_count(result: &ide_db::QueryResult, filter: &str) -> usize {
+    admin_filtered_row_idxs(result, filter).len()
+}
+
+pub fn admin_modal_page_len(
+    result: &ide_db::QueryResult,
+    filter: &str,
+    page: usize,
+) -> usize {
+    let idxs = admin_filtered_row_idxs(result, filter);
+    let start = page.saturating_mul(ADMIN_MODAL_PAGE_SIZE);
+    idxs.len().saturating_sub(start).min(ADMIN_MODAL_PAGE_SIZE)
+}
+
+fn admin_filtered_row_idxs(result: &ide_db::QueryResult, filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return (0..result.rows.len()).collect();
+    }
+    result
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.iter()
+                .any(|c| c.to_ascii_lowercase().contains(&needle))
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn admin_is_metric_value(result: &ide_db::QueryResult) -> bool {
@@ -6107,27 +6197,77 @@ fn admin_blocking_lines(
     Some(lines)
 }
 
+fn admin_preferred_col_idxs(columns: &[String], activity: bool) -> Vec<usize> {
+    if !activity {
+        return (0..columns.len().min(6)).collect();
+    }
+    // Prefer high-signal Activity columns (#288); fall back to first N.
+    const PREFER: &[&str] = &[
+        "class",
+        "pid",
+        "session_id",
+        "id",
+        "usename",
+        "user",
+        "login_name",
+        "datname",
+        "database",
+        "db",
+        "app",
+        "application_name",
+        "program_name",
+        "backend_type",
+        "state",
+        "session_status",
+        "command",
+        "wait",
+        "wait_event",
+        "wait_type",
+        "query",
+        "info",
+    ];
+    let mut idxs = Vec::new();
+    for want in PREFER {
+        if idxs.len() >= 7 {
+            break;
+        }
+        if let Some(i) = columns.iter().position(|c| c.eq_ignore_ascii_case(want)) {
+            if !idxs.contains(&i) {
+                idxs.push(i);
+            }
+        }
+    }
+    if idxs.is_empty() {
+        return (0..columns.len().min(6)).collect();
+    }
+    idxs
+}
+
 fn admin_ops_table_lines(
     result: &ide_db::QueryResult,
+    page_idxs: &[usize],
     sel: usize,
     width: usize,
+    activity: bool,
 ) -> Vec<Line<'static>> {
-    let ncols = result.columns.len().min(6);
-    if ncols == 0 {
+    if result.columns.is_empty() {
         return vec![Line::from(Span::styled(
             " (empty)",
             theme::style_faint(),
         ))];
     }
+    let col_idxs = admin_preferred_col_idxs(&result.columns, activity);
+    let ncols = col_idxs.len().max(1);
     let col_w = ((width.saturating_sub(ncols.saturating_sub(1))) / ncols).max(6);
     let mut lines = Vec::new();
     let mut header: Vec<Span> = Vec::new();
-    for (i, c) in result.columns.iter().take(ncols).enumerate() {
+    for (i, &ci) in col_idxs.iter().enumerate() {
         if i > 0 {
             header.push(Span::styled(" ", theme::style_faint()));
         }
+        let name = result.columns.get(ci).map(|s| s.as_str()).unwrap_or("?");
         header.push(Span::styled(
-            pad_display(c, col_w),
+            pad_display(name, col_w),
             Style::default()
                 .fg(theme::muted())
                 .bg(theme::surface_2())
@@ -6135,42 +6275,92 @@ fn admin_ops_table_lines(
         ));
     }
     lines.push(Line::from(header));
-    for (ri, row) in result.rows.iter().enumerate() {
-        let selected = ri == sel;
+    for (vis, &ri) in page_idxs.iter().enumerate() {
+        let Some(row) = result.rows.get(ri) else {
+            continue;
+        };
+        let selected = vis == sel;
         let style = if selected {
             theme::style_selected()
-        } else if ri % 2 == 1 {
+        } else if vis % 2 == 1 {
             Style::default().fg(theme::text()).bg(theme::surface_2())
         } else {
             theme::style_text()
         };
         let mut spans = Vec::new();
-        for (i, cell) in row.iter().take(ncols).enumerate() {
+        for (i, &ci) in col_idxs.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" ", theme::style_faint()));
             }
+            let cell = row.get(ci).map(|s| s.as_str()).unwrap_or("");
             let t = pad_display(&truncate_display(cell, col_w), col_w);
             spans.push(Span::styled(t, style));
         }
         lines.push(Line::from(spans));
     }
-    if result.rows.is_empty() {
+    if page_idxs.is_empty() {
         lines.push(Line::from(Span::styled(
-            " (no rows)",
+            if result.rows.is_empty() {
+                " (no rows)"
+            } else {
+                " (no matches — clear / filter)"
+            },
             theme::style_faint(),
         )));
     }
-    if result.columns.len() > ncols {
-        lines.push(Line::from(""));
+    // Detail strip for selected Activity row — full query / wait (#288).
+    if activity {
+        if let Some(&ri) = page_idxs.get(sel) {
+            if let Some(row) = result.rows.get(ri) {
+                let detail = admin_activity_detail(&result.columns, row);
+                if !detail.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        truncate_chars(&format!(" ▸ {detail}"), width),
+                        theme::style_muted(),
+                    )));
+                }
+            }
+        }
+    }
+    if result.columns.len() > col_idxs.len() {
         lines.push(Line::from(Span::styled(
             format!(
                 " +{} more cols in Results after Esc ",
-                result.columns.len() - ncols
+                result.columns.len() - col_idxs.len()
             ),
             theme::style_faint(),
         )));
     }
     lines
+}
+
+fn admin_activity_detail(columns: &[String], row: &[String]) -> String {
+    let get = |names: &[&str]| -> Option<String> {
+        for n in names {
+            if let Some(i) = columns.iter().position(|c| c.eq_ignore_ascii_case(n)) {
+                let v = row.get(i)?.trim();
+                if !v.is_empty() && v != "—" {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        None
+    };
+    let mut parts = Vec::new();
+    if let Some(app) = get(&["app", "application_name", "program_name"]) {
+        parts.push(format!("app={app}"));
+    }
+    if let Some(bt) = get(&["backend_type"]) {
+        parts.push(format!("type={bt}"));
+    }
+    if let Some(w) = get(&["wait", "wait_event", "wait_type"]) {
+        parts.push(format!("wait={w}"));
+    }
+    if let Some(q) = get(&["query", "info"]) {
+        parts.push(format!("q={q}"));
+    }
+    parts.join(" · ")
 }
 
 /// Latency / activity monitor overlay (`m` toggle).

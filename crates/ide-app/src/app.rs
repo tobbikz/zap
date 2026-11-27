@@ -2303,6 +2303,8 @@ impl App {
                             self.ui.admin_modal_title = label;
                             self.ui.admin_modal_view = slug.clone();
                             self.ui.admin_modal_row = 0;
+                            self.ui.admin_modal_filter.clear();
+                            self.ui.admin_modal_page = 0;
                             // Activity is a live ops surface — auto-refresh while open (#287).
                             if admin_view_is_activity(&slug) {
                                 self.db.health_activity_auto_refresh = true;
@@ -5123,6 +5125,22 @@ impl App {
                     );
                 }
             }
+            ide_ui::FindTarget::AdminModal => {
+                self.ui.admin_modal_filter = q.clone();
+                self.ui.admin_modal_page = 0;
+                self.ui.admin_modal_row = 0;
+                if q.is_empty() {
+                    self.set_status("admin filter cleared", false);
+                } else {
+                    let n = self
+                        .db
+                        .last_result
+                        .as_ref()
+                        .map(|r| ide_ui::admin_modal_filtered_count(r, &q))
+                        .unwrap_or(0);
+                    self.set_status(format!("admin /{q} · {n} rows"), false);
+                }
+            }
             ide_ui::FindTarget::Sql => {
                 if q.is_empty() {
                     return Ok(());
@@ -5179,11 +5197,18 @@ impl App {
 
     /// Live Explorer `/` filter while typing in Find mode (#9).
     fn sync_live_find_filter(&mut self) {
-        if self.ui.find_target != ide_ui::FindTarget::Explorer {
-            return;
+        match self.ui.find_target {
+            ide_ui::FindTarget::Explorer => {
+                self.db.explorer_filter = self.ui.find_query.clone();
+                self.db.rebuild_flat();
+            }
+            ide_ui::FindTarget::AdminModal => {
+                self.ui.admin_modal_filter = self.ui.find_query.clone();
+                self.ui.admin_modal_page = 0;
+                self.ui.admin_modal_row = 0;
+            }
+            _ => {}
         }
-        self.db.explorer_filter = self.ui.find_query.clone();
-        self.db.rebuild_flat();
     }
 
     /// Byte offset of `db_cursor` inside `db.sql` (#13).
@@ -6308,6 +6333,9 @@ impl App {
                     {
                         self.db.explorer_filter.clear();
                         self.db.rebuild_flat();
+                    }
+                    if self.ui.find_target == ide_ui::FindTarget::AdminModal {
+                        // Keep typed filter on Esc from Find — Esc again in modal clears.
                     }
                     self.ui.find_target = ide_ui::FindTarget::Buffer;
                     self.ui.replace_query.clear();
@@ -10192,6 +10220,13 @@ async fn event_loop(
                         {
                             match key.code {
                                 KeyCode::Esc | KeyCode::Char('q') => {
+                                    if !app.ui.admin_modal_filter.is_empty() {
+                                        app.ui.admin_modal_filter.clear();
+                                        app.ui.admin_modal_page = 0;
+                                        app.ui.admin_modal_row = 0;
+                                        app.set_status("admin · filter cleared", false);
+                                        continue;
+                                    }
                                     app.ui.admin_modal = false;
                                     app.ui.focus = Focus::Database;
                                     app.ui.status = None;
@@ -10202,18 +10237,59 @@ async fn event_loop(
                                     app.run_query().await?;
                                     continue;
                                 }
+                                KeyCode::Char('/') => {
+                                    app.ui.find_target = ide_ui::FindTarget::AdminModal;
+                                    app.ui.find_query = app.ui.admin_modal_filter.clone();
+                                    app.ui.mode = Mode::Find;
+                                    continue;
+                                }
+                                KeyCode::Char('[') => {
+                                    if app.ui.admin_modal_page > 0 {
+                                        app.ui.admin_modal_page -= 1;
+                                        app.ui.admin_modal_row = 0;
+                                    }
+                                    continue;
+                                }
+                                KeyCode::Char(']') => {
+                                    let filter = app.ui.admin_modal_filter.clone();
+                                    let total = app
+                                        .db
+                                        .last_result
+                                        .as_ref()
+                                        .map(|r| {
+                                            ide_ui::admin_modal_filtered_count(r, &filter)
+                                        })
+                                        .unwrap_or(0);
+                                    let pages = total
+                                        .div_ceil(ide_ui::ADMIN_MODAL_PAGE_SIZE)
+                                        .max(1);
+                                    if app.ui.admin_modal_page + 1 < pages {
+                                        app.ui.admin_modal_page += 1;
+                                        app.ui.admin_modal_row = 0;
+                                    }
+                                    continue;
+                                }
                                 KeyCode::Up => {
                                     app.ui.admin_modal_row =
                                         app.ui.admin_modal_row.saturating_sub(1);
                                     continue;
                                 }
                                 KeyCode::Down => {
-                                    let max = app
+                                    let filter = app.ui.admin_modal_filter.clone();
+                                    let page = app.ui.admin_modal_page;
+                                    let on_page = app
                                         .db
                                         .last_result
                                         .as_ref()
-                                        .map(|r| r.rows.len().saturating_sub(1))
+                                        .map(|r| {
+                                            ide_ui::admin_modal_page_len(
+                                                r,
+                                                &filter,
+                                                page,
+                                            )
+                                        })
                                         .unwrap_or(0);
+                                    let max = on_page.saturating_sub(1);
                                     if app.ui.admin_modal_row < max {
                                         app.ui.admin_modal_row += 1;
                                     }
