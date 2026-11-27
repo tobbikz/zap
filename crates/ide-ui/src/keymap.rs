@@ -250,6 +250,10 @@ pub enum Action {
     CollapseAll,
     /// Explorer: collapse all siblings except the selection's ancestors (#34).
     CollapseOthers,
+    /// Explorer: cycle object-type filter (tables / views / …) (#11).
+    CycleExplorerTypeFilter,
+    /// Explorer: toggle system / temp schemas (#11).
+    ToggleExplorerSystemSchemas,
     /// Run only the statement under the cursor (or selection) (#20).
     RunQueryAtCursor,
     /// Results: sort focused column ascending/descending/off (#31).
@@ -571,10 +575,17 @@ impl Keymap {
                 (false, false, KeyCode::Char('o')) => Some(Action::OpenDbObjectPalette),
                 // `/` filters the visible Explorer tree by name (#9).
                 (false, false, KeyCode::Char('/')) => Some(Action::Find),
+                (false, false, KeyCode::Char('f')) => Some(Action::CycleExplorerTypeFilter),
+                // Shift-U: system schemas (plain `u` is disconnect — #12).
+                (false, true, KeyCode::Char('U')) | (false, false, KeyCode::Char('U')) => {
+                    Some(Action::ToggleExplorerSystemSchemas)
+                }
                 (false, false, KeyCode::Char('c')) => Some(Action::CollapseAll),
                 (false, true, KeyCode::Char('C')) | (false, false, KeyCode::Char('C')) => {
                     Some(Action::CollapseOthers)
                 }
+                (false, false, KeyCode::Right) => Some(Action::MoveRight),
+                (false, false, KeyCode::Left) => Some(Action::MoveLeft),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Char(' ')) => Some(Action::ToggleDiscover),
                 (false, true, KeyCode::Char('T')) | (false, false, KeyCode::Char('T')) => {

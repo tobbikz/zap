@@ -6595,6 +6595,8 @@ impl App {
             Action::MoveLeft => {
                 if self.ui.mode == Mode::Settings {
                     self.settings_move_left();
+                } else if self.ui.focus == Focus::Database {
+                    let _ = self.db.explorer_collapse_selected();
                 } else if self.ui.focus == Focus::Results {
                     if let Some(result) = self.db.last_result.as_mut() {
                         result.move_cell(0, -1);
@@ -6609,6 +6611,8 @@ impl App {
             Action::MoveRight => {
                 if self.ui.mode == Mode::Settings {
                     self.settings_move_right();
+                } else if self.ui.focus == Focus::Database {
+                    let _ = self.db.explorer_expand_selected();
                 } else if self.ui.focus == Focus::Results {
                     if let Some(result) = self.db.last_result.as_mut() {
                         result.move_cell(0, 1);
@@ -7186,6 +7190,14 @@ impl App {
             }
             Action::CollapseOthers => {
                 self.db.collapse_others();
+                self.set_status(self.db.status.clone(), false);
+            }
+            Action::CycleExplorerTypeFilter => {
+                self.db.cycle_explorer_type_filter();
+                self.set_status(self.db.status.clone(), false);
+            }
+            Action::ToggleExplorerSystemSchemas => {
+                self.db.toggle_explorer_show_system();
                 self.set_status(self.db.status.clone(), false);
             }
             Action::DeleteDataSource => {
