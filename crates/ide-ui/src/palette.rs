@@ -267,6 +267,8 @@ impl Palette {
             item("Duplicate connection", "duplicate_connection"),
             item("Delete connection", "delete_connection"),
             item("Maintain: vacuum/optimize/rebuild", "vacuum_analyze"),
+            item("Maintain: vacuum FULL (Postgres)", "vacuum_full"),
+            item("Maintain: vacuum FULL ANALYZE (Postgres)", "vacuum_full_analyze"),
             item("Maintain: analyze/statistics", "analyze_table"),
             item("Maintain: reindex/rebuild", "reindex_table"),
             item("Inspect table privileges", "inspect_privileges"),
@@ -915,13 +917,13 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
     frame.render_widget(Paragraph::new(hint), inner[4]);
 }
 
-/// Centered dump restore path prompt.
+/// Centered dump restore path prompt (fallback when native dialog cancelled).
 pub fn render_restore_dump(frame: &mut Frame, screen: Rect, input: &str) {
     render_path_prompt(
         frame,
         screen,
         " restore dump ",
-        "  path to .sql dump (pg_dump / mysqldump / sqlite3)",
+        "  path to .sql dump (fallback — native picker preferred)",
         "  restores into the active database",
         input,
     );

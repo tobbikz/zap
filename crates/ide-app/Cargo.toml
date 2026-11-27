@@ -37,3 +37,4 @@ dirs.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 arboard.workspace = true
+rfd.workspace = true
