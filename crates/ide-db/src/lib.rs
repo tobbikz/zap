@@ -543,7 +543,12 @@ pub fn build_table_data_sql(
     let o = order_by.trim().trim_end_matches(';').trim();
     match driver {
         DbDriver::Mssql => {
-            let mut sql = format!("SELECT TOP ({limit}) * FROM {qual}");
+            // `limit == 0` means lim chip "off" — no TOP (#17).
+            let mut sql = if limit > 0 {
+                format!("SELECT TOP ({limit}) * FROM {qual}")
+            } else {
+                format!("SELECT * FROM {qual}")
+            };
             if !w.is_empty() {
                 sql.push_str(" WHERE ");
                 sql.push_str(w);
@@ -565,7 +570,11 @@ pub fn build_table_data_sql(
                 sql.push_str(" ORDER BY ");
                 sql.push_str(o);
             }
-            sql.push_str(&format!(" LIMIT {limit};\n"));
+            // `limit == 0` means lim chip "off" — no LIMIT (#17).
+            if limit > 0 {
+                sql.push_str(&format!(" LIMIT {limit}"));
+            }
+            sql.push_str(";\n");
             sql
         }
     }
@@ -3288,8 +3297,9 @@ impl DbWorkspace {
                 .get(idx)
                 .map(|t| (t.where_clause.clone(), t.order_by.clone()))
                 .unwrap_or_default();
+            let lim = self.select_limit;
             let sql = entry.query_sql.clone().unwrap_or_else(|| {
-                build_table_data_sql(driver, &schema, &table, &where_clause, &order_by, 100)
+                build_table_data_sql(driver, &schema, &table, &where_clause, &order_by, lim)
             });
             if let Some(tab) = self.tabs.get_mut(idx) {
                 tab.sql = sql.clone();
@@ -3299,8 +3309,9 @@ impl DbWorkspace {
             self.sql = sql;
             self.last_result = None;
         } else {
+            let lim = self.select_limit;
             let sql = entry.query_sql.clone().unwrap_or_else(|| {
-                build_table_data_sql(driver, &schema, &table, "", "", 100)
+                build_table_data_sql(driver, &schema, &table, "", "", lim)
             });
             self.tabs.push(SqlTab {
                 id: table_key.clone(),
@@ -3371,13 +3382,14 @@ impl DbWorkspace {
             .find(|s| s.id == source_id)
             .map(|s| s.driver)
             .unwrap_or_default();
+        let lim = self.select_limit;
         let sql = build_table_data_sql(
             driver,
             schema,
             table,
             &tab.where_clause,
             &tab.order_by,
-            100,
+            lim,
         );
         if let Some(t) = self.tabs.get_mut(self.active_tab) {
             t.sql = sql.clone();
@@ -10336,16 +10348,8 @@ fn admin_folder_for(
 ) -> DbTreeNode {
     let mut children = match driver {
         DbDriver::Postgres => {
+            // Sessions live under Health → Activity (#290) — no legacy duplicate.
             let mut v = vec![
-                admin_query_node(
-                    source_id,
-                    "sessions",
-                    "Sessions (legacy)",
-                    "SELECT pid, usename, datname, client_addr, state, wait_event_type, wait_event,\n\
-                     \tbackend_start, xact_start, query_start, left(query, 120) AS query\n\
-                     FROM pg_stat_activity\n\
-                     ORDER BY state NULLS LAST, query_start DESC NULLS LAST;",
-                ),
                 admin_query_node(
                     source_id,
                     "locks",
@@ -10419,14 +10423,7 @@ fn admin_folder_for(
                 admin_action_node(source_id, "vacuum-analyze", "OPTIMIZE TABLE…"),
                 admin_action_node(source_id, "analyze-table", "ANALYZE TABLE…"),
                 admin_action_node(source_id, "reindex-table", "OPTIMIZE (reindex)…"),
-                admin_query_node(
-                    source_id,
-                    "processlist",
-                    "Processlist (legacy)",
-                    "SELECT id, user, host, db, command, time, state, left(info, 120) AS info\n\
-                     FROM information_schema.processlist\n\
-                     ORDER BY time DESC;",
-                ),
+                // Processlist lives under Health → Activity (#290).
                 admin_query_node(
                     source_id,
                     "variables",
@@ -10489,16 +10486,7 @@ fn admin_folder_for(
                 admin_action_node(source_id, "vacuum-analyze", "UPDATE STATS + REBUILD…"),
                 admin_action_node(source_id, "analyze-table", "UPDATE STATISTICS…"),
                 admin_action_node(source_id, "reindex-table", "REBUILD indexes…"),
-                admin_query_node(
-                    source_id,
-                    "sessions",
-                    "Sessions (legacy)",
-                    "SELECT session_id, login_name, host_name, status, cpu_time, total_elapsed_time,
-                     	LEFT(text, 120) AS query
-                     FROM sys.dm_exec_requests r
-                     CROSS APPLY sys.dm_exec_sql_text(r.sql_handle)
-                     ORDER BY total_elapsed_time DESC;",
-                ),
+                // Sessions live under Health → Activity (#290).
                 admin_query_node(
                     source_id,
                     "databases",
@@ -14039,6 +14027,26 @@ mod mssql_alter_ddl_tests {
     fn postgres_add_keeps_column_keyword() {
         let sql = ddl_add_column(DbDriver::Postgres, "public", "t", "c", "int");
         assert!(sql.contains("ADD COLUMN"), "{sql}");
+    }
+}
+
+#[cfg(test)]
+mod table_data_sql_tests {
+    use super::{build_table_data_sql, DbDriver};
+
+    #[test]
+    fn table_open_uses_select_limit_not_hardcoded_100() {
+        let sql = build_table_data_sql(DbDriver::Postgres, "public", "brands", "", "", 50);
+        assert!(sql.contains("LIMIT 50"), "{sql}");
+        assert!(!sql.contains("LIMIT 100"), "{sql}");
+    }
+
+    #[test]
+    fn table_open_omits_limit_when_off() {
+        let sql = build_table_data_sql(DbDriver::Postgres, "public", "brands", "", "", 0);
+        assert!(!sql.to_ascii_uppercase().contains("LIMIT"), "{sql}");
+        let mssql = build_table_data_sql(DbDriver::Mssql, "dbo", "brands", "", "", 0);
+        assert!(!mssql.to_ascii_uppercase().contains("TOP"), "{mssql}");
     }
 }
 

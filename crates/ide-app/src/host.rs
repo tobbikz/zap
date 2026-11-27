@@ -45,15 +45,42 @@ fn install_panic_hook() {
 }
 
 pub fn apply_icons(pref: IconPref) {
-    let class = theme::classify_font(&console_face());
+    let face = console_face();
+    let class = theme::classify_font(&face);
     let glyphs = resolve_glyphs(pref, class);
+    // ConPTY under Windows Terminal often reports Consolas via GetCurrentConsoleFontEx
+    // even when WT is rendering Cascadia / a Nerd Font — trust WT_SESSION for rich glyphs.
     let rich = matches!(class, FontClass::Nerd | FontClass::Modern)
+        || windows_terminal()
+        || force_rich_glyphs()
         || (matches!(class, FontClass::Unknown) && !cfg!(windows));
     theme::set_glyph_set(glyphs);
     theme::set_rounded_borders(rich);
     theme::set_block_glyphs(rich);
     ide_db::set_rich_blocks(rich);
     theme::set_truecolor(detect_truecolor());
+}
+
+/// Windows Terminal sets `WT_SESSION`. ConPTY font queries are unreliable there.
+pub fn windows_terminal() -> bool {
+    #[cfg(windows)]
+    {
+        std::env::var_os("WT_SESSION").is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn force_rich_glyphs() -> bool {
+    match std::env::var("ZAP_RICH_GLYPHS") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "on" | "yes")
+        }
+        Err(_) => false,
+    }
 }
 
 /// Detect whether the terminal supports 24-bit truecolor (#74).
@@ -67,8 +94,7 @@ pub fn detect_truecolor() -> bool {
         }
     }
     // Windows Terminal sets WT_SESSION and supports 24-bit natively.
-    #[cfg(windows)]
-    if std::env::var_os("WT_SESSION").is_some() {
+    if windows_terminal() {
         return true;
     }
     // ConPTY / conhost without WT — legacy; fall back to 16-color only
@@ -89,7 +115,7 @@ pub fn detect_truecolor() -> bool {
 pub fn keyboard_protocol() -> bool {
     #[cfg(windows)]
     {
-        std::env::var_os("WT_SESSION").is_some()
+        windows_terminal()
     }
     #[cfg(not(windows))]
     {
@@ -108,7 +134,10 @@ fn resolve_glyphs(pref: IconPref, class: FontClass) -> GlyphSet {
         IconPref::Safe => GlyphSet::Safe,
         IconPref::Ascii => GlyphSet::Ascii,
         IconPref::Auto => {
-            if cfg!(windows) && class != FontClass::Nerd {
+            // WT + Cascadia Mono NF can draw Nerd PUA; ConPTY may still say "Consolas".
+            if windows_terminal() || class == FontClass::Nerd {
+                GlyphSet::Nerd
+            } else if cfg!(windows) {
                 GlyphSet::Safe
             } else {
                 GlyphSet::Nerd
