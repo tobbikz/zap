@@ -11430,13 +11430,14 @@ fn postgres_health_folder(source_id: &str) -> DbTreeNode {
             admin_query_node(source_id, "health-activity", "Activity", PG_HEALTH_ACTIVITY),
             admin_query_node(source_id, "health-blocking", "Blocking", PG_HEALTH_BLOCKING),
             admin_query_node(source_id, "health-waits", "Waits", PG_HEALTH_WAITS),
+            admin_query_node(source_id, "health-locks", "Locks", PG_HEALTH_LOCKS),
             admin_query_node(source_id, "health-bloat", "Bloat", PG_HEALTH_BLOAT),
             admin_query_node(source_id, "health-indexes", "Index health", PG_HEALTH_INDEXES),
         ],
     )
 }
 
-/// Roles → members → grants under Admin (#291).
+/// Roles → users cascade under Admin (one row per principal; Enter → privileges).
 fn postgres_roles_folder(source_id: &str) -> DbTreeNode {
     DbTreeNode {
         id: format!("{source_id}::admin::roles"),
@@ -11450,15 +11451,15 @@ fn postgres_roles_folder(source_id: &str) -> DbTreeNode {
         children: vec![
             admin_query_node(
                 source_id,
-                "roles-membership",
-                "Membership (role → member)",
-                PG_ROLES_MEMBERSHIP,
+                "roles-users",
+                "Users (login)",
+                PG_ROLES_USERS,
             ),
             admin_query_node(
                 source_id,
-                "roles-grants",
-                "Table privileges",
-                PG_ROLES_TABLE_GRANTS,
+                "roles-groups",
+                "Roles (cascade)",
+                PG_ROLES_CASCADE,
             ),
             admin_query_node(
                 source_id,
@@ -11471,18 +11472,39 @@ fn postgres_roles_folder(source_id: &str) -> DbTreeNode {
     }
 }
 
-pub const PG_ROLES_MEMBERSHIP: &str = "\
-SELECT r.rolname AS role_name,
-       COALESCE(m.rolname, '(no members)') AS member,
-       CASE WHEN m.oid IS NULL THEN NULL
-            WHEN m.rolcanlogin THEN 'login'
-            ELSE 'role' END AS member_kind,
-       am.admin_option
+/// One row per login role — Enter opens table privileges for that user.
+pub const PG_ROLES_USERS: &str = "\
+SELECT r.rolname AS username,
+       CASE WHEN r.rolsuper THEN 'superuser' ELSE 'login' END AS kind,
+       COALESCE((
+         SELECT string_agg(g.rolname, ', ' ORDER BY g.rolname)
+         FROM pg_auth_members am
+         JOIN pg_roles g ON g.oid = am.roleid
+         WHERE am.member = r.oid
+       ), '—') AS member_of,
+       r.rolconnlimit AS conn_limit
 FROM pg_roles r
-LEFT JOIN pg_auth_members am ON am.roleid = r.oid
-LEFT JOIN pg_roles m ON m.oid = am.member
+WHERE r.rolcanlogin
+  AND r.rolname NOT LIKE 'pg\\_%' ESCAPE '\\'
+ORDER BY 1;";
+
+/// Cascade: one row per role with nested member list (not one row per edge).
+pub const PG_ROLES_CASCADE: &str = "\
+SELECT r.rolname AS role_name,
+       CASE WHEN r.rolcanlogin THEN 'login' ELSE 'group' END AS kind,
+       COALESCE((
+         SELECT string_agg(
+           CASE WHEN m.rolcanlogin THEN m.rolname || ' (user)' ELSE m.rolname END,
+           ', ' ORDER BY m.rolname)
+         FROM pg_auth_members am
+         JOIN pg_roles m ON m.oid = am.member
+         WHERE am.roleid = r.oid
+       ), '(no members)') AS members,
+       (SELECT count(*) FROM pg_auth_members am WHERE am.roleid = r.oid) AS member_count
+FROM pg_roles r
 WHERE r.rolname NOT LIKE 'pg\\_%' ESCAPE '\\'
-ORDER BY r.rolname, m.rolname NULLS FIRST;";
+  AND NOT r.rolcanlogin
+ORDER BY 1;";
 
 pub const PG_ROLES_TABLE_GRANTS: &str = "\
 SELECT grantee, table_schema, table_name, privilege_type, is_grantable
@@ -11498,6 +11520,15 @@ FROM pg_roles
 WHERE rolname NOT LIKE 'pg\\_%' ESCAPE '\\'
 ORDER BY 1;";
 
+pub const PG_HEALTH_LOCKS: &str = "\
+SELECT l.locktype, l.mode, l.granted, l.pid, a.usename, a.datname,
+  c.relname AS relation, left(a.query, 100) AS query
+FROM pg_locks l
+LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+LEFT JOIN pg_class c ON c.oid = l.relation
+WHERE l.pid IS DISTINCT FROM pg_backend_pid()
+ORDER BY l.granted, l.pid;";
+
 fn mysql_roles_folder(source_id: &str) -> DbTreeNode {
     DbTreeNode {
         id: format!("{source_id}::admin::roles"),
@@ -11512,14 +11543,14 @@ fn mysql_roles_folder(source_id: &str) -> DbTreeNode {
             admin_query_node(
                 source_id,
                 "roles-users",
-                "Users",
-                "SELECT user, host, account_locked, password_expired\n\
+                "Users (login)",
+                "SELECT user AS username, host, account_locked, password_expired\n\
                  FROM mysql.user ORDER BY user, host LIMIT 500;",
             ),
             admin_query_node(
                 source_id,
-                "roles-grants",
-                "Schema privileges",
+                "roles-groups",
+                "Schema privileges (all)",
                 "SELECT GRANTEE, TABLE_SCHEMA, PRIVILEGE_TYPE, IS_GRANTABLE\n\
                  FROM information_schema.SCHEMA_PRIVILEGES\n\
                  ORDER BY GRANTEE, TABLE_SCHEMA LIMIT 2000;",
@@ -12034,18 +12065,8 @@ fn admin_folder_for(
     let mut children = match driver {
         DbDriver::Postgres => {
             // Sessions live under Health → Activity (#290) — no legacy duplicate.
+            // Locks live under Health (#admin-ux). Roles cascade under Admin.
             let mut v = vec![
-                admin_query_node(
-                    source_id,
-                    "locks",
-                    "Locks",
-                    "SELECT l.locktype, l.mode, l.granted, l.pid, a.usename, a.datname,\n\
-                     \tc.relname AS relation, left(a.query, 100) AS query\n\
-                     FROM pg_locks l\n\
-                     LEFT JOIN pg_stat_activity a ON a.pid = l.pid\n\
-                     LEFT JOIN pg_class c ON c.oid = l.relation\n\
-                     ORDER BY l.granted, l.pid;",
-                ),
                 postgres_roles_folder(source_id),
                 admin_query_node(
                     source_id,

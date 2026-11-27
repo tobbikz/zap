@@ -5794,7 +5794,8 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         width,
         height,
     };
-    paint_scrim(frame, screen);
+    // Solid black — no frosted dither / wallpaper bleed behind Admin.
+    widgets::paint_scrim_solid(frame, screen);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()
@@ -5838,6 +5839,10 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     let is_activity = view.contains("activity")
         || view.contains("processlist")
         || view == "sessions";
+    let is_waits = view.contains("wait");
+    let is_locks = view.contains("lock") && !is_blocking;
+    let is_roles = view.contains("roles") || view.contains("users") || view.contains("membership")
+        || view.contains("privileges") || view.contains("role-flags");
     let filter = ctx.ui.admin_modal_filter.trim();
     let page_size = ADMIN_MODAL_PAGE_SIZE;
     let filtered_idxs = db
@@ -5966,11 +5971,23 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
                     sel,
                     body_w,
                     is_activity,
+                    is_waits,
+                    is_locks,
+                    is_roles,
                 ),
             }
         }
         Some(result) => {
-            admin_ops_table_lines(result, &page_idxs, sel, body_w, is_activity)
+            admin_ops_table_lines(
+                result,
+                &page_idxs,
+                sel,
+                body_w,
+                is_activity,
+                is_waits,
+                is_locks,
+                is_roles,
+            )
         }
     };
 
@@ -5999,9 +6016,15 @@ fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
             height: 1,
         },
     );
-    let live = is_activity && db.health_activity_auto_refresh;
+    let live = (is_activity || is_waits) && db.health_activity_auto_refresh;
     let hint = if is_overview {
         " r refresh   Esc close "
+    } else if is_activity && live {
+        " ↑↓ · [/] page · / filter · k kill · live ~5s · r · Esc "
+    } else if is_activity {
+        " ↑↓ · [/] page · / filter · k kill · r refresh · Esc "
+    } else if is_roles {
+        " ↑↓ · Enter privileges · [/] page · / filter · r · Esc "
     } else if live {
         " ↑↓ · [/] page · / filter · live ~5s · r · Esc "
     } else {
@@ -6256,6 +6279,9 @@ fn admin_ops_table_lines(
     sel: usize,
     width: usize,
     activity: bool,
+    waits: bool,
+    locks: bool,
+    roles: bool,
 ) -> Vec<Line<'static>> {
     if result.columns.is_empty() {
         return vec![Line::from(Span::styled(
@@ -6315,15 +6341,45 @@ fn admin_ops_table_lines(
             theme::style_faint(),
         )));
     }
-    // Detail strip for selected Activity row — full query / wait (#288).
-    if activity {
+    // Detail + glossary for selected row (Activity / Waits / Locks / Roles).
+    if activity || waits || locks || roles {
         if let Some(&ri) = page_idxs.get(sel) {
             if let Some(row) = result.rows.get(ri) {
-                let detail = admin_activity_detail(&result.columns, row);
-                if !detail.is_empty() {
+                if activity {
+                    let detail = admin_activity_detail(&result.columns, row);
+                    if !detail.is_empty() {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::styled(
+                            truncate_chars(&format!(" ▸ {detail}"), width),
+                            theme::style_muted(),
+                        )));
+                    }
+                    for tip in admin_activity_glossary(&result.columns, row) {
+                        lines.push(Line::from(Span::styled(
+                            truncate_chars(&format!("   · {tip}"), width),
+                            theme::style_faint(),
+                        )));
+                    }
+                } else if waits {
+                    lines.push(Line::from(""));
+                    for tip in admin_waits_glossary(&result.columns, row) {
+                        lines.push(Line::from(Span::styled(
+                            truncate_chars(&format!(" ▸ {tip}"), width),
+                            theme::style_muted(),
+                        )));
+                    }
+                } else if locks {
+                    lines.push(Line::from(""));
+                    for tip in admin_locks_glossary(&result.columns, row) {
+                        lines.push(Line::from(Span::styled(
+                            truncate_chars(&format!(" ▸ {tip}"), width),
+                            theme::style_muted(),
+                        )));
+                    }
+                } else if roles {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        truncate_chars(&format!(" ▸ {detail}"), width),
+                        truncate_chars(" ▸ Enter → table privileges for this principal", width),
                         theme::style_muted(),
                     )));
                 }
@@ -6342,32 +6398,196 @@ fn admin_ops_table_lines(
     lines
 }
 
-fn admin_activity_detail(columns: &[String], row: &[String]) -> String {
-    let get = |names: &[&str]| -> Option<String> {
-        for n in names {
-            if let Some(i) = columns.iter().position(|c| c.eq_ignore_ascii_case(n)) {
-                let v = row.get(i)?.trim();
-                if !v.is_empty() && v != "—" {
-                    return Some(v.to_string());
-                }
+fn admin_cell(columns: &[String], row: &[String], names: &[&str]) -> Option<String> {
+    for n in names {
+        if let Some(i) = columns.iter().position(|c| c.eq_ignore_ascii_case(n)) {
+            let v = row.get(i)?.trim();
+            if !v.is_empty() && v != "—" && !v.eq_ignore_ascii_case("null") {
+                return Some(v.to_string());
             }
         }
-        None
-    };
+    }
+    None
+}
+
+fn admin_activity_detail(columns: &[String], row: &[String]) -> String {
     let mut parts = Vec::new();
-    if let Some(app) = get(&["app", "application_name", "program_name"]) {
+    if let Some(app) = admin_cell(columns, row, &["app", "application_name", "program_name"]) {
         parts.push(format!("app={app}"));
     }
-    if let Some(bt) = get(&["backend_type"]) {
+    if let Some(bt) = admin_cell(columns, row, &["backend_type"]) {
         parts.push(format!("type={bt}"));
     }
-    if let Some(w) = get(&["wait", "wait_event", "wait_type"]) {
+    if let Some(w) = admin_cell(columns, row, &["wait", "wait_event", "wait_type"]) {
         parts.push(format!("wait={w}"));
     }
-    if let Some(q) = get(&["query", "info"]) {
+    if let Some(q) = admin_cell(columns, row, &["query", "info"]) {
         parts.push(format!("q={q}"));
     }
     parts.join(" · ")
+}
+
+fn admin_activity_glossary(columns: &[String], row: &[String]) -> Vec<String> {
+    let mut tips = Vec::new();
+    if let Some(st) = admin_cell(columns, row, &["state", "command"]) {
+        tips.push(format!("state `{st}` — {}", explain_session_state(&st)));
+    }
+    if let Some(bt) = admin_cell(columns, row, &["backend_type", "class"]) {
+        tips.push(format!("backend `{bt}` — {}", explain_backend_type(&bt)));
+    }
+    if let Some(w) = admin_cell(columns, row, &["wait", "wait_event"]) {
+        tips.push(format!("wait `{w}` — {}", explain_wait_event(&w)));
+    }
+    tips
+}
+
+fn admin_waits_glossary(columns: &[String], row: &[String]) -> Vec<String> {
+    let mut tips = Vec::new();
+    if let Some(t) = admin_cell(columns, row, &["wait_event_type", "wait_type", "type"]) {
+        tips.push(format!("type `{t}` — {}", explain_wait_type(&t)));
+    }
+    if let Some(e) = admin_cell(columns, row, &["wait_event", "wait", "event"]) {
+        tips.push(format!("event `{e}` — {}", explain_wait_event(&e)));
+    }
+    if tips.is_empty() {
+        tips.push("wait glossary · select a row".into());
+    }
+    tips
+}
+
+fn admin_locks_glossary(columns: &[String], row: &[String]) -> Vec<String> {
+    let mut tips = Vec::new();
+    if let Some(m) = admin_cell(columns, row, &["mode", "lock_mode", "request_mode"]) {
+        tips.push(format!("mode `{m}` — {}", explain_lock_mode(&m)));
+    }
+    if let Some(lt) = admin_cell(columns, row, &["locktype", "resource_type", "type"]) {
+        tips.push(format!("locktype `{lt}` — {}", explain_lock_type(&lt)));
+    }
+    if let Some(g) = admin_cell(columns, row, &["granted"]) {
+        tips.push(if g.eq_ignore_ascii_case("true") || g == "t" || g == "1" {
+            "granted · lock held; others may wait".into()
+        } else {
+            "not granted · session is waiting for this lock".into()
+        });
+    }
+    if tips.is_empty() {
+        tips.push("lock glossary · select a row".into());
+    }
+    tips
+}
+
+fn explain_session_state(s: &str) -> &'static str {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "active" => "executing a query now",
+        "idle" => "connected, waiting for next client command",
+        "idle in transaction" => "open txn, not running SQL — hold locks until COMMIT/ROLLBACK",
+        "idle in transaction (aborted)" => "txn failed; must ROLLBACK",
+        "fastpath function call" => "in a fast-path function",
+        "disabled" => "tracking disabled for this session",
+        "sleep" => "MySQL: idle connection",
+        "query" => "MySQL: running a statement",
+        "locked" | "waiting for table metadata lock" => "blocked on a lock",
+        other if other.contains("wait") => "waiting on a resource",
+        _ => "session state from the engine",
+    }
+}
+
+fn explain_backend_type(s: &str) -> &'static str {
+    let t = s.trim().to_ascii_lowercase();
+    if t.contains("client") {
+        "normal client connection (apps / psql)"
+    } else if t.contains("autovacuum") {
+        "background vacuum worker"
+    } else if t.contains("walwriter") || t.contains("wal writer") {
+        "writes WAL to disk"
+    } else if t.contains("checkpointer") {
+        "flushes dirty buffers / checkpoints"
+    } else if t.contains("bgwriter") || t.contains("background writer") {
+        "writes dirty buffers in background"
+    } else if t.contains("logical") {
+        "logical replication / launcher"
+    } else if t == "worker" || t.contains("parallel") {
+        "parallel / background worker"
+    } else if t.contains("walsender") || t.contains("walreceiver") {
+        "physical replication"
+    } else {
+        "server process class"
+    }
+}
+
+fn explain_wait_type(s: &str) -> &'static str {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "client" | "(none)" | "none" => "waiting on the client (often idle ClientRead)",
+        "activity" => "idle background process main loop (normal)",
+        "io" => "disk / buffer I/O",
+        "ipc" => "inter-process communication inside the server",
+        "lock" => "waiting for a heavyweight lock",
+        "lwlock" => "lightweight lock (buffer / WAL internals)",
+        "bufferpin" => "waiting to pin a buffer",
+        "extension" => "wait defined by an extension",
+        "timeout" => "sleep / timeout wait",
+        _ => "PostgreSQL wait_event_type class",
+    }
+}
+
+fn explain_wait_event(s: &str) -> &'static str {
+    let e = s.trim().to_ascii_lowercase();
+    match e.as_str() {
+        "clientread" => "waiting for data from the client (typical for idle)",
+        "clientwrite" => "waiting to send results to the client",
+        "datafileread" | "datafilewrite" => "reading/writing a relation file",
+        "walwrite" | "walsync" => "writing or syncing WAL",
+        "bufferio" => "waiting for buffer I/O",
+        "bgwriterhibernate" => "bgwriter sleeping — normal when quiet",
+        "walwritermain" => "WAL writer idle loop",
+        "checkpointermain" => "checkpointer idle loop",
+        "autovacuummain" => "autovacuum launcher idle",
+        "logicallaunchermain" => "logical replication launcher idle",
+        "lock:transactionid" | "transactionid" => "waiting on a transaction lock",
+        "lock:relation" | "relation" => "waiting on a relation lock",
+        _ if e.contains("lock") => "waiting to acquire a lock",
+        _ => "see wait_event in docs for this engine",
+    }
+}
+
+fn explain_lock_mode(s: &str) -> &'static str {
+    let m = s.trim().to_ascii_lowercase();
+    if m.contains("accessshare") {
+        "SELECT — conflicts with AccessExclusive"
+    } else if m.contains("rowshare") {
+        "SELECT FOR UPDATE/SHARE"
+    } else if m.contains("rowexclusive") {
+        "INSERT/UPDATE/DELETE"
+    } else if m.contains("shareupdateexclusive") {
+        "VACUUM / CREATE INDEX CONCURRENTLY / analyze"
+    } else if m.contains("share") && !m.contains("exclusive") {
+        "CREATE INDEX (non-concurrent)"
+    } else if m.contains("sharerowexclusive") {
+        "stronger than SHARE; rare"
+    } else if m.contains("exclusive") && !m.contains("access") {
+        "blocks RowShare+ ; allows AccessShare"
+    } else if m.contains("accessexclusive") {
+        "ALTER/DROP/TRUNCATE/VACUUM FULL — blocks all"
+    } else if m.contains("sch_s") || m.contains("schema") {
+        "schema stability lock"
+    } else {
+        "lock strength — higher modes block more"
+    }
+}
+
+fn explain_lock_type(s: &str) -> &'static str {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "relation" => "lock on a table/index/sequence",
+        "extend" => "extending a relation's disk file",
+        "page" => "lock on a page within a relation",
+        "tuple" => "lock on a single row version",
+        "transactionid" => "transaction xid lock",
+        "virtualxid" => "virtual transaction id (session)",
+        "object" => "database object (type, function, …)",
+        "userlock" => "advisory / user lock",
+        "advisory" => "pg_advisory_lock family",
+        _ => "lock resource class",
+    }
 }
 
 /// Latency / activity monitor overlay (`m` toggle).

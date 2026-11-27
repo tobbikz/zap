@@ -1,6 +1,6 @@
 //! Application loop: input, render, LSP, git, search, terminal, DAP.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
@@ -2398,18 +2398,29 @@ impl App {
                             self.ui.admin_modal_filter.clear();
                             self.ui.admin_modal_page = 0;
                             // Activity is a live ops surface — auto-refresh while open (#287).
-                            if admin_view_is_activity(&slug) {
+                            if admin_view_is_live(&slug) {
                                 self.db.health_activity_auto_refresh = true;
                                 self.health_activity_tick = 0;
                             }
                         }
                         // Keep Explorer focus under the modal so Esc isn't stolen by Results.
                         self.ui.focus = Focus::Database;
-                        let live = admin_view_is_activity(&self.ui.admin_modal_view);
+                        let live = admin_view_is_live(&self.ui.admin_modal_view);
+                        let roles = admin_view_is_roles(&self.ui.admin_modal_view);
                         self.set_status(
-                            if live {
+                            if live && admin_view_is_activity(&self.ui.admin_modal_view) {
+                                format!(
+                                    "admin · {} · k kill · live ~5s · Esc",
+                                    self.ui.admin_modal_title
+                                )
+                            } else if live {
                                 format!(
                                     "admin · {} · live ~5s · r refresh · Esc",
+                                    self.ui.admin_modal_title
+                                )
+                            } else if roles {
+                                format!(
+                                    "admin · {} · Enter privileges · Esc",
                                     self.ui.admin_modal_title
                                 )
                             } else {
@@ -3778,10 +3789,137 @@ impl App {
         Ok(())
     }
 
+    /// Map Admin modal page/filter selection onto `last_result.cursor_row`.
+    fn sync_admin_modal_result_cursor(&mut self) {
+        let filter = self.ui.admin_modal_filter.clone();
+        let page = self.ui.admin_modal_page;
+        let sel = self.ui.admin_modal_row;
+        let Some(result) = self.db.last_result.as_mut() else {
+            return;
+        };
+        let idxs = ide_ui::admin_modal_filtered_count(result, &filter);
+        let _ = idxs;
+        // Rebuild filtered absolute indices (same as modal).
+        let needle = filter.trim().to_ascii_lowercase();
+        let filtered: Vec<usize> = if needle.is_empty() {
+            (0..result.rows.len()).collect()
+        } else {
+            result
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    row.iter()
+                        .any(|c| c.to_ascii_lowercase().contains(&needle))
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let start = page.saturating_mul(ide_ui::ADMIN_MODAL_PAGE_SIZE);
+        if let Some(&abs) = filtered.get(start + sel) {
+            result.cursor_row = abs;
+        }
+    }
+
+    /// Enter on Users/Roles row → table privileges for that principal.
+    async fn admin_roles_enter_privileges(&mut self) -> Result<()> {
+        let Some(result) = self.db.last_result.as_ref() else {
+            bail!("no roles grid");
+        };
+        let row = result
+            .rows
+            .get(result.cursor_row)
+            .context("select a user/role row")?;
+        let principal = {
+            let names = [
+                "username",
+                "rolname",
+                "role_name",
+                "grantee",
+                "user",
+                "member",
+                "login_name",
+                "name",
+            ];
+            let mut found = None;
+            for n in names {
+                if let Some(i) = result.columns.iter().position(|c| c.eq_ignore_ascii_case(n)) {
+                    let v = row.get(i).map(|s| s.trim()).unwrap_or("");
+                    if !v.is_empty()
+                        && v != "—"
+                        && !v.eq_ignore_ascii_case("null")
+                        && v != "(no members)"
+                    {
+                        found = Some(v.to_string());
+                        break;
+                    }
+                }
+            }
+            found.context("no principal name on this row")?
+        };
+        // Escape single quotes for SQL literal.
+        let lit = principal.replace('\'', "''");
+        let driver = self
+            .db
+            .active_source
+            .as_ref()
+            .and_then(|id| self.db.sources.iter().find(|s| &s.id == id))
+            .map(|s| s.driver)
+            .unwrap_or_default();
+        let sql = match driver {
+            DbDriver::Mysql => format!(
+                "SELECT GRANTEE AS grantee, TABLE_SCHEMA AS table_schema,\n\
+                 \tTABLE_NAME AS table_name, PRIVILEGE_TYPE AS privilege_type,\n\
+                 \tIS_GRANTABLE AS is_grantable\n\
+                 FROM information_schema.TABLE_PRIVILEGES\n\
+                 WHERE GRANTEE LIKE '%{lit}%'\n\
+                 ORDER BY TABLE_SCHEMA, TABLE_NAME, PRIVILEGE_TYPE\n\
+                 LIMIT 2000;"
+            ),
+            DbDriver::Mssql => format!(
+                "SELECT USER_NAME(p.grantee_principal_id) AS grantee,\n\
+                 \tOBJECT_SCHEMA_NAME(p.major_id) AS table_schema,\n\
+                 \tOBJECT_NAME(p.major_id) AS table_name,\n\
+                 \tp.permission_name AS privilege_type,\n\
+                 \tp.state_desc AS is_grantable\n\
+                 FROM sys.database_permissions p\n\
+                 WHERE USER_NAME(p.grantee_principal_id) = N'{lit}'\n\
+                   AND p.class_desc = 'OBJECT_OR_COLUMN'\n\
+                 ORDER BY 2, 3, 4;"
+            ),
+            _ => format!(
+                "SELECT grantee, table_schema, table_name, privilege_type, is_grantable\n\
+                 FROM information_schema.role_table_grants\n\
+                 WHERE grantee = '{lit}'\n\
+                 ORDER BY table_schema, table_name, privilege_type\n\
+                 LIMIT 2000;"
+            ),
+        };
+        self.db.sql = sql;
+        if let Some(tab) = self.db.tabs.get_mut(self.db.active_tab) {
+            tab.sql = self.db.sql.clone();
+            tab.title = format!("Admin · Privileges · {principal}");
+        }
+        self.ui.admin_modal_title = format!("Privileges · {principal}");
+        self.ui.admin_modal_view = "roles-privileges".into();
+        self.ui.admin_modal_row = 0;
+        self.ui.admin_modal_page = 0;
+        self.ui.admin_modal_filter.clear();
+        self.set_status(
+            format!("privileges for {principal} · Esc back · r refresh"),
+            false,
+        );
+        self.run_query().await?;
+        Ok(())
+    }
+
     async fn kill_session(&mut self) -> Result<()> {
+        if self.ui.admin_modal {
+            self.sync_admin_modal_result_cursor();
+        }
         let Some(pid) = self.db.peek_kill_session_pid() else {
             self.set_status(
-                "kill: open Admin → Sessions and select a pid row (Esc cancels the running query)",
+                "kill: open Admin → Health → Activity and select a pid row (k)",
                 true,
             );
             return Ok(());
@@ -10216,7 +10354,7 @@ async fn event_loop(
                 // Admin Activity modal refreshes in place; other modals/palette still skip (#188).
                 let activity_tab = app.db.active_tab_is_health_activity() && !app.ui.admin_modal;
                 let activity_modal = app.ui.admin_modal
-                    && admin_view_is_activity(&app.ui.admin_modal_view)
+                    && admin_view_is_live(&app.ui.admin_modal_view)
                     && app.ui.confirm_run_sql.is_none()
                     && app.ui.confirm_delete_source_id.is_none();
                 if app.db.health_activity_auto_refresh
@@ -10378,6 +10516,23 @@ async fn event_loop(
                                 KeyCode::Char('r') | KeyCode::Char('R') => {
                                     app.set_status("admin · refreshing…", false);
                                     app.run_query().await?;
+                                    continue;
+                                }
+                                KeyCode::Char('k') | KeyCode::Char('K')
+                                    if admin_view_is_activity(&app.ui.admin_modal_view) =>
+                                {
+                                    app.sync_admin_modal_result_cursor();
+                                    app.kill_session().await?;
+                                    continue;
+                                }
+                                KeyCode::Enter
+                                    if admin_view_is_roles(&app.ui.admin_modal_view)
+                                        && !app.ui.admin_modal_view.contains("privileges") =>
+                                {
+                                    app.sync_admin_modal_result_cursor();
+                                    if let Err(e) = app.admin_roles_enter_privileges().await {
+                                        app.set_status(format!("privileges: {e:#}"), true);
+                                    }
                                     continue;
                                 }
                                 KeyCode::Char('/') => {
@@ -11859,6 +12014,21 @@ async fn event_loop(
 fn admin_view_is_activity(view: &str) -> bool {
     let v = view.trim().to_ascii_lowercase();
     v.contains("activity") || v.contains("processlist") || v == "sessions"
+}
+
+/// Views that auto-refresh on the ~5s tick (Activity + Waits).
+fn admin_view_is_live(view: &str) -> bool {
+    let v = view.trim().to_ascii_lowercase();
+    admin_view_is_activity(view) || v.contains("wait")
+}
+
+fn admin_view_is_roles(view: &str) -> bool {
+    let v = view.trim().to_ascii_lowercase();
+    v.contains("roles")
+        || v.contains("users")
+        || v.contains("membership")
+        || v.contains("privileges")
+        || v.contains("cascade")
 }
 
 fn nvim_typing_mode(mode: &str) -> bool {
