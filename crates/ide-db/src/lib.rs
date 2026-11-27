@@ -1020,6 +1020,10 @@ pub struct QueryHistoryEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresMaintenance {
     VacuumAnalyze,
+    /// Postgres only — exclusive lock, rewrites the table.
+    VacuumFull,
+    /// Postgres only — FULL + ANALYZE.
+    VacuumFullAnalyze,
     Analyze,
     Reindex,
 }
@@ -1741,9 +1745,13 @@ pub struct DbWorkspace {
     pub select_limit: usize,
     /// Persisted absolute paths for dump/restore CLIs (#293). Synced from IdeConfig.
     pub tool_paths: HashMap<String, String>,
-    /// Optional dump scope from Explorer / picker (#108).
+    /// Optional dump content flags (#108).
     pub dump_schema_only: bool,
     pub dump_data_only: bool,
+    /// Explicit dump targets from the scope wizard (empty ⇒ Explorer / active db).
+    pub dump_tables: Vec<(String, String)>,
+    pub dump_schemas: Vec<String>,
+    pub dump_databases: Vec<String>,
     /// Explorer health after last expand/ping.
     pub connection_health: HashMap<String, ConnHealth>,
     /// Local Explorer name filter (`/` when Explorer focused) (#9).
@@ -1904,6 +1912,9 @@ impl Default for DbWorkspace {
             tool_paths: HashMap::new(),
             dump_schema_only: false,
             dump_data_only: false,
+            dump_tables: Vec::new(),
+            dump_schemas: Vec::new(),
+            dump_databases: Vec::new(),
             connection_health: HashMap::new(),
             explorer_filter: String::new(),
             explorer_type_by_source: HashMap::new(),
@@ -3050,6 +3061,9 @@ impl DbWorkspace {
          \n\
          Maintain & visualize (Wave 13)\n\
            Vacuum / Analyze / Reindex  all SQL engines (dialect-aware)\n\
+           Vacuum FULL / FULL ANALYZE  Postgres (Admin → Maintenance)\n\
+           Dump scope wizard           table / schema / db / multi → content mode\n\
+           Restore dump                native OS file picker (rfd) + confirm\n\
            Timing histogram          recent query durations\n\
            Find table/view           explorer object search\n\
            Structure GRANTS          when engine supports\n\
@@ -8534,7 +8548,10 @@ impl DbWorkspace {
     ) -> Result<(String, String, String, Option<String>)> {
         let (source_id, database, schema, table, driver) = self.selected_maintenance_table()?;
         let rbac_op = match op {
-            PostgresMaintenance::VacuumAnalyze | PostgresMaintenance::Analyze => "vacuum",
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze
+            | PostgresMaintenance::Analyze => "vacuum",
             PostgresMaintenance::Reindex => "reindex",
         };
         self.guard_writable_op(&source_id, rbac_op)?;
@@ -8555,8 +8572,10 @@ impl DbWorkspace {
         }
         let (source_id, database, schema, table, driver) = self.selected_maintenance_table()?;
         let rbac_op = match op {
-            PostgresMaintenance::VacuumAnalyze => "vacuum",
-            PostgresMaintenance::Analyze => "vacuum",
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze
+            | PostgresMaintenance::Analyze => "vacuum",
             PostgresMaintenance::Reindex => "reindex",
         };
         self.guard_writable_op(&source_id, rbac_op)?;
@@ -11453,6 +11472,27 @@ fn maintenance_folder(source_id: &str, vacuum: &str, analyze: &str, reindex: &st
     )
 }
 
+/// Postgres Maintenance with VACUUM FULL variants (exclusive lock).
+fn postgres_maintenance_folder(source_id: &str) -> DbTreeNode {
+    admin_group_folder(
+        source_id,
+        "maintenance",
+        "Maintenance",
+        vec![
+            admin_action_node(source_id, "vacuum-analyze", "Vacuum (analyze) table…"),
+            admin_action_node(source_id, "vacuum-full", "Vacuum FULL table…"),
+            admin_action_node(
+                source_id,
+                "vacuum-full-analyze",
+                "Vacuum FULL ANALYZE table…",
+            ),
+            admin_action_node(source_id, "analyze-table", "Analyze table…"),
+            admin_action_node(source_id, "reindex-table", "Reindex table…"),
+        ],
+        true,
+    )
+}
+
 fn connection_folder(source_id: &str) -> DbTreeNode {
     admin_group_folder(
         source_id,
@@ -12144,12 +12184,7 @@ fn admin_folder_for(
             // Health (incl. Databases) · Roles · Maintenance — Settings leaf at end.
             let mut v = vec![
                 postgres_roles_folder(source_id),
-                maintenance_folder(
-                    source_id,
-                    "Vacuum (analyze) table…",
-                    "Analyze table…",
-                    "Reindex table…",
-                ),
+                postgres_maintenance_folder(source_id),
             ];
             v.insert(0, postgres_health_folder(source_id));
             v
@@ -13076,7 +13111,31 @@ impl DbWorkspace {
                 (e.schema.clone(), e.table.clone())
             }
             DbNodeKind::Schema => (e.schema.clone(), None),
-            _ => (self.active_schema.clone(), None),
+            _ => (None, None),
+        }
+    }
+
+    /// Clear one-shot dump wizard state after a run/cancel.
+    pub fn clear_dump_scope(&mut self) {
+        self.dump_schema_only = false;
+        self.dump_data_only = false;
+        self.dump_tables.clear();
+        self.dump_schemas.clear();
+        self.dump_databases.clear();
+    }
+
+    /// Resolve table / schema / multi-schema targets for a single-database dump.
+    fn dump_object_scope(&self) -> (Vec<(String, String)>, Vec<String>) {
+        if !self.dump_tables.is_empty() {
+            return (self.dump_tables.clone(), Vec::new());
+        }
+        if !self.dump_schemas.is_empty() {
+            return (Vec::new(), self.dump_schemas.clone());
+        }
+        match self.dump_scope_from_explorer() {
+            (Some(s), Some(t)) => (vec![(s, t)], Vec::new()),
+            (Some(s), None) => (Vec::new(), vec![s]),
+            _ => (Vec::new(), Vec::new()),
         }
     }
 
@@ -13093,137 +13152,163 @@ impl DbWorkspace {
             .context("missing source")?
             .clone();
         std::fs::create_dir_all(out_dir)?;
-        let stamp = Local::now().format("%Y%m%d-%H%M%S");
-        let (scope_schema, scope_table) = self.dump_scope_from_explorer();
+        let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
         let schema_only = self.dump_schema_only;
         let data_only = self.dump_data_only;
+        let (tables, schemas) = self.dump_object_scope();
+        let databases = if !self.dump_databases.is_empty() {
+            self.dump_databases.clone()
+        } else {
+            let db = self
+                .active_database
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    if src.database.is_empty() {
+                        match src.driver {
+                            DbDriver::Postgres => "postgres".into(),
+                            _ => src.database.clone(),
+                        }
+                    } else {
+                        src.database.clone()
+                    }
+                });
+            if db.is_empty() {
+                Vec::new()
+            } else {
+                vec![db]
+            }
+        };
         match src.driver {
             DbDriver::Postgres => {
-                let db = self
-                    .active_database
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| {
-                        if src.database.is_empty() {
-                            "postgres".into()
-                        } else {
-                            src.database.clone()
-                        }
-                    });
-                let scope_tag = match (&scope_schema, &scope_table) {
-                    (Some(s), Some(t)) => format!("{s}.{t}-"),
-                    (Some(s), None) => format!("{s}-"),
-                    _ => String::new(),
-                };
-                let out = out_dir.join(format!("{scope_tag}{db}-{stamp}.sql"));
+                if databases.is_empty() {
+                    bail!("select a database first");
+                }
                 let bin = self.resolve_cli("pg_dump")?;
                 let (host, port) = self.dump_connect_endpoint(&src)?;
                 let password = src.resolved_password();
-                let mut args = vec![
-                    "-h".into(),
-                    host,
-                    "-p".into(),
-                    port.to_string(),
-                    "-U".into(),
-                    src.user.clone(),
-                    "-d".into(),
-                    db,
-                    "-f".into(),
-                    out.to_str().context("path utf8")?.to_string(),
-                    "--no-owner".into(),
-                    "--no-acl".into(),
-                ];
-                if schema_only {
-                    args.push("--schema-only".into());
-                }
-                if data_only {
-                    args.push("--data-only".into());
-                }
-                if let Some(schema) = &scope_schema {
-                    if scope_table.is_none() {
+                let mut last = None;
+                let mut paths = Vec::new();
+                for db in &databases {
+                    let scope_tag = if tables.len() == 1 {
+                        format!("{}.{}-", tables[0].0, tables[0].1)
+                    } else if schemas.len() == 1 {
+                        format!("{}-", schemas[0])
+                    } else if schemas.len() > 1 {
+                        format!("{}schemas-", schemas.len())
+                    } else {
+                        String::new()
+                    };
+                    let out = out_dir.join(format!("{scope_tag}{db}-{stamp}.sql"));
+                    let mut args = vec![
+                        "-h".into(),
+                        host.clone(),
+                        "-p".into(),
+                        port.to_string(),
+                        "-U".into(),
+                        src.user.clone(),
+                        "-d".into(),
+                        db.clone(),
+                        "-f".into(),
+                        out.to_str().context("path utf8")?.to_string(),
+                        "--no-owner".into(),
+                        "--no-acl".into(),
+                    ];
+                    if schema_only {
+                        args.push("--schema-only".into());
+                    }
+                    if data_only {
+                        args.push("--data-only".into());
+                    }
+                    for schema in &schemas {
                         args.push("-n".into());
                         args.push(schema.clone());
                     }
-                }
-                if let (Some(schema), Some(table)) = (&scope_schema, &scope_table) {
-                    args.push("-t".into());
-                    args.push(format!("{schema}.{table}"));
-                }
-                let output = tokio::process::Command::new(&bin)
-                    .env("PGPASSWORD", password)
-                    .args(&args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .await
-                    .with_context(|| format!("spawn {}", bin.display()))?;
-                if !output.status.success() {
-                    bail!(
-                        "pg_dump failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    for (schema, table) in &tables {
+                        args.push("-t".into());
+                        args.push(format!("{schema}.{table}"));
+                    }
+                    let output = tokio::process::Command::new(&bin)
+                        .env("PGPASSWORD", &password)
+                        .args(&args)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .await
+                        .with_context(|| format!("spawn {}", bin.display()))?;
+                    if !output.status.success() {
+                        bail!(
+                            "pg_dump failed ({db}): {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    paths.push(out.display().to_string());
+                    last = Some(out);
                 }
                 self.status = format!(
-                    "dumped {}{}",
-                    out.display(),
-                    match (&scope_schema, &scope_table) {
-                        (Some(s), Some(t)) => format!(" · {s}.{t}"),
-                        (Some(s), _) => format!(" · schema {s}"),
-                        _ => " · full database".into(),
+                    "dumped {} file(s){}",
+                    paths.len(),
+                    if paths.len() == 1 {
+                        format!(" · {}", paths[0])
+                    } else {
+                        format!(" · {}", paths.join(" · "))
                     }
                 );
-                Ok(out)
+                last.context("no dump written")
             }
             DbDriver::Mysql => {
-                let db = self
-                    .active_database
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| src.database.clone());
-                if db.is_empty() {
+                if databases.is_empty() {
                     bail!("select a MySQL database first");
                 }
-                let out = out_dir.join(format!("{db}-{stamp}.sql"));
                 let bin = self.resolve_cli("mysqldump")?;
                 let (host, port) = self.dump_connect_endpoint(&src)?;
                 let password = src.resolved_password();
-                let mut args = vec![
-                    "-h".into(),
-                    host,
-                    "-P".into(),
-                    port.to_string(),
-                    "-u".into(),
-                    src.user.clone(),
-                ];
-                if schema_only {
-                    args.push("--no-data".into());
+                let mut last = None;
+                let mut paths = Vec::new();
+                for db in &databases {
+                    let out = out_dir.join(format!("{db}-{stamp}.sql"));
+                    let mut args = vec![
+                        "-h".into(),
+                        host.clone(),
+                        "-P".into(),
+                        port.to_string(),
+                        "-u".into(),
+                        src.user.clone(),
+                    ];
+                    if schema_only {
+                        args.push("--no-data".into());
+                    }
+                    if data_only {
+                        args.push("--no-create-info".into());
+                    }
+                    args.push(db.clone());
+                    for (_schema, table) in &tables {
+                        args.push(table.clone());
+                    }
+                    // MySQL has no schema namespace like PG; multi-schema ⇒ dump whole DBs only.
+                    let file = std::fs::File::create(&out).context("create dump file")?;
+                    let mut cmd = tokio::process::Command::new(&bin);
+                    if !password.is_empty() {
+                        cmd.env("MYSQL_PWD", &password);
+                    }
+                    let output = cmd
+                        .args(&args)
+                        .stdout(file)
+                        .stderr(Stdio::piped())
+                        .output()
+                        .await
+                        .with_context(|| format!("spawn {}", bin.display()))?;
+                    if !output.status.success() {
+                        bail!(
+                            "mysqldump failed ({db}): {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    paths.push(out.display().to_string());
+                    last = Some(out);
                 }
-                if data_only {
-                    args.push("--no-create-info".into());
-                }
-                args.push(db.clone());
-                if let Some(table) = &scope_table {
-                    args.push(table.clone());
-                }
-                let file = std::fs::File::create(&out).context("create dump file")?;
-                let mut cmd = tokio::process::Command::new(&bin);
-                if !password.is_empty() {
-                    cmd.env("MYSQL_PWD", password);
-                }
-                let output = cmd
-                    .args(&args)
-                    .stdout(file)
-                    .stderr(Stdio::piped())
-                    .output()
-                    .await
-                    .with_context(|| format!("spawn {}", bin.display()))?;
-                if !output.status.success() {
-                    bail!(
-                        "mysqldump failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                Ok(out)
+                self.status = format!("dumped {} file(s)", paths.len());
+                last.context("no dump written")
             }
             DbDriver::Sqlite => {
                 let file = if src.file.is_empty() {
@@ -13250,13 +13335,28 @@ impl DbWorkspace {
                 Ok(out)
             }
             DbDriver::Mssql => {
-                let db = self
-                    .active_database
-                    .clone()
+                let db = databases
+                    .first()
+                    .cloned()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| src.database.clone());
-                self.dump_mssql(&src, &source_id, &db, out_dir, &stamp.to_string())
-                    .await
+                if db.is_empty() {
+                    bail!("select a database first");
+                }
+                // Multi-db: one file per database.
+                if databases.len() > 1 {
+                    let mut last = None;
+                    for d in &databases {
+                        last = Some(
+                            self.dump_mssql(&src, &source_id, d, out_dir, &stamp)
+                                .await?,
+                        );
+                    }
+                    self.status = format!("dumped {} MSSQL database(s)", databases.len());
+                    last.context("no dump written")
+                } else {
+                    self.dump_mssql(&src, &source_id, &db, out_dir, &stamp).await
+                }
             }
             DbDriver::Clickhouse => {
                 self.dump_clickhouse(&src, &source_id, out_dir, &stamp.to_string())
@@ -14569,6 +14669,14 @@ fn maintenance_sql(
             "VACUUM (ANALYZE)".into(),
             format!("VACUUM (ANALYZE) {fq_pg}"),
         ),
+        (DbDriver::Postgres, PostgresMaintenance::VacuumFull) => (
+            "VACUUM (FULL)".into(),
+            format!("VACUUM (FULL) {fq_pg}"),
+        ),
+        (DbDriver::Postgres, PostgresMaintenance::VacuumFullAnalyze) => (
+            "VACUUM (FULL, ANALYZE)".into(),
+            format!("VACUUM (FULL, ANALYZE) {fq_pg}"),
+        ),
         (DbDriver::Postgres, PostgresMaintenance::Analyze) => {
             ("ANALYZE".into(), format!("ANALYZE {fq_pg}"))
         }
@@ -14576,9 +14684,13 @@ fn maintenance_sql(
             "REINDEX TABLE".into(),
             format!("REINDEX TABLE {fq_pg}"),
         ),
-        (DbDriver::Sqlite, PostgresMaintenance::VacuumAnalyze) => {
-            ("VACUUM".into(), "VACUUM".into())
-        }
+        // FULL is Postgres-only in the Admin tree; other engines map heavy ops here.
+        (
+            DbDriver::Sqlite,
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze,
+        ) => ("VACUUM".into(), "VACUUM".into()),
         (DbDriver::Sqlite, PostgresMaintenance::Analyze) => (
             "ANALYZE".into(),
             format!("ANALYZE \"{}\"", table.replace('"', "\"\"")),
@@ -14587,7 +14699,12 @@ fn maintenance_sql(
             "REINDEX".into(),
             format!("REINDEX \"{}\"", table.replace('"', "\"\"")),
         ),
-        (DbDriver::Mysql, PostgresMaintenance::VacuumAnalyze) => (
+        (
+            DbDriver::Mysql,
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze,
+        ) => (
             "OPTIMIZE TABLE".into(),
             format!("OPTIMIZE TABLE {fq_mysql}"),
         ),
@@ -14599,7 +14716,12 @@ fn maintenance_sql(
             "OPTIMIZE TABLE (reindex)".into(),
             format!("OPTIMIZE TABLE {fq_mysql}"),
         ),
-        (DbDriver::Mssql, PostgresMaintenance::VacuumAnalyze) => (
+        (
+            DbDriver::Mssql,
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze,
+        ) => (
             "UPDATE STATISTICS + REBUILD".into(),
             format!(
                 "UPDATE STATISTICS {fq_mssql} WITH FULLSCAN; \
@@ -14614,9 +14736,12 @@ fn maintenance_sql(
             "ALTER INDEX ALL REBUILD".into(),
             format!("ALTER INDEX ALL ON {fq_mssql} REBUILD"),
         ),
-        (DbDriver::Duckdb, PostgresMaintenance::VacuumAnalyze) => {
-            ("CHECKPOINT".into(), "CHECKPOINT".into())
-        }
+        (
+            DbDriver::Duckdb,
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze,
+        ) => ("CHECKPOINT".into(), "CHECKPOINT".into()),
         (DbDriver::Duckdb, PostgresMaintenance::Analyze) => (
             "ANALYZE".into(),
             if schema.is_empty() || schema == "main" {
@@ -14633,7 +14758,12 @@ fn maintenance_sql(
             "FORCE CHECKPOINT".into(),
             "FORCE CHECKPOINT".into(),
         ),
-        (DbDriver::Clickhouse, PostgresMaintenance::VacuumAnalyze) => (
+        (
+            DbDriver::Clickhouse,
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze,
+        ) => (
             "OPTIMIZE TABLE FINAL".into(),
             format!("OPTIMIZE TABLE {fq_ch} FINAL"),
         ),
@@ -14645,7 +14775,12 @@ fn maintenance_sql(
             "OPTIMIZE TABLE FINAL".into(),
             format!("OPTIMIZE TABLE {fq_ch} FINAL"),
         ),
-        (DbDriver::Snowflake, PostgresMaintenance::VacuumAnalyze) => (
+        (
+            DbDriver::Snowflake,
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze,
+        ) => (
             "SUGGEST recluster".into(),
             format!(
                 "-- Snowflake: ALTER TABLE \"{schema}\".\"{table}\" RECLUSTER;\n\
@@ -14660,7 +14795,12 @@ fn maintenance_sql(
             "SUGGEST recluster".into(),
             format!("-- Snowflake has no REINDEX; use ALTER TABLE \"{schema}\".\"{table}\" RECLUSTER;"),
         ),
-        (DbDriver::Bigquery, PostgresMaintenance::VacuumAnalyze) => (
+        (
+            DbDriver::Bigquery,
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze,
+        ) => (
             "SUGGEST BQ optimize".into(),
             format!(
                 "-- BigQuery: CREATE OR REPLACE TABLE `{schema}.{table}` AS SELECT * FROM `{schema}.{table}`;\n\
@@ -14678,11 +14818,13 @@ fn maintenance_sql(
             "SUGGEST BQ clustering".into(),
             format!("-- BigQuery: set clustering/partitioning on `{schema}.{table}` in Console"),
         ),
-        (DbDriver::Trino, PostgresMaintenance::VacuumAnalyze) => (
-            "SUGGEST Trino ANALYZE".into(),
-            format!("ANALYZE {schema}.{table}"),
-        ),
-        (DbDriver::Trino, PostgresMaintenance::Analyze) => (
+        (
+            DbDriver::Trino,
+            PostgresMaintenance::VacuumAnalyze
+            | PostgresMaintenance::VacuumFull
+            | PostgresMaintenance::VacuumFullAnalyze
+            | PostgresMaintenance::Analyze,
+        ) => (
             "SUGGEST Trino ANALYZE".into(),
             format!("ANALYZE {schema}.{table}"),
         ),
@@ -15310,6 +15452,8 @@ mod dba_engines_tests {
         for d in engines {
             for op in [
                 PostgresMaintenance::VacuumAnalyze,
+                PostgresMaintenance::VacuumFull,
+                PostgresMaintenance::VacuumFullAnalyze,
                 PostgresMaintenance::Analyze,
                 PostgresMaintenance::Reindex,
             ] {
@@ -15318,6 +15462,20 @@ mod dba_engines_tests {
                 assert!(!sql.is_empty(), "{d:?}");
             }
         }
+        let (label, sql) =
+            maintenance_sql(DbDriver::Postgres, PostgresMaintenance::VacuumFull, "public", "t")
+                .unwrap();
+        assert_eq!(label, "VACUUM (FULL)");
+        assert!(sql.contains("VACUUM (FULL)"));
+        let (label, sql) = maintenance_sql(
+            DbDriver::Postgres,
+            PostgresMaintenance::VacuumFullAnalyze,
+            "public",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(label, "VACUUM (FULL, ANALYZE)");
+        assert!(sql.contains("VACUUM (FULL, ANALYZE)"));
     }
 
     #[test]

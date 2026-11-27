@@ -101,7 +101,8 @@ Press **Space** — see what can follow. No memorization tax.
 
 ### DBA / ops
 - Connection health · Admin / Health overview & activity (incl. MSSQL packs)
-- Dump / restore · schema diff · data compare · migrations
+- Dump (table / schema / db / multi) · restore via native file picker · schema diff · data compare · migrations
+- Postgres Maintenance: VACUUM ANALYZE · VACUUM FULL · VACUUM FULL ANALYZE · ANALYZE · REINDEX
 - Vacuum / analyze / reindex · privileges · RLS policies (Postgres)
 - Export CSV / SQL / JSON / Markdown · result packs
 - Import CSV / JSON · ER sketch / canvas · CDC lag sketch

@@ -1215,6 +1215,8 @@ impl App {
     async fn start_maintenance_flow(&mut self, op: PostgresMaintenance) {
         let key = match op {
             PostgresMaintenance::VacuumAnalyze => "vacuum_analyze",
+            PostgresMaintenance::VacuumFull => "vacuum_full",
+            PostgresMaintenance::VacuumFullAnalyze => "vacuum_full_analyze",
             PostgresMaintenance::Analyze => "analyze",
             PostgresMaintenance::Reindex => "reindex",
         };
@@ -1314,6 +1316,8 @@ impl App {
             Ok((_sql, msg, source_id, database)) => {
                 let marker = match op {
                     PostgresMaintenance::VacuumAnalyze => "__maint_vacuum_analyze__",
+                    PostgresMaintenance::VacuumFull => "__maint_vacuum_full__",
+                    PostgresMaintenance::VacuumFullAnalyze => "__maint_vacuum_full_analyze__",
                     PostgresMaintenance::Analyze => "__maint_analyze__",
                     PostgresMaintenance::Reindex => "__maint_reindex__",
                 };
@@ -1325,6 +1329,8 @@ impl App {
                 self.ui.confirm_delete_label = msg;
                 self.ui.confirm_dialog_title = match op {
                     PostgresMaintenance::VacuumAnalyze => " vacuum / optimize ",
+                    PostgresMaintenance::VacuumFull => " vacuum FULL ",
+                    PostgresMaintenance::VacuumFullAnalyze => " vacuum FULL ANALYZE ",
                     PostgresMaintenance::Analyze => " analyze table ",
                     PostgresMaintenance::Reindex => " reindex table ",
                 }
@@ -1338,25 +1344,149 @@ impl App {
     }
 
     fn start_dump_options(&mut self) {
-        let scope = match self.db.flat.get(self.db.selected) {
+        self.db.clear_dump_scope();
+        self.ui.dump_pick_checked.clear();
+        self.ui.dump_pick_choices.clear();
+        let table_hint = match self.db.flat.get(self.db.selected) {
             Some(e) if matches!(e.kind, ide_db::DbNodeKind::Table | ide_db::DbNodeKind::View) => {
                 match (&e.schema, &e.table) {
-                    (Some(s), Some(t)) => format!("selection ({s}.{t})"),
-                    _ => "selection".into(),
+                    (Some(s), Some(t)) => format!("{s}.{t}"),
+                    _ => e.label.clone(),
                 }
             }
-            Some(e) if matches!(e.kind, ide_db::DbNodeKind::Schema) => {
-                format!("schema ({})", e.schema.as_deref().unwrap_or("?"))
-            }
-            _ => "full database (Explorer selection used if table/schema)".into(),
+            _ => "none selected".into(),
         };
+        let schema_hint = self
+            .db
+            .flat
+            .get(self.db.selected)
+            .and_then(|e| e.schema.clone())
+            .or_else(|| self.db.active_schema.clone())
+            .unwrap_or_else(|| "—".into());
+        let db_hint = self
+            .db
+            .active_database
+            .clone()
+            .unwrap_or_else(|| "active".into());
+        self.ui.pending_dump = Some("scope".into());
         self.ui.mode = Mode::Palette;
         self.ui.palette = Palette::open_actions(vec![
-            (format!("Dump · full / Explorer scope — {scope}"), "dump_full".into()),
+            (
+                format!("Current table ({table_hint})"),
+                "dump_scope_table".into(),
+            ),
+            (
+                format!("Current schema ({schema_hint})"),
+                "dump_scope_schema".into(),
+            ),
+            (
+                format!("Current database ({db_hint})"),
+                "dump_scope_database".into(),
+            ),
+            ("Pick schemas…".into(), "dump_scope_pick_schemas".into()),
+            ("Pick databases…".into(), "dump_scope_pick_databases".into()),
+        ]);
+        self.set_status("dump · choose scope · then content mode", false);
+    }
+
+    fn open_dump_content_palette(&mut self) {
+        self.ui.pending_dump = Some("content".into());
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_actions(vec![
+            ("Dump · full (schema + data)".into(), "dump_full".into()),
             ("Dump · schema only (DDL)".into(), "dump_schema_only".into()),
             ("Dump · data only".into(), "dump_data_only".into()),
         ]);
-        self.set_status("dump options · Explorer schema/table scopes the dump", false);
+        self.set_status("dump · choose content mode", false);
+    }
+
+    fn rebuild_dump_multi_palette(&mut self) {
+        let n = self.ui.dump_pick_checked.len();
+        let mut actions = vec![(
+            format!("✓ Continue ({n} selected)"),
+            "dump_multi_done".into(),
+        )];
+        for name in &self.ui.dump_pick_choices {
+            let mark = if self.ui.dump_pick_checked.iter().any(|c| c == name) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            actions.push((format!("{mark} {name}"), format!("dump_pick:{name}")));
+        }
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_actions(actions);
+        self.set_status("dump · Enter toggle · Continue when ready", false);
+    }
+
+    async fn start_dump_pick_schemas(&mut self) {
+        match self.db.list_console_schemas().await {
+            Ok(names) if !names.is_empty() => {
+                self.ui.pending_dump = Some("multi_schemas".into());
+                self.ui.dump_pick_checked.clear();
+                self.ui.dump_pick_choices = names;
+                self.rebuild_dump_multi_palette();
+            }
+            Ok(_) => self.set_status("no schemas found — connect and expand a database", true),
+            Err(e) => self.set_status(format!("dump schemas: {e:#}"), true),
+        }
+    }
+
+    async fn start_dump_pick_databases(&mut self) {
+        match self.db.list_console_databases().await {
+            Ok(names) if !names.is_empty() => {
+                self.ui.pending_dump = Some("multi_dbs".into());
+                self.ui.dump_pick_checked.clear();
+                self.ui.dump_pick_choices = names;
+                self.rebuild_dump_multi_palette();
+            }
+            Ok(_) => self.set_status("no databases found — connect first", true),
+            Err(e) => self.set_status(format!("dump databases: {e:#}"), true),
+        }
+    }
+
+    fn apply_dump_scope_table(&mut self) {
+        self.db.dump_tables.clear();
+        self.db.dump_schemas.clear();
+        self.db.dump_databases.clear();
+        if let Some(e) = self.db.flat.get(self.db.selected) {
+            if matches!(e.kind, ide_db::DbNodeKind::Table | ide_db::DbNodeKind::View) {
+                if let (Some(s), Some(t)) = (&e.schema, &e.table) {
+                    self.db.dump_tables.push((s.clone(), t.clone()));
+                    self.open_dump_content_palette();
+                    return;
+                }
+            }
+        }
+        self.set_status("select a table in Explorer first", true);
+    }
+
+    fn apply_dump_scope_schema(&mut self) {
+        self.db.dump_tables.clear();
+        self.db.dump_schemas.clear();
+        self.db.dump_databases.clear();
+        let schema = self
+            .db
+            .flat
+            .get(self.db.selected)
+            .and_then(|e| e.schema.clone())
+            .or_else(|| self.db.active_schema.clone());
+        if let Some(s) = schema {
+            self.db.dump_schemas.push(s);
+            self.open_dump_content_palette();
+        } else {
+            self.set_status("no schema selected", true);
+        }
+    }
+
+    fn apply_dump_scope_database(&mut self) {
+        self.db.dump_tables.clear();
+        self.db.dump_schemas.clear();
+        self.db.dump_databases.clear();
+        if let Some(db) = self.db.active_database.clone().filter(|s| !s.is_empty()) {
+            self.db.dump_databases.push(db);
+        }
+        self.open_dump_content_palette();
     }
 
     fn confirm_delete_connection(&mut self) -> Result<()> {
@@ -2544,6 +2674,14 @@ impl App {
                         self.start_maintenance_flow(PostgresMaintenance::VacuumAnalyze)
                             .await
                     }
+                    Some("vacuum-full") => {
+                        self.start_maintenance_flow(PostgresMaintenance::VacuumFull)
+                            .await
+                    }
+                    Some("vacuum-full-analyze") => {
+                        self.start_maintenance_flow(PostgresMaintenance::VacuumFullAnalyze)
+                            .await
+                    }
                     Some("analyze-table") => {
                         self.start_maintenance_flow(PostgresMaintenance::Analyze)
                             .await
@@ -3569,6 +3707,8 @@ impl App {
         // Maintenance markers re-resolve the Explorer table and RBAC (#138).
         let maint = match sql.as_str() {
             "__maint_vacuum_analyze__" => Some(PostgresMaintenance::VacuumAnalyze),
+            "__maint_vacuum_full__" => Some(PostgresMaintenance::VacuumFull),
+            "__maint_vacuum_full_analyze__" => Some(PostgresMaintenance::VacuumFullAnalyze),
             "__maint_analyze__" => Some(PostgresMaintenance::Analyze),
             "__maint_reindex__" => Some(PostgresMaintenance::Reindex),
             _ => None,
@@ -3692,15 +3832,16 @@ impl App {
     async fn dump_database(&mut self) -> Result<()> {
         let out_dir = self.workspace.root.join("exports");
         match self.db.dump_database(&out_dir).await {
-            Ok(path) => {
+            Ok(_path) => {
                 self.persist_discovered_tool_paths();
-                self.set_status(format!("dumped {}", path.display()), false);
+                self.set_status(self.db.status.clone(), false);
             }
             Err(e) => self.set_status(format!("dump: {e:#}"), true),
         }
-        // Reset one-shot dump flags after run (#108).
-        self.db.dump_schema_only = false;
-        self.db.dump_data_only = false;
+        self.db.clear_dump_scope();
+        self.ui.pending_dump = None;
+        self.ui.dump_pick_checked.clear();
+        self.ui.dump_pick_choices.clear();
         Ok(())
     }
 
@@ -3712,9 +3853,89 @@ impl App {
         let _ = self.config.save();
     }
 
+    /// Native OS file dialog (rfd). Falls back to typed path if cancelled/unavailable.
     fn start_restore_dump(&mut self) {
-        self.ui.mode = Mode::RestoreDump;
-        self.ui.import_csv_input = self.workspace.root.join("exports").display().to_string() + "/";
+        let exports = self.workspace.root.join("exports");
+        let _ = std::fs::create_dir_all(&exports);
+        // Leave the TUI so the OS dialog can paint on top of the terminal.
+        let mut stdout = io::stdout();
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+        let picked = rfd::FileDialog::new()
+            .set_title("Restore SQL dump")
+            .set_directory(&exports)
+            .add_filter("SQL dump", &["sql", "dump", "backup", "bak"])
+            .add_filter("All files", &["*"])
+            .pick_file();
+        let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+        let _ = enable_raw_mode();
+        match picked {
+            Some(path) => self.prompt_restore_confirm(path),
+            None => {
+                // Fallback: typed path prompt (exports/ seed).
+                self.ui.mode = Mode::RestoreDump;
+                self.ui.import_csv_input = exports.display().to_string() + "/";
+                self.set_status(
+                    "file dialog cancelled — type a dump path · Enter confirm · Esc cancel",
+                    false,
+                );
+            }
+        }
+    }
+
+    fn prompt_restore_confirm(&mut self, path: PathBuf) {
+        self.ui.import_csv_input.clear();
+        self.ui.mode = Mode::Normal;
+        let src = self
+            .db
+            .active_source
+            .as_ref()
+            .and_then(|id| self.db.sources.iter().find(|s| &s.id == id));
+        let Some(src) = src else {
+            self.set_status("restore: no active connection", true);
+            return;
+        };
+        let size = std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let size_h = if size >= 1_048_576 {
+            format!("{:.1} MiB", size as f64 / 1_048_576.0)
+        } else if size >= 1024 {
+            format!("{:.1} KiB", size as f64 / 1024.0)
+        } else {
+            format!("{size} B")
+        };
+        let db = self
+            .db
+            .active_database
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if src.database.is_empty() {
+                    "(default)".into()
+                } else {
+                    src.database.clone()
+                }
+            });
+        self.ui.confirm_apply_pending = false;
+        self.ui.confirm_delete_source_id = None;
+        self.ui.confirm_run_sql = Some(format!("__restore_dump__{}", path.display()));
+        self.ui.confirm_run_source_id = Some(src.id.clone());
+        self.ui.confirm_run_database = self.db.active_database.clone();
+        self.ui.confirm_delete_label = format!(
+            "Restore dump into {driver} · {host}:{port}/{db}?\n\
+             file={path}\n\
+             size≈{size_h}\n\
+             This can overwrite objects. Enter run · Esc cancel",
+            driver = src.driver.label(),
+            host = src.host,
+            port = src.port,
+            path = path.display(),
+        );
+        self.ui.confirm_dialog_title = " restore dump ".into();
+        self.ui.confirm_action_verb = "run".into();
+        self.ui.mode = Mode::ConfirmDeleteSource;
+        self.set_status("confirm restore — Enter run · Esc cancel", true);
     }
 
     fn start_schema_diff(&mut self) {
@@ -3800,57 +4021,7 @@ impl App {
                 self.workspace.root.join(p)
             }
         };
-        // Confirm target before wipe/pollute (#102).
-        let src = self
-            .db
-            .active_source
-            .as_ref()
-            .and_then(|id| self.db.sources.iter().find(|s| &s.id == id));
-        let Some(src) = src else {
-            self.set_status("restore: no active connection", true);
-            return Ok(());
-        };
-        let size = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let size_h = if size >= 1_048_576 {
-            format!("{:.1} MiB", size as f64 / 1_048_576.0)
-        } else if size >= 1024 {
-            format!("{:.1} KiB", size as f64 / 1024.0)
-        } else {
-            format!("{size} B")
-        };
-        let db = self
-            .db
-            .active_database
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                if src.database.is_empty() {
-                    "(default)".into()
-                } else {
-                    src.database.clone()
-                }
-            });
-        self.ui.confirm_apply_pending = false;
-        self.ui.confirm_delete_source_id = None;
-        self.ui.confirm_run_sql = Some(format!("__restore_dump__{}", path.display()));
-        self.ui.confirm_run_source_id = Some(src.id.clone());
-        self.ui.confirm_run_database = self.db.active_database.clone();
-        self.ui.confirm_delete_label = format!(
-            "Restore dump into {driver} · {host}:{port}/{db}?\n\
-             file={path}\n\
-             size≈{size_h}\n\
-             This can overwrite objects. Enter run · Esc cancel",
-            driver = src.driver.label(),
-            host = src.host,
-            port = src.port,
-            path = path.display(),
-        );
-        self.ui.confirm_dialog_title = " restore dump ".into();
-        self.ui.confirm_action_verb = "restore".into();
-        self.ui.mode = Mode::ConfirmDeleteSource;
-        self.set_status("confirm restore — Enter run · Esc cancel", true);
+        self.prompt_restore_confirm(path);
         Ok(())
     }
 
@@ -6655,6 +6826,9 @@ impl App {
                     self.restore_theme_preview();
                     self.ui.pending_maintenance = None;
                     self.ui.pending_dump = None;
+                    self.ui.dump_pick_checked.clear();
+                    self.ui.dump_pick_choices.clear();
+                    self.db.clear_dump_scope();
                 }
                 if self.ui.query_error.is_some() {
                     self.ui.query_error = None;
@@ -8339,6 +8513,17 @@ impl App {
             // Enter keeps the previewed theme — persist happens in theme_* handlers.
             self.theme_before_preview = None;
         }
+        // Dump multi-pick: Enter toggles; Continue advances to content mode.
+        if let Some(name) = item.id.strip_prefix("dump_pick:") {
+            let name = name.to_string();
+            if let Some(pos) = self.ui.dump_pick_checked.iter().position(|c| c == &name) {
+                self.ui.dump_pick_checked.remove(pos);
+            } else {
+                self.ui.dump_pick_checked.push(name);
+            }
+            self.rebuild_dump_multi_palette();
+            return Ok(());
+        }
         // Maintenance picker uses CodeActions palette with dbobj:/maint: ids (#292).
         if self.ui.pending_maintenance.is_some()
             && (item.id.starts_with("dbobj:") || item.id.starts_with("maint:"))
@@ -8348,6 +8533,8 @@ impl App {
                     let op = match key.as_str() {
                         "analyze" => PostgresMaintenance::Analyze,
                         "reindex" => PostgresMaintenance::Reindex,
+                        "vacuum_full" => PostgresMaintenance::VacuumFull,
+                        "vacuum_full_analyze" => PostgresMaintenance::VacuumFullAnalyze,
                         _ => PostgresMaintenance::VacuumAnalyze,
                     };
                     self.start_maintenance_confirm(op);
@@ -8436,6 +8623,8 @@ impl App {
                     let op = match key.as_str() {
                         "analyze" => PostgresMaintenance::Analyze,
                         "reindex" => PostgresMaintenance::Reindex,
+                        "vacuum_full" => PostgresMaintenance::VacuumFull,
+                        "vacuum_full_analyze" => PostgresMaintenance::VacuumFullAnalyze,
                         _ => PostgresMaintenance::VacuumAnalyze,
                     };
                     self.start_maintenance_confirm(op);
@@ -9485,6 +9674,31 @@ impl App {
             "import_csv" => self.start_import_csv(),
             "import_json" => self.start_import_json(),
             "dump_database" => self.start_dump_options(),
+            "dump_scope_table" => self.apply_dump_scope_table(),
+            "dump_scope_schema" => self.apply_dump_scope_schema(),
+            "dump_scope_database" => self.apply_dump_scope_database(),
+            "dump_scope_pick_schemas" => self.start_dump_pick_schemas().await,
+            "dump_scope_pick_databases" => self.start_dump_pick_databases().await,
+            "dump_multi_done" => {
+                let step = self.ui.pending_dump.clone().unwrap_or_default();
+                let picks = self.ui.dump_pick_checked.clone();
+                if picks.is_empty() {
+                    self.set_status("pick at least one item · or Esc cancel", true);
+                    self.rebuild_dump_multi_palette();
+                } else if step == "multi_schemas" {
+                    self.db.dump_tables.clear();
+                    self.db.dump_databases.clear();
+                    self.db.dump_schemas = picks;
+                    self.open_dump_content_palette();
+                } else if step == "multi_dbs" {
+                    self.db.dump_tables.clear();
+                    self.db.dump_schemas.clear();
+                    self.db.dump_databases = picks;
+                    self.open_dump_content_palette();
+                } else {
+                    self.set_status("dump multi-pick: unknown step", true);
+                }
+            }
             "dump_full" => {
                 self.db.dump_schema_only = false;
                 self.db.dump_data_only = false;
@@ -9667,10 +9881,25 @@ impl App {
                 }
             }
             "vacuum_analyze" => {
-                self.start_maintenance_confirm(PostgresMaintenance::VacuumAnalyze)
+                self.start_maintenance_flow(PostgresMaintenance::VacuumAnalyze)
+                    .await
             }
-            "analyze_table" => self.start_maintenance_confirm(PostgresMaintenance::Analyze),
-            "reindex_table" => self.start_maintenance_confirm(PostgresMaintenance::Reindex),
+            "vacuum_full" => {
+                self.start_maintenance_flow(PostgresMaintenance::VacuumFull)
+                    .await
+            }
+            "vacuum_full_analyze" => {
+                self.start_maintenance_flow(PostgresMaintenance::VacuumFullAnalyze)
+                    .await
+            }
+            "analyze_table" => {
+                self.start_maintenance_flow(PostgresMaintenance::Analyze)
+                    .await
+            }
+            "reindex_table" => {
+                self.start_maintenance_flow(PostgresMaintenance::Reindex)
+                    .await
+            }
             "inspect_privileges" => match self.db.inspect_table_privileges().await {
                 Ok(()) => {
                     self.ui.focus = Focus::Results;

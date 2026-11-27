@@ -242,10 +242,14 @@ pub struct UiState {
     /// Results: per-column width override delta (col_index → delta chars) (#31).
     pub results_col_width_delta: std::collections::HashMap<usize, isize>,
     /// After maintenance target palette picks a table, run this op (#292).
-    /// Values: `vacuum_analyze` | `analyze` | `reindex`.
+    /// Values: `vacuum_analyze` | `vacuum_full` | `vacuum_full_analyze` | `analyze` | `reindex`.
     pub pending_maintenance: Option<String>,
-    /// After dump-options palette, run dump with these flags (#108).
+    /// Dump wizard step: `scope` | `multi_schemas` | `multi_dbs` | `content`.
     pub pending_dump: Option<String>,
+    /// Names checked in dump multi-pick palette.
+    pub dump_pick_checked: Vec<String>,
+    /// Candidate names for the current dump multi-pick.
+    pub dump_pick_choices: Vec<String>,
 }
 
 /// Which column is active on DB Home.
@@ -363,6 +367,8 @@ impl Default for UiState {
             table_filter_order_edit: String::new(),
             pending_maintenance: None,
             pending_dump: None,
+            dump_pick_checked: Vec::new(),
+            dump_pick_choices: Vec::new(),
         }
     }
 }
