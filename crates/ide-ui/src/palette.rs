@@ -778,8 +778,8 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
         height,
     };
 
-    // Opaque Hop-style scrim — Clear alone leaves chrome ghosts.
-    crate::widgets::paint_scrim(frame, screen);
+    // Solid black — no frosted dither behind Actions / Vacuum picker.
+    crate::widgets::paint_scrim_solid(frame, screen);
     frame.render_widget(Clear, area);
 
     let title = match palette.mode {

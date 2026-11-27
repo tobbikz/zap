@@ -6094,31 +6094,32 @@ fn admin_overview_kpi_lines(result: &ide_db::QueryResult, width: usize) -> Vec<L
         theme::style_faint(),
     )));
     lines.push(Line::from(""));
-    // Two KPIs per row when wide enough.
-    let card_w = ((width.saturating_sub(2)) / 2).max(18).min(36);
+    // Fixed two-column grid — same label/value widths every row so columns line up.
+    let sep = " │ ";
+    let sep_w = display_width(sep);
+    let col_w = ((width.saturating_sub(sep_w)) / 2).max(18);
+    let value_w = 8usize.min(col_w / 3).max(4);
+    let label_w = col_w.saturating_sub(value_w + 1).max(8);
     let mut i = 0usize;
     while i < result.rows.len() {
         let mut spans: Vec<Span> = Vec::new();
         for j in 0..2 {
+            if j > 0 {
+                spans.push(Span::styled(sep.to_string(), theme::style_faint()));
+            }
             if let Some(row) = result.rows.get(i + j) {
                 let metric = row.first().map(|s| s.as_str()).unwrap_or("?");
                 let value = row.get(1).map(|s| s.as_str()).unwrap_or("—");
-                let label = truncate_chars(metric, card_w.saturating_sub(value.chars().count() + 3));
-                let pad = card_w
-                    .saturating_sub(display_width(&label) + display_width(value) + 1)
-                    .min(8);
-                if j > 0 {
-                    spans.push(Span::raw("  "));
-                }
+                let label = pad_display(&truncate_chars(metric, label_w), label_w);
+                let val = pad_display_left(&truncate_chars(value, value_w), value_w);
+                spans.push(Span::styled(label, theme::style_faint()));
+                spans.push(Span::raw(" "));
                 spans.push(Span::styled(
-                    format!(" {label}"),
-                    theme::style_faint(),
-                ));
-                spans.push(Span::raw(" ".repeat(pad.max(1))));
-                spans.push(Span::styled(
-                    format!("{value} "),
+                    val,
                     theme::style_text().add_modifier(Modifier::BOLD),
                 ));
+            } else {
+                spans.push(Span::raw(" ".repeat(col_w)));
             }
         }
         lines.push(Line::from(spans));
@@ -6131,6 +6132,15 @@ fn admin_overview_kpi_lines(result: &ide_db::QueryResult, width: usize) -> Vec<L
         )));
     }
     lines
+}
+
+fn pad_display_left(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        truncate_chars(s, width)
+    } else {
+        format!("{}{s}", " ".repeat(width - w))
+    }
 }
 
 fn admin_col_idx(columns: &[String], names: &[&str]) -> Option<usize> {

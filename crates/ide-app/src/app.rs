@@ -3931,6 +3931,8 @@ impl App {
             .and_then(|id| self.db.sources.iter().find(|s| &s.id == id))
             .map(|s| s.driver)
             .unwrap_or_default();
+        // Group roles (e.g. dba_role) often have no direct table grants — fall back to
+        // membership so Enter never opens an empty privileges grid.
         let sql = match driver {
             DbDriver::Mysql => format!(
                 "SELECT GRANTEE AS grantee, TABLE_SCHEMA AS table_schema,\n\
@@ -3951,6 +3953,48 @@ impl App {
                  WHERE USER_NAME(p.grantee_principal_id) = N'{lit}'\n\
                    AND p.class_desc = 'OBJECT_OR_COLUMN'\n\
                  ORDER BY 2, 3, 4;"
+            ),
+            DbDriver::Postgres => format!(
+                "WITH grants AS (\n\
+                 SELECT 'table'::text AS scope, table_schema AS object,\n\
+                        table_name AS name, privilege_type, is_grantable\n\
+                 FROM information_schema.table_privileges\n\
+                 WHERE grantee = '{lit}'\n\
+                 UNION ALL\n\
+                 SELECT 'schema', object_schema, object_name, privilege_type, is_grantable\n\
+                 FROM information_schema.usage_privileges\n\
+                 WHERE grantee = '{lit}' AND object_type = 'SCHEMA'\n\
+                 UNION ALL\n\
+                 SELECT 'role_table', table_schema, table_name, privilege_type, is_grantable\n\
+                 FROM information_schema.role_table_grants\n\
+                 WHERE grantee = '{lit}'\n\
+                 ),\n\
+                 members AS (\n\
+                 SELECT 'has_member'::text AS scope,\n\
+                        m.rolname AS object,\n\
+                        CASE WHEN m.rolcanlogin THEN 'login' ELSE 'role' END AS name,\n\
+                        'member'::text AS privilege_type,\n\
+                        CASE WHEN am.admin_option THEN 'YES' ELSE 'NO' END AS is_grantable\n\
+                 FROM pg_roles r\n\
+                 JOIN pg_auth_members am ON am.roleid = r.oid\n\
+                 JOIN pg_roles m ON m.oid = am.member\n\
+                 WHERE r.rolname = '{lit}'\n\
+                 UNION ALL\n\
+                 SELECT 'member_of', p.rolname,\n\
+                        CASE WHEN p.rolcanlogin THEN 'login' ELSE 'role' END,\n\
+                        'inherits',\n\
+                        CASE WHEN am.admin_option THEN 'YES' ELSE 'NO' END\n\
+                 FROM pg_roles r\n\
+                 JOIN pg_auth_members am ON am.member = r.oid\n\
+                 JOIN pg_roles p ON p.oid = am.roleid\n\
+                 WHERE r.rolname = '{lit}'\n\
+                 )\n\
+                 SELECT * FROM grants\n\
+                 UNION ALL\n\
+                 SELECT * FROM members\n\
+                 WHERE NOT EXISTS (SELECT 1 FROM grants)\n\
+                 ORDER BY 1, 2, 3, 4\n\
+                 LIMIT 2000;"
             ),
             _ => format!(
                 "SELECT grantee, table_schema, table_name, privilege_type, is_grantable\n\
