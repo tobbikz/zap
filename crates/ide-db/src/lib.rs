@@ -680,6 +680,69 @@ impl ExplorerTypeFilter {
     }
 }
 
+/// Hit from catalog Search Everywhere (#10) — independent of explorer expand state.
+#[derive(Debug, Clone)]
+pub struct CatalogHit {
+    pub source_id: String,
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub name: String,
+    /// `schema` | `table` | `view` | `matview` | `routine` | `column`
+    pub kind: String,
+    /// Parent table when `kind == "column"`.
+    pub parent: Option<String>,
+}
+
+impl CatalogHit {
+    pub fn palette_id(&self) -> String {
+        format!(
+            "dbcat:{}|{}|{}|{}|{}|{}",
+            self.source_id,
+            self.database.as_deref().unwrap_or(""),
+            self.schema.as_deref().unwrap_or(""),
+            self.kind,
+            self.parent.as_deref().unwrap_or(""),
+            self.name
+        )
+    }
+
+    pub fn parse_palette_id(id: &str) -> Option<Self> {
+        let rest = id.strip_prefix("dbcat:")?;
+        let mut parts = rest.splitn(6, '|');
+        let source_id = parts.next()?.to_string();
+        let database = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        let schema = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        let kind = parts.next()?.to_string();
+        let parent = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        let name = parts.next()?.to_string();
+        Some(Self {
+            source_id,
+            database,
+            schema,
+            name,
+            kind,
+            parent,
+        })
+    }
+
+    pub fn subtitle(&self) -> String {
+        let loc = match (&self.database, &self.schema) {
+            (Some(d), Some(s)) if !d.is_empty() => format!("{d}.{s}"),
+            (_, Some(s)) => s.clone(),
+            (Some(d), _) => d.clone(),
+            _ => self.source_id.clone(),
+        };
+        if let Some(parent) = &self.parent {
+            format!("{} · {}.{}", self.kind, loc, parent)
+        } else {
+            format!("{} · {loc}", self.kind)
+        }
+    }
+}
+
+/// Soft-cap objects shown under a schema folder so Explorer stays scrollable (#5).
+pub const EXPLORER_FOLDER_SOFT_CAP: usize = 400;
+
 #[derive(Debug, Clone)]
 pub struct DbTreeNode {
     pub id: String,
@@ -7941,9 +8004,419 @@ impl DbWorkspace {
             }
             // Open Tables / Views / MatViews (+ Partitions) so the leaf is visible (#7 / #6).
             expand_folders_to_relation(&mut self.tree, &sid, table);
+            // Soft-capped folders may omit the target — inject so jump still works (#5 / #10).
+            ensure_relation_visible(
+                &mut self.tree,
+                &sid,
+                source_id,
+                database,
+                schema,
+                table,
+            );
             self.rebuild_flat();
         }
         Ok(self.select_table_in_explorer(source_id, database, schema, table))
+    }
+
+    /// Catalog search for Search Everywhere — not limited to expanded explorer rows (#10).
+    /// Prefix / substring match; skips partition children and temp schemas; hard-capped.
+    pub async fn search_catalog(
+        &mut self,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<CatalogHit>> {
+        let limit = limit.clamp(1, 500);
+        let needle = needle.trim();
+        let mut out = Vec::new();
+        let sources: Vec<(String, Option<String>)> = {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut list = Vec::new();
+            if let Some(id) = &self.active_source {
+                let db = self.active_database.clone();
+                seen.insert(id.clone());
+                list.push((id.clone(), db));
+            }
+            for e in &self.flat {
+                if seen.insert(e.source_id.clone()) {
+                    list.push((e.source_id.clone(), e.database.clone()));
+                }
+            }
+            for s in &self.sources {
+                if seen.insert(s.id.clone()) {
+                    list.push((s.id.clone(), None));
+                }
+            }
+            list
+        };
+        for (source_id, database) in sources {
+            if out.len() >= limit {
+                break;
+            }
+            if self.ensure_connected(&source_id, database.as_deref()).await.is_err() {
+                continue;
+            }
+            let budget = limit.saturating_sub(out.len());
+            match self
+                .search_catalog_on_source(&source_id, database.as_deref(), needle, budget)
+                .await
+            {
+                Ok(mut hits) => out.append(&mut hits),
+                Err(_) => continue,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn search_catalog_on_source(
+        &self,
+        source_id: &str,
+        database: Option<&str>,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<CatalogHit>> {
+        let key = Self::pool_key(source_id, database);
+        let pool = self.pools.get(&key).context("not connected")?;
+        let db_owned = database.map(|s| s.to_string());
+        let like = if needle.is_empty() {
+            "%".into()
+        } else {
+            format!("%{}%", needle.replace('%', r"\%").replace('_', r"\_"))
+        };
+        let mut out = Vec::new();
+        match pool {
+            LivePool::Pg(p) => {
+                // Schemas
+                let schemas = sqlx::query(
+                    "SELECT nspname AS name FROM pg_namespace \
+                     WHERE nspname NOT IN ('information_schema') \
+                       AND nspname !~ '^pg_' \
+                       AND ($1 = '%' OR nspname ILIKE $1 ESCAPE '\\') \
+                     ORDER BY 1 LIMIT 40",
+                )
+                .bind(&like)
+                .fetch_all(p)
+                .await
+                .unwrap_or_default();
+                for r in schemas {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    let name: String = r.get("name");
+                    if !is_user_pg_schema(&name) {
+                        continue;
+                    }
+                    out.push(CatalogHit {
+                        source_id: source_id.into(),
+                        database: db_owned.clone(),
+                        schema: Some(name.clone()),
+                        name,
+                        kind: "schema".into(),
+                        parent: None,
+                    });
+                }
+                let rel_limit = limit.saturating_sub(out.len()).min(300);
+                if rel_limit > 0 {
+                    let rows = sqlx::query(
+                        "SELECT n.nspname AS schema, c.relname AS name, \
+                                CASE c.relkind \
+                                  WHEN 'v' THEN 'view' \
+                                  WHEN 'm' THEN 'matview' \
+                                  ELSE 'table' END AS kind \
+                         FROM pg_class c \
+                         JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE c.relkind IN ('r','p','v','m') \
+                           AND NOT c.relispartition \
+                           AND n.nspname NOT IN ('pg_catalog','information_schema') \
+                           AND n.nspname !~ '^pg_' \
+                           AND ($1 = '%' OR c.relname ILIKE $1 ESCAPE '\\' \
+                                OR n.nspname ILIKE $1 ESCAPE '\\') \
+                         ORDER BY n.nspname, c.relname \
+                         LIMIT $2",
+                    )
+                    .bind(&like)
+                    .bind(rel_limit as i64)
+                    .fetch_all(p)
+                    .await
+                    .unwrap_or_default();
+                    for r in rows {
+                        if out.len() >= limit {
+                            break;
+                        }
+                        let schema: String = r.get("schema");
+                        let name: String = r.get("name");
+                        let kind: String = r.get("kind");
+                        out.push(CatalogHit {
+                            source_id: source_id.into(),
+                            database: db_owned.clone(),
+                            schema: Some(schema),
+                            name,
+                            kind,
+                            parent: None,
+                        });
+                    }
+                }
+                let rtn_limit = limit.saturating_sub(out.len()).min(80);
+                if rtn_limit > 0 {
+                    let rows = sqlx::query(
+                        "SELECT n.nspname AS schema, p.proname AS name \
+                         FROM pg_proc p \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace \
+                         WHERE n.nspname NOT IN ('pg_catalog','information_schema') \
+                           AND n.nspname !~ '^pg_' \
+                           AND ($1 = '%' OR p.proname ILIKE $1 ESCAPE '\\') \
+                         ORDER BY 1, 2 LIMIT $2",
+                    )
+                    .bind(&like)
+                    .bind(rtn_limit as i64)
+                    .fetch_all(p)
+                    .await
+                    .unwrap_or_default();
+                    for r in rows {
+                        if out.len() >= limit {
+                            break;
+                        }
+                        out.push(CatalogHit {
+                            source_id: source_id.into(),
+                            database: db_owned.clone(),
+                            schema: Some(r.get("schema")),
+                            name: r.get("name"),
+                            kind: "routine".into(),
+                            parent: None,
+                        });
+                    }
+                }
+                // Columns only when the user typed something (keeps empty open snappy).
+                let col_limit = if needle.is_empty() {
+                    0
+                } else {
+                    limit.saturating_sub(out.len()).min(60)
+                };
+                if col_limit > 0 {
+                    let rows = sqlx::query(
+                        "SELECT table_schema AS schema, table_name AS parent, column_name AS name \
+                         FROM information_schema.columns \
+                         WHERE table_schema NOT IN ('pg_catalog','information_schema') \
+                           AND table_schema !~ '^pg_' \
+                           AND column_name ILIKE $1 ESCAPE '\\' \
+                         ORDER BY 1, 2, 3 LIMIT $2",
+                    )
+                    .bind(&like)
+                    .bind(col_limit as i64)
+                    .fetch_all(p)
+                    .await
+                    .unwrap_or_default();
+                    for r in rows {
+                        if out.len() >= limit {
+                            break;
+                        }
+                        out.push(CatalogHit {
+                            source_id: source_id.into(),
+                            database: db_owned.clone(),
+                            schema: Some(r.get("schema")),
+                            name: r.get("name"),
+                            kind: "column".into(),
+                            parent: Some(r.get("parent")),
+                        });
+                    }
+                }
+            }
+            LivePool::Mysql(p) => {
+                let db = database.unwrap_or("");
+                let rows = sqlx::query(
+                    "SELECT table_schema AS schema, table_name AS name, \
+                            CASE WHEN table_type LIKE '%VIEW%' THEN 'view' ELSE 'table' END AS kind \
+                     FROM information_schema.tables \
+                     WHERE table_schema = ? \
+                       AND (? = '%' OR table_name LIKE ? ESCAPE '\\\\') \
+                     ORDER BY 1, 2 LIMIT ?",
+                )
+                .bind(db)
+                .bind(&like)
+                .bind(&like)
+                .bind(limit as i64)
+                .fetch_all(p)
+                .await
+                .unwrap_or_default();
+                for r in rows {
+                    out.push(CatalogHit {
+                        source_id: source_id.into(),
+                        database: db_owned.clone(),
+                        schema: Some(r.get("schema")),
+                        name: r.get("name"),
+                        kind: r.get("kind"),
+                        parent: None,
+                    });
+                }
+            }
+            LivePool::Mssql(c) => {
+                let esc = needle.replace('\'', "''");
+                let schema_filter = if needle.is_empty() {
+                    String::new()
+                } else {
+                    format!("AND (t.name LIKE N'%{esc}%' OR s.name LIKE N'%{esc}%')")
+                };
+                let Ok(qr) = engines::exec_mssql(
+                    c,
+                    &format!(
+                        "SELECT TOP {limit} s.name AS schema_name, t.name AS name, \
+                                CASE WHEN t.type IN ('V') THEN 'view' ELSE 'table' END AS kind \
+                         FROM sys.objects t \
+                         JOIN sys.schemas s ON s.schema_id = t.schema_id \
+                         WHERE t.type IN ('U','V') {schema_filter} \
+                         ORDER BY s.name, t.name"
+                    ),
+                )
+                .await
+                else {
+                    return Ok(out);
+                };
+                for row in qr.rows {
+                    if row.len() < 3 {
+                        continue;
+                    }
+                    out.push(CatalogHit {
+                        source_id: source_id.into(),
+                        database: db_owned.clone(),
+                        schema: Some(row[0].clone()),
+                        name: row[1].clone(),
+                        kind: row[2].clone(),
+                        parent: None,
+                    });
+                }
+            }
+            LivePool::Sqlite(_) | LivePool::Duckdb(_) => {
+                // Fall back to schema_cache / introspect flat names when connected.
+                let flat = self
+                    .introspect_tables(source_id, database, "main")
+                    .await
+                    .unwrap_or_default();
+                let nlow = needle.to_ascii_lowercase();
+                for n in flat {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    let name = n.table.unwrap_or_default();
+                    if !nlow.is_empty() && !name.to_ascii_lowercase().contains(&nlow) {
+                        continue;
+                    }
+                    let kind = if n.kind == DbNodeKind::View {
+                        "view"
+                    } else {
+                        "table"
+                    };
+                    out.push(CatalogHit {
+                        source_id: source_id.into(),
+                        database: db_owned.clone(),
+                        schema: n.schema,
+                        name,
+                        kind: kind.into(),
+                        parent: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+        Ok(out)
+    }
+
+    /// Reveal a catalog hit in Explorer (expand folders / select) (#10).
+    pub async fn reveal_catalog_hit(&mut self, hit: &CatalogHit) -> Result<bool> {
+        match hit.kind.as_str() {
+            "schema" => {
+                let schema = hit.schema.as_deref().unwrap_or(hit.name.as_str());
+                self.ensure_connected(&hit.source_id, hit.database.as_deref())
+                    .await?;
+                // Select schema row if present; expand source/db as needed via rebuild.
+                for (i, e) in self.flat.iter().enumerate() {
+                    if e.source_id == hit.source_id
+                        && e.kind == DbNodeKind::Schema
+                        && e.schema.as_deref() == Some(schema)
+                    {
+                        self.selected = i;
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            "table" | "view" | "matview" => {
+                let schema = hit.schema.as_deref().unwrap_or("public");
+                self.expand_and_select_table(
+                    &hit.source_id,
+                    hit.database.as_deref(),
+                    schema,
+                    &hit.name,
+                )
+                .await
+            }
+            "column" => {
+                let schema = hit.schema.as_deref().unwrap_or("public");
+                let table = hit.parent.as_deref().unwrap_or("");
+                if table.is_empty() {
+                    return Ok(false);
+                }
+                let ok = self
+                    .expand_and_select_table(
+                        &hit.source_id,
+                        hit.database.as_deref(),
+                        schema,
+                        table,
+                    )
+                    .await?;
+                if ok {
+                    let _ = self.refresh_structure_for_selection().await;
+                }
+                Ok(ok)
+            }
+            "routine" => {
+                let schema = hit.schema.as_deref().unwrap_or("public");
+                // Expand schema folders then select routine by name in flat.
+                let _ = self
+                    .expand_and_select_table(
+                        &hit.source_id,
+                        hit.database.as_deref(),
+                        schema,
+                        &hit.name,
+                    )
+                    .await;
+                for (i, e) in self.flat.iter().enumerate() {
+                    if e.source_id == hit.source_id
+                        && e.kind == DbNodeKind::Routine
+                        && e.table.as_deref() == Some(hit.name.as_str())
+                        && e.schema.as_deref() == Some(schema)
+                    {
+                        self.selected = i;
+                        return Ok(true);
+                    }
+                }
+                // Expand Functions/Procedures folders explicitly.
+                if let Some(sid) = self.flat.iter().find_map(|e| {
+                    (e.source_id == hit.source_id
+                        && e.kind == DbNodeKind::Schema
+                        && e.schema.as_deref() == Some(schema))
+                    .then(|| e.id.clone())
+                }) {
+                    if let Some(schema_node) = find_node_mut(&mut self.tree, &sid) {
+                        schema_node.expanded = true;
+                        for folder in &mut schema_node.children {
+                            if folder.kind == DbNodeKind::Group {
+                                folder.expanded = true;
+                            }
+                        }
+                    }
+                    self.rebuild_flat();
+                    for (i, e) in self.flat.iter().enumerate() {
+                        if e.kind == DbNodeKind::Routine
+                            && e.table.as_deref() == Some(hit.name.as_str())
+                        {
+                            self.selected = i;
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Explorer selection or bound table tab → `(source_id, database, schema, table)`.
@@ -10412,9 +10885,44 @@ fn push_folder_if(
     if children.is_empty() {
         return;
     }
+    let children = soft_cap_folder_children(source_id, database.clone(), schema, slug, children);
     out.push(object_folder(
         source_id, database, schema, slug, label, children,
     ));
+}
+
+fn soft_cap_folder_children(
+    source_id: &str,
+    database: Option<String>,
+    schema: &str,
+    slug: &str,
+    mut children: Vec<DbTreeNode>,
+) -> Vec<DbTreeNode> {
+    // Only cap large relation folders — routines/types stay complete when smaller.
+    if !matches!(slug, "tables" | "views" | "matviews") {
+        return children;
+    }
+    if children.len() <= EXPLORER_FOLDER_SOFT_CAP {
+        return children;
+    }
+    let rest = children.len() - EXPLORER_FOLDER_SOFT_CAP;
+    children.truncate(EXPLORER_FOLDER_SOFT_CAP);
+    let id_db = database.clone().unwrap_or_default();
+    children.push(DbTreeNode {
+        id: format!("{source_id}::overflow::{id_db}::{schema}::{slug}"),
+        label: format!("… +{rest} more · / filter or Ctrl-Shift-A"),
+        kind: DbNodeKind::AdminQuery,
+        source_id: source_id.into(),
+        database,
+        schema: Some(schema.into()),
+        table: None,
+        query_sql: Some(
+            "-- folder truncated for Explorer speed (#5) — use / or Search Everywhere".into(),
+        ),
+        children: Vec::new(),
+        expanded: false,
+    });
+    children
 }
 
 fn group_relation_folders(
@@ -10466,6 +10974,63 @@ fn group_relation_folders(
         matviews,
     );
     folders
+}
+
+/// If soft-cap hid `table`, append it under Tables so jump-to still works (#5 / #10).
+fn ensure_relation_visible(
+    tree: &mut [DbTreeNode],
+    schema_id: &str,
+    source_id: &str,
+    database: Option<&str>,
+    schema: &str,
+    table: &str,
+) {
+    let Some(schema_node) = find_node_mut(tree, schema_id) else {
+        return;
+    };
+    let already = schema_node.children.iter().any(|folder| {
+        folder.children.iter().any(|c| c.table.as_deref() == Some(table))
+            || folder.children.iter().any(|c| {
+                c.children.iter().any(|g| {
+                    g.children
+                        .iter()
+                        .any(|p| p.table.as_deref() == Some(table))
+                })
+            })
+    });
+    if already {
+        return;
+    }
+    let node = relation_node(
+        source_id,
+        database.map(|s| s.to_string()),
+        schema,
+        table,
+        "BASE TABLE",
+    );
+    if let Some(tables) = schema_node
+        .children
+        .iter_mut()
+        .find(|f| f.table.as_deref() == Some("tables"))
+    {
+        tables.expanded = true;
+        tables.children.insert(0, node);
+    } else {
+        schema_node.children.insert(
+            0,
+            object_folder(
+                source_id,
+                database.map(|s| s.to_string()),
+                schema,
+                "tables",
+                "Tables",
+                vec![node],
+            ),
+        );
+        if let Some(f) = schema_node.children.first_mut() {
+            f.expanded = true;
+        }
+    }
 }
 
 /// Expand Tables/Views/MatViews (+ Partitions) so `table` is reachable without manual open (#7).
@@ -14185,6 +14750,24 @@ mod explorer_schema_filter_tests {
         assert!(!is_user_pg_schema("pg_temp_20"));
         assert!(!is_user_pg_schema("pg_toast_temp_20"));
         assert!(!is_user_pg_schema(""));
+    }
+
+    #[test]
+    fn catalog_hit_palette_id_roundtrip() {
+        let hit = CatalogHit {
+            source_id: "pg1".into(),
+            database: Some("app".into()),
+            schema: Some("public".into()),
+            name: "orders".into(),
+            kind: "table".into(),
+            parent: None,
+        };
+        let id = hit.palette_id();
+        let parsed = CatalogHit::parse_palette_id(&id).expect("parse");
+        assert_eq!(parsed.source_id, "pg1");
+        assert_eq!(parsed.name, "orders");
+        assert_eq!(parsed.kind, "table");
+        assert_eq!(parsed.schema.as_deref(), Some("public"));
     }
 
     #[test]

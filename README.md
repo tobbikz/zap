@@ -160,6 +160,7 @@ Windows PowerShell uses square borders and Consolas-safe icons automatically. In
 | `Enter` | Inspect (Results) / open (Explorer) |
 | `f` / `U` | Explorer type filter · toggle system schemas |
 | `←` `→` | Explorer collapse / expand folder (partitions) |
+| `Ctrl-Shift-A` | Search Everywhere (catalog · Tab scopes) |
 | `w` / `o` | WHERE / ORDER BY |
 | `m` | Results actions |
 | `?` | Help |

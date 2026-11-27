@@ -23,7 +23,7 @@ pub enum PaletteMode {
     DbObjects,
     /// Create menu (New query / schema / table / …).
     Create,
-    /// Search Everywhere — tools + commands + DB objects.
+    /// Search Everywhere — tools + commands + DB catalog (#10).
     SearchEverywhere,
     /// Console toolbar: pick database (catalog).
     ConsoleDatabase,
@@ -42,6 +42,49 @@ pub struct PaletteItem {
     pub subtitle: Option<String>,
 }
 
+/// Scope chip for Search Everywhere (#10). Tab cycles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchEverywhereScope {
+    #[default]
+    All,
+    Database,
+    Actions,
+    Files,
+}
+
+impl SearchEverywhereScope {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::All => Self::Database,
+            Self::Database => Self::Actions,
+            Self::Actions => Self::Files,
+            Self::Files => Self::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Database => "Database",
+            Self::Actions => "Actions",
+            Self::Files => "Files",
+        }
+    }
+
+    fn matches_item(self, id: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Database => id.starts_with("dbcat:") || id.starts_with("dbobj:"),
+            Self::Actions => {
+                !id.starts_with("dbcat:")
+                    && !id.starts_with("dbobj:")
+                    && !id.starts_with("filetab:")
+            }
+            Self::Files => id.starts_with("filetab:"),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Palette {
     pub mode: PaletteMode,
@@ -49,6 +92,8 @@ pub struct Palette {
     pub items: Vec<PaletteItem>,
     pub filtered: Vec<usize>,
     pub selected: usize,
+    /// Search Everywhere scope (#10).
+    pub everywhere_scope: SearchEverywhereScope,
 }
 
 impl Palette {
@@ -250,6 +295,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -283,6 +329,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -320,6 +367,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -341,6 +389,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -362,6 +411,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -406,6 +456,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -427,6 +478,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -449,14 +501,18 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
     }
 
-    /// Tools first, then optional DB objects, then remaining commands.
+    /// Tools + catalog hits + open SQL tabs + commands (#10).
+    /// `catalog`: (label, subtitle, palette_id) from `CatalogHit`.
+    /// `file_tabs`: (label, subtitle, filetab:idx).
     pub fn open_search_everywhere(
-        db_objects: Vec<(String, String, String)>,
+        catalog: Vec<(String, String, String)>,
+        file_tabs: Vec<(String, String, String)>,
     ) -> Self {
         let mut items = vec![
             item("Git", "git"),
@@ -471,15 +527,22 @@ impl Palette {
             item("Set console database…", "console_database"),
             item("Set console schema…", "console_schema"),
         ];
-        for (label, subtitle, flat_idx) in db_objects {
+        for (label, subtitle, id) in catalog {
             items.push(PaletteItem {
                 label,
-                id: format!("dbobj:{flat_idx}"),
+                id,
                 path: None,
                 subtitle: Some(subtitle),
             });
         }
-        // Append a trimmed command set (skip duplicates already listed).
+        for (label, subtitle, id) in file_tabs {
+            items.push(PaletteItem {
+                label,
+                id,
+                path: None,
+                subtitle: Some(subtitle),
+            });
+        }
         for it in Self::open_commands().items {
             if items.iter().any(|e| e.id == it.id) {
                 continue;
@@ -492,9 +555,59 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
+    }
+
+    /// Replace catalog (`dbcat:`) rows while keeping actions / file tabs (#10).
+    pub fn replace_everywhere_catalog(&mut self, catalog: Vec<(String, String, String)>) {
+        self.items
+            .retain(|it| !it.id.starts_with("dbcat:") && !it.id.starts_with("dbobj:"));
+        // Insert catalog after the pinned tool block (first ~11 items).
+        let insert_at = self
+            .items
+            .iter()
+            .position(|it| {
+                !matches!(
+                    it.id.as_str(),
+                    "git"
+                        | "terminal"
+                        | "debug"
+                        | "outline"
+                        | "search"
+                        | "script_object"
+                        | "create_menu"
+                        | "db_object_search"
+                        | "new_tab"
+                        | "console_database"
+                        | "console_schema"
+                )
+            })
+            .unwrap_or(self.items.len());
+        let mut pos = insert_at;
+        for (label, subtitle, id) in catalog {
+            self.items.insert(
+                pos,
+                PaletteItem {
+                    label,
+                    id,
+                    path: None,
+                    subtitle: Some(subtitle),
+                },
+            );
+            pos += 1;
+        }
+        self.refilter();
+    }
+
+    pub fn cycle_everywhere_scope(&mut self) {
+        if self.mode != PaletteMode::SearchEverywhere {
+            return;
+        }
+        self.everywhere_scope = self.everywhere_scope.cycle();
+        self.refilter();
     }
 
     pub fn open_console_databases(names: Vec<String>) -> Self {
@@ -513,6 +626,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -534,6 +648,7 @@ impl Palette {
             items,
             filtered: Vec::new(),
             selected: 0,
+            everywhere_scope: SearchEverywhereScope::All,
         };
         p.refilter();
         p
@@ -547,8 +662,17 @@ impl Palette {
     }
 
     pub fn refilter(&mut self) {
+        let scope = self.everywhere_scope;
+        let in_everywhere = self.mode == PaletteMode::SearchEverywhere;
+        let scope_ok = |id: &str| !in_everywhere || scope.matches_item(id);
         if self.query.is_empty() {
-            self.filtered = (0..self.items.len()).collect();
+            self.filtered = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| scope_ok(&it.id))
+                .map(|(i, _)| i)
+                .collect();
         } else {
             let mut matcher = Matcher::new(Config::DEFAULT);
             let pattern = Pattern::new(
@@ -561,6 +685,7 @@ impl Palette {
                 .items
                 .iter()
                 .enumerate()
+                .filter(|(_, it)| scope_ok(&it.id))
                 .filter_map(|(i, it)| {
                     let text = Self::haystack(it);
                     let mut buf = Vec::new();
@@ -569,6 +694,21 @@ impl Palette {
                 })
                 .collect();
             scored.sort_by(|a, b| b.1.cmp(&a.1));
+            // Cap Database hits so huge catalogs stay responsive (#10).
+            if in_everywhere && matches!(scope, SearchEverywhereScope::Database | SearchEverywhereScope::All)
+            {
+                let mut db_kept = 0usize;
+                scored.retain(|(i, _)| {
+                    let id = &self.items[*i].id;
+                    if id.starts_with("dbcat:") || id.starts_with("dbobj:") {
+                        if db_kept >= 120 {
+                            return false;
+                        }
+                        db_kept += 1;
+                    }
+                    true
+                });
+            }
             self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         }
         if self.selected >= self.filtered.len() {
@@ -643,17 +783,22 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
     frame.render_widget(Clear, area);
 
     let title = match palette.mode {
-        PaletteMode::Commands => " Commands ",
-        PaletteMode::Files => " Open file ",
-        PaletteMode::CodeActions => " Actions ",
-        PaletteMode::Projects => " Projects ",
-        PaletteMode::Workspaces => " Workspaces ",
-        PaletteMode::DbObjects => " Find object ",
-        PaletteMode::Create => " New ",
-        PaletteMode::SearchEverywhere => " Search everywhere ",
-        PaletteMode::ConsoleDatabase => " Database ",
-        PaletteMode::ConsoleSchema => " Schema ",
-        PaletteMode::ResultsActions => " Results · actions ",
+        PaletteMode::Commands => " Commands ".to_string(),
+        PaletteMode::Files => " Open file ".to_string(),
+        PaletteMode::CodeActions => " Actions ".to_string(),
+        PaletteMode::Projects => " Projects ".to_string(),
+        PaletteMode::Workspaces => " Workspaces ".to_string(),
+        PaletteMode::DbObjects => " Find object ".to_string(),
+        PaletteMode::Create => " New ".to_string(),
+        PaletteMode::SearchEverywhere => {
+            format!(
+                " Search everywhere · {} · Tab scope ",
+                palette.everywhere_scope.label()
+            )
+        }
+        PaletteMode::ConsoleDatabase => " Database ".to_string(),
+        PaletteMode::ConsoleSchema => " Schema ".to_string(),
+        PaletteMode::ResultsActions => " Results · actions ".to_string(),
     };
 
     frame.render_widget(

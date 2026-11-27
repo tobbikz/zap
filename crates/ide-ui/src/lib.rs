@@ -1169,8 +1169,24 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
     let inner_h = area.height.saturating_sub(2) as usize;
     let scroll = db.map(|ws| ws.explorer_scroll).unwrap_or(0);
     let items: Vec<ListItem> = match db {
-        Some(ws) if !ws.flat.is_empty() => ws
-            .flat
+        Some(ws) if !ws.flat.is_empty() => {
+            // One source lookup map per frame — avoid O(rows × sources) (#5).
+            let mut src_meta: std::collections::HashMap<
+                &str,
+                (Color, &'static str, Option<&str>, bool),
+            > = std::collections::HashMap::new();
+            for s in &ws.sources {
+                src_meta.insert(
+                    s.id.as_str(),
+                    (
+                        parse_accent_color(&s.accent),
+                        icons::driver(s.driver),
+                        Some(s.role.label()),
+                        ws.is_source_connected(&s.id),
+                    ),
+                );
+            }
+            ws.flat
             .iter()
             .enumerate()
             .skip(scroll)
@@ -1178,13 +1194,8 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
             .map(|(i, e)| {
                 // Soft indent + DataRig Nerd Font glyphs (icons::*).
                 let tree = explorer_tree_prefix(&ws.flat, i);
-                let source_accent = |source_id: &str| -> Color {
-                    ws.sources
-                        .iter()
-                        .find(|s| s.id == source_id)
-                        .map(|s| parse_accent_color(&s.accent))
-                        .unwrap_or(theme::accent())
-                };
+                let meta = src_meta.get(e.source_id.as_str());
+                let accent_color = meta.map(|m| m.0).unwrap_or_else(theme::accent);
                 let color = match e.kind {
                     DbNodeKind::Group => theme::muted(),
                     DbNodeKind::Source => {
@@ -1193,7 +1204,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                             Some(ide_db::ConnHealth::Dead(_)) => theme::warn(),
                             Some(ide_db::ConnHealth::Ok { .. }) => Color::Green,
                             Some(ide_db::ConnHealth::Stale { .. }) => theme::warn(),
-                            None => source_accent(&e.source_id),
+                            None => accent_color,
                         }
                     }
                     DbNodeKind::Database => theme::accent(),
@@ -1207,21 +1218,16 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     DbNodeKind::Routine => theme::muted(),
                 };
                 let glyph = if matches!(e.kind, DbNodeKind::Source) {
-                    ws.sources
-                        .iter()
-                        .find(|s| s.id == e.source_id)
-                        .map(|s| icons::driver(s.driver))
-                        .unwrap_or(icons::database())
+                    meta.map(|m| m.1).unwrap_or_else(icons::database)
                 } else {
                     icons::node(&e.kind)
                 };
                 let selected = i == ws.selected;
-                let src = matches!(e.kind, DbNodeKind::Source)
-                    .then(|| ws.sources.iter().find(|s| s.id == e.source_id))
-                    .flatten();
-                let accent = src
-                    .map(|s| parse_accent_color(&s.accent))
-                    .unwrap_or(color);
+                let accent = if matches!(e.kind, DbNodeKind::Source) {
+                    accent_color
+                } else {
+                    color
+                };
                 let (row_fg, row_bg) = if selected && theme::is_mono() {
                     // AMOLED: invert — grey slab on pure black reads as “dirty”, not mono.
                     (theme::bg(), theme::text())
@@ -1255,7 +1261,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 // Chromatic: solid accent rail cell. AMOLED: invert row (no grey wash).
                 // Source: filled ● when pool live, ○ when disconnected (#12).
                 let glyph_part = if matches!(e.kind, DbNodeKind::Source) {
-                    let live = ws.is_source_connected(&e.source_id);
+                    let live = meta.map(|m| m.3).unwrap_or(false);
                     let mark = if live { "●" } else { "○" };
                     format!("{mark} {glyph} ")
                 } else {
@@ -1263,7 +1269,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 };
                 let used = 1 + tree.chars().count() + glyph_part.chars().count();
                 let label_max = inner_w.saturating_sub(used).max(4);
-                let role = src.map(|s| s.role.label());
+                let role = meta.and_then(|m| m.2);
                 // Drop whole tokens (driver, then role) before ellipsizing — never "[ad…]".
                 let mut label = if matches!(e.kind, DbNodeKind::Source) {
                     fit_explorer_source_label(&e.label, role, label_max)
@@ -1288,7 +1294,8 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     Span::styled(label, label_style),
                 ]))
             })
-            .collect(),
+            .collect()
+        }
         Some(ws) => {
             let loading = ws.status.to_lowercase().contains("load")
                 || ws.status.to_lowercase().contains("fetch")
@@ -3799,6 +3806,7 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("/", "filter tree by name"),
             ("f", "cycle type filter (tables/views/…)"),
             ("U", "toggle system schemas"),
+            ("Ctrl-Shift-A", "Search Everywhere (catalog)"),
             ("c  u", "connect · disconnect source"),
             ("Ctrl+←→", "resize explorer width"),
             ("Ctrl+↑↓", "resize results height"),
