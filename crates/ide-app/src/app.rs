@@ -2526,6 +2526,7 @@ impl App {
         match self.ui.mode {
             Mode::Find => {
                 self.ui.find_query.push_str(text);
+                self.sync_live_find_filter();
                 true
             }
             Mode::Replace => {
@@ -5056,27 +5057,52 @@ impl App {
     async fn confirm_find(&mut self) -> Result<()> {
         let q = self.ui.find_query.trim().to_string();
         self.ui.mode = Mode::Normal;
-        if self.ui.focus == Focus::Results {
-            self.db.results_filter = q.clone();
-            if let Some(r) = self.db.last_result.as_mut() {
-                r.snap_cursor_to_filter(&q);
+        match self.ui.find_target {
+            ide_ui::FindTarget::Results => {
+                self.db.results_filter = q.clone();
+                if let Some(r) = self.db.last_result.as_mut() {
+                    r.snap_cursor_to_filter(&q);
+                }
+                if q.is_empty() {
+                    self.set_status("results filter cleared", false);
+                } else {
+                    self.set_status(format!("results filter · {q}"), false);
+                }
             }
-            if q.is_empty() {
-                self.set_status("results filter cleared", false);
-            } else {
-                self.set_status(format!("results filter · {q}"), false);
+            ide_ui::FindTarget::Explorer => {
+                self.db.explorer_filter = q.clone();
+                self.db.rebuild_flat();
+                if q.is_empty() {
+                    self.set_status("explorer filter cleared", false);
+                } else {
+                    self.set_status(
+                        format!("explorer /{q} · {} rows", self.db.flat.len()),
+                        false,
+                    );
+                }
             }
-            return Ok(());
-        }
-        if q.is_empty() {
-            return Ok(());
-        }
-        if let Some(buf) = self.active_buffer_mut() {
-            if buf.find_next(&q) {
-                buf.ensure_cursor_visible(30);
-                self.set_status(format!("find: {q}"), false);
-            } else {
-                self.set_status("no match", true);
+            ide_ui::FindTarget::Sql => {
+                if q.is_empty() {
+                    return Ok(());
+                }
+                if self.db_sql_find_next(&q) {
+                    self.set_status(format!("find sql · {q}"), false);
+                } else {
+                    self.set_status("no match in SQL", true);
+                }
+            }
+            ide_ui::FindTarget::Buffer => {
+                if q.is_empty() {
+                    return Ok(());
+                }
+                if let Some(buf) = self.active_buffer_mut() {
+                    if buf.find_next(&q) {
+                        buf.ensure_cursor_visible(30);
+                        self.set_status(format!("find: {q}"), false);
+                    } else {
+                        self.set_status("no match", true);
+                    }
+                }
             }
         }
         Ok(())
@@ -5090,6 +5116,14 @@ impl App {
         if q.is_empty() {
             return Ok(());
         }
+        if self.ui.find_target == ide_ui::FindTarget::Sql {
+            if self.db_sql_replace_one(&q, &replacement) {
+                self.set_status("replaced one in SQL", false);
+            } else {
+                self.set_status("no match to replace", true);
+            }
+            return Ok(());
+        }
         if let Some(buf) = self.active_buffer_mut() {
             if buf.replace_one(&q, &replacement) {
                 self.sync_lsp_change().await;
@@ -5099,6 +5133,210 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Live Explorer `/` filter while typing in Find mode (#9).
+    fn sync_live_find_filter(&mut self) {
+        if self.ui.find_target != ide_ui::FindTarget::Explorer {
+            return;
+        }
+        self.db.explorer_filter = self.ui.find_query.clone();
+        self.db.rebuild_flat();
+    }
+
+    /// Byte offset of `db_cursor` inside `db.sql` (#13).
+    fn db_sql_byte_offset(&self) -> usize {
+        let mut at = 0usize;
+        for (i, line) in self.db.sql.split_inclusive('\n').enumerate() {
+            if i == self.ui.db_cursor.row {
+                let cols: Vec<char> = line.chars().collect();
+                let col = self.ui.db_cursor.col.min(cols.len());
+                return at + cols[..col].iter().map(|c| c.len_utf8()).sum::<usize>();
+            }
+            at += line.len();
+        }
+        self.db.sql.len()
+    }
+
+    fn db_sql_set_cursor_byte(&mut self, at: usize) {
+        let at = at.min(self.db.sql.len());
+        let mut row = 0usize;
+        let mut col = 0usize;
+        let mut seen = 0usize;
+        for ch in self.db.sql.chars() {
+            if seen >= at {
+                break;
+            }
+            if ch == '\n' {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+            seen += ch.len_utf8();
+        }
+        self.ui.db_cursor.row = row;
+        self.ui.db_cursor.col = col;
+        self.db_ensure_cursor_visible(20);
+    }
+
+    fn db_sql_find_next(&mut self, query: &str) -> bool {
+        if query.is_empty() {
+            return false;
+        }
+        let q = query.to_ascii_lowercase();
+        let lower = self.db.sql.to_ascii_lowercase();
+        let start = self.db_sql_byte_offset();
+        let found = lower[start.saturating_add(1).min(lower.len())..]
+            .find(&q)
+            .map(|i| start.saturating_add(1) + i)
+            .or_else(|| lower.find(&q));
+        let Some(at) = found else {
+            return false;
+        };
+        self.db_sql_set_cursor_byte(at);
+        true
+    }
+
+    fn db_sql_find_prev(&mut self, query: &str) -> bool {
+        if query.is_empty() {
+            return false;
+        }
+        let q = query.to_ascii_lowercase();
+        let lower = self.db.sql.to_ascii_lowercase();
+        let start = self.db_sql_byte_offset();
+        let head = &lower[..start.min(lower.len())];
+        let found = head.rfind(&q).or_else(|| lower.rfind(&q));
+        let Some(at) = found else {
+            return false;
+        };
+        self.db_sql_set_cursor_byte(at);
+        true
+    }
+
+    fn db_sql_replace_one(&mut self, query: &str, replacement: &str) -> bool {
+        if query.is_empty() {
+            return false;
+        }
+        let at = self.db_sql_byte_offset();
+        let q_lower = query.to_ascii_lowercase();
+        let lower = self.db.sql.to_ascii_lowercase();
+        let on_match = lower.get(at..).is_some_and(|s| s.starts_with(&q_lower));
+        if !on_match && !self.db_sql_find_next(query) {
+            return false;
+        }
+        let at = self.db_sql_byte_offset();
+        let take = self.db.sql[at..]
+            .chars()
+            .take(query.chars().count())
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        let end = at + take;
+        if end > self.db.sql.len() || !self.db.sql[at..end].eq_ignore_ascii_case(query) {
+            return false;
+        }
+        self.db.sql.replace_range(at..end, replacement);
+        if let Some(tab) = self.db.tabs.get_mut(self.db.active_tab) {
+            tab.sql = self.db.sql.clone();
+        }
+        self.db_sql_set_cursor_byte(at + replacement.len());
+        true
+    }
+
+    /// Identifier under Console cursor → Explorer (`schema.table` / bare table) (#14).
+    async fn jump_sql_identifier_to_explorer(&mut self) {
+        let row = self.ui.db_cursor.row;
+        let col = self.ui.db_cursor.col;
+        let line = self.db_line(row);
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            self.set_status("no identifier under cursor", true);
+            return;
+        }
+        let col = col.min(chars.len().saturating_sub(1));
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '"' || c == '`';
+        if !is_ident(chars[col]) && col > 0 && is_ident(chars[col - 1]) {
+            // Allow cursor just past the word.
+        } else if !is_ident(chars[col]) {
+            self.set_status("no identifier under cursor", true);
+            return;
+        }
+        let mut start = col.min(chars.len().saturating_sub(1));
+        while start > 0 && (is_ident(chars[start - 1]) || chars[start - 1] == '.') {
+            start -= 1;
+        }
+        let mut end = col.min(chars.len().saturating_sub(1)) + 1;
+        while end < chars.len() && (is_ident(chars[end]) || chars[end] == '.') {
+            end += 1;
+        }
+        let raw: String = chars[start..end].iter().collect();
+        let raw = raw.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+        let parts: Vec<&str> = raw.split('.').filter(|p| !p.is_empty()).collect();
+        let active_schema = self
+            .db
+            .active_schema
+            .clone()
+            .unwrap_or_else(|| "public".into());
+        let (schema_s, table, column): (String, String, Option<String>) = match parts.as_slice() {
+            [s, t, c, ..] => (s.to_string(), t.to_string(), Some(c.to_string())),
+            [s, t] => {
+                // Prefer schema.table; if that fails later, caller can retry as table.col.
+                (s.to_string(), t.to_string(), None)
+            }
+            [t] => (active_schema.clone(), t.to_string(), None),
+            _ => {
+                self.set_status("no identifier under cursor", true);
+                return;
+            }
+        };
+        let Some(source_id) = self.db.active_source.clone() else {
+            self.set_status("no active connection", true);
+            return;
+        };
+        let database = self.db.active_database.clone();
+        let mut ok = self
+            .db
+            .expand_and_select_table(&source_id, database.as_deref(), &schema_s, &table)
+            .await
+            .unwrap_or(false);
+        let mut landed_schema = schema_s.clone();
+        let mut landed_table = table.clone();
+        let mut landed_col = column.clone();
+        // Two-part name that wasn't schema.table → try active_schema.table + column.
+        if !ok && parts.len() == 2 {
+            let t = parts[0];
+            let c = parts[1];
+            ok = self
+                .db
+                .expand_and_select_table(&source_id, database.as_deref(), &active_schema, t)
+                .await
+                .unwrap_or(false);
+            if ok {
+                landed_schema = active_schema.clone();
+                landed_table = t.to_string();
+                landed_col = Some(c.to_string());
+            }
+        }
+        if !ok {
+            self.set_status(
+                format!("not in explorer · {landed_schema}.{landed_table}"),
+                true,
+            );
+            return;
+        }
+        self.ui.focus = Focus::Database;
+        let _ = self.db.refresh_structure_for_selection().await;
+        if let Some(col_name) = landed_col {
+            if let Some(idx) = self.db.structure_lines.iter().position(|l| {
+                l.text
+                    .to_ascii_lowercase()
+                    .starts_with(&col_name.to_ascii_lowercase())
+            }) {
+                self.db.structure_selected = idx;
+                self.ui.focus = Focus::Structure;
+            }
+        }
+        self.set_status(format!("→ {landed_schema}.{landed_table}"), false);
     }
 
     async fn confirm_git_commit(&mut self) -> Result<()> {
@@ -5490,6 +5728,14 @@ impl App {
     }
 
     async fn goto_definition(&mut self) {
+        // Studio Console: jump SQL identifier → Explorer (#14).
+        if self.ui.product == ProductMode::Database
+            && self.ui.db_surface == DbSurface::Studio
+            && self.ui.focus == Focus::Editor
+        {
+            self.jump_sql_identifier_to_explorer().await;
+            return;
+        }
         let (path, line, col, lang) = {
             let Some(buf) = self.active_buffer() else {
                 return;
@@ -6015,6 +6261,13 @@ impl App {
                     self.ui.rename_input.clear();
                     self.ui.search_input.clear();
                     self.ui.find_query.clear();
+                    if self.ui.find_target == ide_ui::FindTarget::Explorer
+                        && !self.db.explorer_filter.is_empty()
+                    {
+                        self.db.explorer_filter.clear();
+                        self.db.rebuild_flat();
+                    }
+                    self.ui.find_target = ide_ui::FindTarget::Buffer;
                     self.ui.replace_query.clear();
                     self.ui.commit_input.clear();
                     self.ui.db_connect_input.clear();
@@ -6438,6 +6691,7 @@ impl App {
                 }
                 Mode::Find => {
                     self.ui.find_query.pop();
+                    self.sync_live_find_filter();
                 }
                 Mode::EditTableFilter => {
                     self.ui.table_filter_draft.pop();
@@ -7127,15 +7381,37 @@ impl App {
                 }
             }
             Action::Find => {
-                if self.ui.focus == Focus::Results {
+                self.ui.find_target = if self.ui.focus == Focus::Results {
                     self.ui.find_query = self.db.results_filter.clone();
-                }
+                    ide_ui::FindTarget::Results
+                } else if self.ui.focus == Focus::Database {
+                    self.ui.find_query = self.db.explorer_filter.clone();
+                    ide_ui::FindTarget::Explorer
+                } else if self.ui.product == ProductMode::Database
+                    && self.ui.db_surface == DbSurface::Studio
+                    && self.ui.focus == Focus::Editor
+                {
+                    ide_ui::FindTarget::Sql
+                } else {
+                    ide_ui::FindTarget::Buffer
+                };
                 self.ui.mode = Mode::Find;
             }
             Action::FindNext => {
                 let q = self.ui.find_query.clone();
                 if q.trim().is_empty() {
                     self.ui.mode = Mode::Find;
+                } else if self.ui.find_target == ide_ui::FindTarget::Sql {
+                    if !self.db_sql_find_next(&q) {
+                        self.set_status("no more matches", true);
+                    }
+                } else if self.ui.find_target == ide_ui::FindTarget::Explorer {
+                    // Re-apply filter; selection stays — n cycles matching rows.
+                    self.db.explorer_filter = q.clone();
+                    self.db.rebuild_flat();
+                    if !self.db.flat.is_empty() {
+                        self.db.selected = (self.db.selected + 1) % self.db.flat.len();
+                    }
                 } else if let Some(buf) = self.active_buffer_mut() {
                     if !buf.find_next(&q) {
                         self.set_status("no more matches", true);
@@ -7146,6 +7422,20 @@ impl App {
                 let q = self.ui.find_query.clone();
                 if q.trim().is_empty() {
                     self.ui.mode = Mode::Find;
+                } else if self.ui.find_target == ide_ui::FindTarget::Sql {
+                    if !self.db_sql_find_prev(&q) {
+                        self.set_status("no previous match", true);
+                    }
+                } else if self.ui.find_target == ide_ui::FindTarget::Explorer {
+                    self.db.explorer_filter = q.clone();
+                    self.db.rebuild_flat();
+                    if !self.db.flat.is_empty() {
+                        self.db.selected = if self.db.selected == 0 {
+                            self.db.flat.len() - 1
+                        } else {
+                            self.db.selected - 1
+                        };
+                    }
                 } else if let Some(buf) = self.active_buffer_mut() {
                     if !buf.find_prev(&q) {
                         self.set_status("no previous match", true);
@@ -7153,6 +7443,12 @@ impl App {
                 }
             }
             Action::Replace => {
+                if self.ui.product == ProductMode::Database
+                    && self.ui.db_surface == DbSurface::Studio
+                    && self.ui.focus == Focus::Editor
+                {
+                    self.ui.find_target = ide_ui::FindTarget::Sql;
+                }
                 self.ui.mode = Mode::Replace;
                 self.ui.replace_query.clear();
             }
@@ -7161,6 +7457,15 @@ impl App {
                 let r = self.ui.replace_query.clone();
                 if q.trim().is_empty() {
                     self.ui.mode = Mode::Find;
+                } else if self.ui.find_target == ide_ui::FindTarget::Sql {
+                    let mut n = 0usize;
+                    while self.db_sql_replace_one(&q, &r) {
+                        n += 1;
+                        if n > 10_000 {
+                            break;
+                        }
+                    }
+                    self.set_status(format!("replaced {n} in SQL"), false);
                 } else if let Some(buf) = self.active_buffer_mut() {
                     let n = buf.replace_all_matches(&q, &r);
                     self.sync_lsp_change().await;
@@ -11021,6 +11326,7 @@ async fn event_loop(
                                         && !key.modifiers.contains(KeyModifiers::SUPER)
                                     {
                                         app.ui.find_query.push(c);
+                                        app.sync_live_find_filter();
                                     }
                                 }
                             }

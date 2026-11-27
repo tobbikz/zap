@@ -38,6 +38,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+/// Where Mode::Find / n / N apply (#13 / #9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FindTarget {
+    #[default]
+    Buffer,
+    Results,
+    /// Console `db.sql` (#13).
+    Sql,
+    /// Explorer name filter (#9).
+    Explorer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTone {
     /// Quiet tip — no colored badge (pane focus, resize hints, …).
@@ -81,6 +93,8 @@ pub struct UiState {
     pub rename_input: String,
     pub search_input: String,
     pub find_query: String,
+    /// Buffer / Results / Sql console / Explorer filter (#13 / #9).
+    pub find_target: FindTarget,
     pub replace_query: String,
     pub commit_input: String,
     pub db_connect_input: String,
@@ -248,6 +262,7 @@ impl Default for UiState {
             rename_input: String::new(),
             search_input: String::new(),
             find_query: String::new(),
+            find_target: FindTarget::Buffer,
             replace_query: String::new(),
             commit_input: String::new(),
             db_connect_input: String::new(),
@@ -709,7 +724,15 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
             let (prefix, text) = match ctx.ui.mode {
                 Mode::Command => (":", ctx.ui.command.as_str()),
                 Mode::Search => ("search> ", ctx.ui.search_input.as_str()),
-                Mode::Find => ("find> ", ctx.ui.find_query.as_str()),
+                Mode::Find => (
+                    match ctx.ui.find_target {
+                        FindTarget::Explorer => "explorer/ ",
+                        FindTarget::Sql => "sql/ ",
+                        FindTarget::Results => "results/ ",
+                        FindTarget::Buffer => "find> ",
+                    },
+                    ctx.ui.find_query.as_str(),
+                ),
                 _ => ("", ""),
             };
             frame.render_widget(
@@ -934,7 +957,15 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
             Mode::Command => (":", ctx.ui.command.as_str()),
             Mode::Rename => ("rename> ", ctx.ui.rename_input.as_str()),
             Mode::Search => ("search> ", ctx.ui.search_input.as_str()),
-            Mode::Find => ("find> ", ctx.ui.find_query.as_str()),
+            Mode::Find => (
+                match ctx.ui.find_target {
+                    FindTarget::Explorer => "explorer/ ",
+                    FindTarget::Sql => "sql/ ",
+                    FindTarget::Results => "results/ ",
+                    FindTarget::Buffer => "find> ",
+                },
+                ctx.ui.find_query.as_str(),
+            ),
             Mode::Replace => ("replace> ", ctx.ui.replace_query.as_str()),
             Mode::Commit => ("commit> ", ctx.ui.commit_input.as_str()),
             Mode::EditCell => ("cell> ", ctx.ui.cell_edit_input.as_str()),
@@ -1288,9 +1319,20 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
             theme::style_faint(),
         ))],
     };
-    let title = if focused { " Explorer " } else { " explorer " };
+    let filter = db.map(|w| w.explorer_filter.trim()).unwrap_or("");
+    let title = if !filter.is_empty() {
+        if focused {
+            format!(" Explorer · /{filter} ")
+        } else {
+            format!(" explorer · /{filter} ")
+        }
+    } else if focused {
+        " Explorer ".into()
+    } else {
+        " explorer ".into()
+    };
     frame.render_widget(
-        List::new(items).block(theme::pane_block(title, focused)),
+        List::new(items).block(theme::pane_block(&title, focused)),
         area,
     );
     let _ = border;
@@ -1645,12 +1687,20 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let highlights = ctx
         .highlighter
         .highlight_lines(LanguageId::Sql, sql, start, end);
+    let find_q = if matches!(ctx.ui.find_target, FindTarget::Sql)
+        && !ctx.ui.find_query.trim().is_empty()
+    {
+        Some(ctx.ui.find_query.trim().to_ascii_lowercase())
+    } else {
+        None
+    };
 
     let mut out_lines = Vec::new();
     for row in start..end {
         let rel = row - start;
         let text = lines.get(row).copied().unwrap_or("");
         let on_cursor = focused && row == cursor_row;
+        let find_mask = find_q.as_ref().map(|q| sql_line_find_mask(text, q));
         // Solid accent rail + bold line number on cursor row.
         let gutter_fg = if on_cursor {
             theme::accent()
@@ -1698,8 +1748,14 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                         .min(visible_end)
                 });
             let slice: String = chars[col..run_end].iter().collect();
+            let in_find = find_mask
+                .as_ref()
+                .map(|m| (col..run_end).any(|i| m.get(i).copied().unwrap_or(false)))
+                .unwrap_or(false);
             let style = if ctx.ui.db_sql_all_selected {
                 theme::style_selected()
+            } else if in_find {
+                theme::style_chip_run()
             } else {
                 let base = style_for(kind);
                 if on_cursor {
@@ -3709,6 +3765,8 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("F5", "run all"),
             ("Alt-Enter", "run statement at cursor"),
             ("Ctrl-E", "EXPLAIN"),
+            ("/  n  N", "find in SQL · next · prev"),
+            ("g", "jump identifier → Explorer"),
             ("t  x  X", "begin · rollback · commit txn"),
             ("Ctrl+←→", "resize console / left stack"),
             ("Ctrl+↑↓", "resize results height"),
@@ -3724,6 +3782,7 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("Ctrl-P", "command palette"),
             ("Ctrl-W", "close SQL tab"),
             ("Enter", "open / expand"),
+            ("/", "filter tree by name"),
             ("c  u", "connect · disconnect source"),
             ("Ctrl+←→", "resize explorer width"),
             ("Ctrl+↑↓", "resize results height"),
@@ -4528,9 +4587,9 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
     match ui.focus {
         Focus::Database => vec![
             ("Enter", "open"),
+            ("/", "filter"),
             ("c/u", "conn"),
             ("Ctrl+←→", "resize"),
-            ("b/s/o", "db·schema·table"),
             ("Tab", "focus"),
         ],
         Focus::Structure => vec![
@@ -4542,9 +4601,9 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
         Focus::Editor => vec![
             ("i", "insert"),
             ("F5", "run"),
+            ("/ n", "find"),
+            ("g", "goto"),
             ("t/x/X", "txn"),
-            ("Ctrl+←→", "resize"),
-            ("b/s/o", "db·schema·table"),
             ("Alt-L", "limit"),
         ],
         Focus::Results => vec![
@@ -6355,6 +6414,37 @@ fn console_toolbar_spans(
             theme::style_chip_run_idle()
         },
     )]
+}
+
+/// Char-index mask of find matches on one SQL line (#13).
+fn sql_line_find_mask(text: &str, query_lower: &str) -> Vec<bool> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut mask = vec![false; chars.len()];
+    if query_lower.is_empty() {
+        return mask;
+    }
+    let lower: String = chars.iter().flat_map(|c| c.to_lowercase()).collect();
+    let qlen = query_lower.chars().count();
+    if qlen == 0 {
+        return mask;
+    }
+    let lower_chars: Vec<char> = lower.chars().collect();
+    let mut i = 0usize;
+    while i + qlen <= lower_chars.len() {
+        if lower_chars[i..i + qlen]
+            .iter()
+            .copied()
+            .eq(query_lower.chars())
+        {
+            for j in i..i + qlen {
+                mask[j] = true;
+            }
+            i += qlen;
+        } else {
+            i += 1;
+        }
+    }
+    mask
 }
 
 /// Drop whole ` · `-separated tokens from the **left** before mid-glyph ellipsis.
