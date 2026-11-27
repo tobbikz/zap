@@ -3626,15 +3626,67 @@ impl DbWorkspace {
             DbNodeKind::Table | DbNodeKind::View => {
                 let schema = entry.schema.as_deref().unwrap_or("?");
                 let table = entry.table.as_deref().unwrap_or(entry.label.as_str());
+                let db = entry.database.as_deref();
                 let kind = if matches!(entry.kind, DbNodeKind::View) {
                     "view"
                 } else {
                     "table"
                 };
-                Some(format!(" {kind} · {schema}.{table} · p props · d DDL "))
+                // Full path always — Explorer may truncate the row label (#18).
+                let path = match db {
+                    Some(d) if !d.is_empty() => format!("{d}.{schema}.{table}"),
+                    _ => format!("{schema}.{table}"),
+                };
+                Some(format!(" {kind} · {path} · p props · d DDL "))
             }
             _ => Some(format!(" {} · n New · p props ", entry.label)),
         }
+    }
+
+    /// Full `database.schema.object` (or source name) for the Explorer selection (#18).
+    pub fn selection_full_path(&self) -> Option<String> {
+        let entry = self.flat.get(self.selected)?;
+        match entry.kind {
+            DbNodeKind::Source => self
+                .sources
+                .iter()
+                .find(|s| s.id == entry.source_id)
+                .map(|s| s.name.clone())
+                .or_else(|| Some(entry.label.clone())),
+            DbNodeKind::Database => Some(
+                entry
+                    .database
+                    .clone()
+                    .unwrap_or_else(|| entry.label.clone()),
+            ),
+            DbNodeKind::Schema => {
+                let schema = entry.schema.as_deref().unwrap_or(entry.label.as_str());
+                match entry.database.as_deref() {
+                    Some(d) if !d.is_empty() => Some(format!("{d}.{schema}")),
+                    _ => Some(schema.to_string()),
+                }
+            }
+            DbNodeKind::Table | DbNodeKind::View | DbNodeKind::Routine => {
+                let schema = entry.schema.as_deref().unwrap_or("?");
+                let name = entry
+                    .table
+                    .as_deref()
+                    .unwrap_or(entry.label.as_str());
+                match entry.database.as_deref() {
+                    Some(d) if !d.is_empty() => Some(format!("{d}.{schema}.{name}")),
+                    _ => Some(format!("{schema}.{name}")),
+                }
+            }
+            _ => Some(entry.label.clone()),
+        }
+    }
+
+    /// True when any live pool exists for this source (#12).
+    pub fn is_source_connected(&self, source_id: &str) -> bool {
+        let prefix = format!("{source_id}#");
+        self.pools
+            .keys()
+            .any(|k| k == source_id || k.starts_with(&prefix))
     }
 
     fn fill_structure_source_properties(&mut self, source_id: &str) {
@@ -6711,31 +6763,77 @@ impl DbWorkspace {
         let Some(source_id) = self.active_source.clone() else {
             return;
         };
-        let database = self.active_database.clone();
-        let key = Self::pool_key(&source_id, database.as_deref());
-        // A dropped pool must not leave a dangling server-side transaction (#168).
-        if self.in_txn && self.txn_pool_key.as_deref() == Some(key.as_str()) {
-            let _ = self.rollback_transaction_inner().await;
-            self.clear_txn();
+        let _ = self.disconnect_source(&source_id).await;
+    }
+
+    /// Drop all live pools for a source, collapse its Explorer children, keep config (#12).
+    pub async fn disconnect_source(&mut self, source_id: &str) -> Result<()> {
+        let name = self.source_name(source_id);
+        // Cancel in-flight query on this source, then close pools.
+        if self.query_running && self.active_source.as_deref() == Some(source_id) {
+            self.query_cancel.store(true, Ordering::Relaxed);
         }
-        if let Some(pool) = self.pools.remove(&key) {
-            match pool {
-                LivePool::Pg(p) => {
-                    let _ = p.close();
+        let prefix = format!("{source_id}#");
+        let keys: Vec<String> = self
+            .pools
+            .keys()
+            .filter(|k| *k == source_id || k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in &keys {
+            if self.in_txn && self.txn_pool_key.as_deref() == Some(key.as_str()) {
+                let _ = self.rollback_transaction_inner().await;
+                self.clear_txn();
+            }
+            if let Some(pool) = self.pools.remove(key) {
+                match pool {
+                    LivePool::Pg(p) => {
+                        let _ = p.close();
+                    }
+                    LivePool::Mysql(p) => {
+                        let _ = p.close();
+                    }
+                    LivePool::Sqlite(p) => {
+                        let _ = p.close();
+                    }
+                    LivePool::Duckdb(_) => {}
+                    _ => {}
                 }
-                LivePool::Mysql(p) => {
-                    let _ = p.close();
-                }
-                LivePool::Sqlite(p) => {
-                    let _ = p.close();
-                }
-                LivePool::Duckdb(d) => {
-                    let _ = d;
-                }
-                _ => {}
             }
         }
-        self.pools.remove(&source_id);
+        self.connection_health.remove(source_id);
+        // Collapse source node and clear children — saved source stays.
+        if let Some(node) = self.tree.iter_mut().find(|n| n.source_id == source_id) {
+            node.expanded = false;
+            node.children.clear();
+        }
+        self.rebuild_flat();
+        self.status = format!("disconnected · {name} · c reconnect");
+        Ok(())
+    }
+
+    /// Connect a source and expand its first tree level (#12).
+    pub async fn connect_source(&mut self, source_id: &str) -> Result<()> {
+        let name = self.source_name(source_id);
+        self.ensure_connected(source_id, None).await?;
+        self.connection_health
+            .insert(source_id.to_string(), ConnHealth::ok_now());
+        // Select source row and expand (loads catalogs) if collapsed.
+        if let Some(idx) = self
+            .flat
+            .iter()
+            .position(|e| matches!(e.kind, DbNodeKind::Source) && e.source_id == source_id)
+        {
+            self.selected = idx;
+            let expanded = find_node(&self.tree, &self.flat[idx].id)
+                .map(|n| n.expanded)
+                .unwrap_or(false);
+            if !expanded {
+                self.toggle_selected().await?;
+            }
+        }
+        self.status = format!("connected · {name}");
+        Ok(())
     }
 
     pub async fn fetch_result_page(&mut self, page: usize) -> Result<()> {
@@ -10681,21 +10779,7 @@ fn admin_folder_for(
         "Schema diff → DDL…",
     ));
     children.push(admin_action_node(source_id, "data-compare", "Data compare…"));
-    children.push(admin_action_node(
-        source_id,
-        "txn-begin",
-        "Begin transaction",
-    ));
-    children.push(admin_action_node(
-        source_id,
-        "txn-commit",
-        "Commit transaction",
-    ));
-    children.push(admin_action_node(
-        source_id,
-        "txn-rollback",
-        "Rollback transaction",
-    ));
+    // Begin/Commit/Rollback live on Console chrome (toolbar + t/x/X), not Admin (#294).
     children.push(admin_action_node(source_id, "chart-results", "Chart results…"));
     children.push(admin_action_node(
         source_id,

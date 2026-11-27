@@ -154,6 +154,9 @@ Windows PowerShell uses square borders and Consolas-safe icons automatically. In
 | `1`–`4` | Explorer · Structure · Console · Results |
 | `Tab` | Cycle panes |
 | `F5` / `Ctrl-↵` | Run SQL |
+| `Ctrl+←→` / `Ctrl+↑↓` | Resize Explorer / Results |
+| `c` / `u` | Connect / disconnect (Explorer source) |
+| `t` / `x` / `X` | Begin / rollback / commit txn (Console · Results) |
 | `Enter` | Inspect (Results) / open (Explorer) |
 | `w` / `o` | WHERE / ORDER BY |
 | `m` | Results actions |
