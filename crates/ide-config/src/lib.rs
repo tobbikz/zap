@@ -89,6 +89,9 @@ pub struct DatabaseConfig {
     /// Auto LIMIT for SELECT/WITH without an explicit LIMIT (0 = off). Alt-L cycles.
     #[serde(default = "default_select_limit")]
     pub select_limit: usize,
+    /// Absolute paths for native dump/restore CLIs (`pg_dump`, `mysqldump`, …) (#293).
+    #[serde(default)]
+    pub tool_paths: HashMap<String, String>,
 }
 
 fn default_query_timeout() -> u64 {
@@ -117,6 +120,7 @@ impl Default for DatabaseConfig {
             studio_left_width: default_studio_left_width(),
             results_pct: default_results_pct(),
             select_limit: default_select_limit(),
+            tool_paths: HashMap::new(),
         }
     }
 }

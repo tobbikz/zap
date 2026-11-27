@@ -28,7 +28,18 @@ pub fn paginate_select_sql_for(
     if trimmed.is_empty() {
         return sql.to_string();
     }
-    if page_size == 0 || !is_paged_query(trimmed) || has_limit_clause(trimmed) {
+    // Hard safety cap when lim chip is off — still stop the server at MAX_FETCH_ROWS (#46).
+    if page_size == 0 {
+        if is_paged_query(trimmed) && !has_limit_clause(trimmed) {
+            return match driver {
+                DbDriver::Mssql => mssql_inject_top(trimmed, MAX_FETCH_ROWS),
+                DbDriver::Trino => format!("{trimmed} LIMIT {MAX_FETCH_ROWS}"),
+                _ => format!("{trimmed} LIMIT {MAX_FETCH_ROWS}"),
+            };
+        }
+        return sql.to_string();
+    }
+    if !is_paged_query(trimmed) || has_limit_clause(trimmed) {
         return sql.to_string();
     }
     let offset = page.saturating_mul(page_size);
@@ -145,9 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn page_size_zero_disables() {
+    fn page_size_zero_applies_hard_cap() {
         let sql = "SELECT * FROM t";
-        assert_eq!(paginate_select_sql(sql, 0, 0), sql);
+        let out = paginate_select_sql(sql, 0, 0);
+        assert_eq!(out, format!("SELECT * FROM t LIMIT {MAX_FETCH_ROWS}"));
     }
 
     #[test]
