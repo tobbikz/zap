@@ -3,6 +3,7 @@
 //! Drivers: PostgreSQL (primary), MySQL, SQLite, MSSQL, ClickHouse, DuckDB, Redis, MongoDB, …
 
 mod alt_engines;
+mod cli_tools;
 mod datagrip;
 mod draw_glyphs;
 mod brain_ask;
@@ -49,6 +50,7 @@ pub use result_chart::{
     CHART_KINDS,
 };
 pub use schema_cache::{expecting_relation, SchemaNameCache, SqlCompletionItem};
+pub use cli_tools::{missing_tool_hint, resolve_tool, which_on_path};
 
 /// Extract the SQL text under the cursor, or the selection if given (#20).
 /// Used by the app to get the statement text without going through `execute_sql_at_cursor`.
@@ -1737,6 +1739,11 @@ pub struct DbWorkspace {
     pub query_timeout_secs: u64,
     /// Auto LIMIT for SELECT without LIMIT (0 = disabled). Synced from IdeConfig.
     pub select_limit: usize,
+    /// Persisted absolute paths for dump/restore CLIs (#293). Synced from IdeConfig.
+    pub tool_paths: HashMap<String, String>,
+    /// Optional dump scope from Explorer / picker (#108).
+    pub dump_schema_only: bool,
+    pub dump_data_only: bool,
     /// Explorer health after last expand/ping.
     pub connection_health: HashMap<String, ConnHealth>,
     /// Local Explorer name filter (`/` when Explorer focused) (#9).
@@ -1892,6 +1899,9 @@ impl Default for DbWorkspace {
             query_running: false,
             query_timeout_secs: 120,
             select_limit: RESULT_PAGE_SIZE,
+            tool_paths: HashMap::new(),
+            dump_schema_only: false,
+            dump_data_only: false,
             connection_health: HashMap::new(),
             explorer_filter: String::new(),
             explorer_type_by_source: HashMap::new(),
@@ -6717,7 +6727,11 @@ impl DbWorkspace {
             last.columns.len(),
             last.rows.len(),
             statements.len(),
-            if last.truncated { " (truncated)" } else { "" },
+            if last.truncated {
+                " (truncated · add LIMIT — client stopped at 5000)"
+            } else {
+                ""
+            },
             page_tag,
             more_tag,
             limit_tag,
@@ -8479,30 +8493,28 @@ impl DbWorkspace {
         }
     }
 
-    /// Strict table pick for Vacuum/Reindex — Explorer Table or last Table sel; never views/`last_result` (#138).
+    /// Strict table pick for Vacuum/Reindex — current Explorer Table only (#292 / #138).
+    /// No silent `last_table_sel` fallback; the UI opens a target picker first.
     pub fn selected_maintenance_table(
         &self,
     ) -> Result<(String, Option<String>, String, String, DbDriver)> {
-        let picked = if let Some(e) = self.flat.get(self.selected) {
-            if matches!(e.kind, DbNodeKind::Table) {
-                let schema = e
-                    .schema
-                    .clone()
-                    .context("select a table with a schema")?;
-                let table = e.table.clone().context("missing table")?;
-                Some((e.source_id.clone(), e.database.clone(), schema, table))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let (source_id, database, schema, table) = picked
-            .or_else(|| self.last_table_sel.clone())
-            .context("select a table in Explorer first (views / result fallbacks are blocked)")?;
+        let e = self
+            .flat
+            .get(self.selected)
+            .context("pick a table target first")?;
+        if !matches!(e.kind, DbNodeKind::Table) {
+            bail!("pick a table target (views / Admin rows are blocked)");
+        }
+        let schema = e
+            .schema
+            .clone()
+            .context("select a table with a schema")?;
+        let table = e.table.clone().context("missing table")?;
         if table == "er_sketch" || table == "er_canvas" || table == "wide_cell" {
             bail!("synthetic result tables cannot be vacuumed");
         }
+        let source_id = e.source_id.clone();
+        let database = e.database.clone();
         let driver = self
             .source_cfg(&source_id)
             .map(|s| s.driver)
@@ -9978,6 +9990,55 @@ impl DbWorkspace {
 
 const MAX_ROWS: usize = MAX_FETCH_ROWS;
 
+/// Stream rows and stop after MAX_ROWS+1 so we never OOM on huge SELECTs (#46).
+async fn fetch_rows_capped_pg<'c, E>(exec: E, sql: &str) -> Result<Vec<PgRow>>
+where
+    E: sqlx::Executor<'c, Database = Postgres>,
+{
+    use futures_util::StreamExt;
+    let mut stream = sqlx::query(sql).fetch(exec);
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.context("pg row")?);
+        if rows.len() > MAX_ROWS {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+async fn fetch_rows_capped_mysql<'c, E>(exec: E, sql: &str) -> Result<Vec<MySqlRow>>
+where
+    E: sqlx::Executor<'c, Database = MySqlDb>,
+{
+    use futures_util::StreamExt;
+    let mut stream = sqlx::query(sql).fetch(exec);
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.context("mysql row")?);
+        if rows.len() > MAX_ROWS {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+async fn fetch_rows_capped_sqlite<'c, E>(exec: E, sql: &str) -> Result<Vec<SqliteRow>>
+where
+    E: sqlx::Executor<'c, Database = SqliteDb>,
+{
+    use futures_util::StreamExt;
+    let mut stream = sqlx::query(sql).fetch(exec);
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.context("sqlite row")?);
+        if rows.len() > MAX_ROWS {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
 async fn exec_pg(pool: &PgPool, sql: &str) -> Result<QueryResult> {
     let mut q = exec_pg_conn(pool, sql).await?;
     if q.columns.is_empty() && is_query(sql) {
@@ -10000,7 +10061,7 @@ where
     E: sqlx::Executor<'c, Database = Postgres>,
 {
     if is_query(sql) {
-        let rows = sqlx::query(sql).fetch_all(exec).await?;
+        let rows = fetch_rows_capped_pg(exec, sql).await?;
         Ok(rows_from_pg(rows))
     } else {
         let r = sqlx::query(sql).execute(exec).await?;
@@ -10017,7 +10078,7 @@ where
     E: sqlx::Executor<'c, Database = MySqlDb>,
 {
     if is_query(sql) {
-        let rows = sqlx::query(sql).fetch_all(exec).await?;
+        let rows = fetch_rows_capped_mysql(exec, sql).await?;
         Ok(rows_from_mysql(rows))
     } else {
         let r = sqlx::query(sql).execute(exec).await?;
@@ -10034,7 +10095,7 @@ where
     E: sqlx::Executor<'c, Database = SqliteDb>,
 {
     if is_query(sql) {
-        let rows = sqlx::query(sql).fetch_all(exec).await?;
+        let rows = fetch_rows_capped_sqlite(exec, sql).await?;
         Ok(rows_from_sqlite(rows))
     } else {
         let r = sqlx::query(sql).execute(exec).await?;
@@ -10048,7 +10109,7 @@ where
 
 async fn exec_mysql(pool: &MySqlPool, sql: &str) -> Result<QueryResult> {
     if is_query(sql) {
-        let rows = sqlx::query(sql).fetch_all(pool).await?;
+        let rows = fetch_rows_capped_mysql(pool, sql).await?;
         let mut q = rows_from_mysql(rows);
         if q.columns.is_empty() {
             if let Ok(mut conn) = pool.acquire().await {
@@ -10075,7 +10136,7 @@ async fn exec_mysql(pool: &MySqlPool, sql: &str) -> Result<QueryResult> {
 
 async fn exec_sqlite(pool: &SqlitePool, sql: &str) -> Result<QueryResult> {
     if is_query(sql) {
-        let rows = sqlx::query(sql).fetch_all(pool).await?;
+        let rows = fetch_rows_capped_sqlite(pool, sql).await?;
         let mut q = rows_from_sqlite(rows);
         if q.columns.is_empty() {
             if let Ok(mut conn) = pool.acquire().await {
@@ -11375,6 +11436,136 @@ fn postgres_health_folder(source_id: &str) -> DbTreeNode {
     )
 }
 
+/// Roles → members → grants under Admin (#291).
+fn postgres_roles_folder(source_id: &str) -> DbTreeNode {
+    DbTreeNode {
+        id: format!("{source_id}::admin::roles"),
+        label: "Roles & users".into(),
+        kind: DbNodeKind::Admin,
+        source_id: source_id.into(),
+        database: None,
+        schema: None,
+        table: None,
+        query_sql: None,
+        children: vec![
+            admin_query_node(
+                source_id,
+                "roles-membership",
+                "Membership (role → member)",
+                PG_ROLES_MEMBERSHIP,
+            ),
+            admin_query_node(
+                source_id,
+                "roles-grants",
+                "Table privileges",
+                PG_ROLES_TABLE_GRANTS,
+            ),
+            admin_query_node(
+                source_id,
+                "roles-flags",
+                "Role flags",
+                PG_ROLES_FLAGS,
+            ),
+        ],
+        expanded: true,
+    }
+}
+
+pub const PG_ROLES_MEMBERSHIP: &str = "\
+SELECT r.rolname AS role_name,
+       COALESCE(m.rolname, '(no members)') AS member,
+       CASE WHEN m.oid IS NULL THEN NULL
+            WHEN m.rolcanlogin THEN 'login'
+            ELSE 'role' END AS member_kind,
+       am.admin_option
+FROM pg_roles r
+LEFT JOIN pg_auth_members am ON am.roleid = r.oid
+LEFT JOIN pg_roles m ON m.oid = am.member
+WHERE r.rolname NOT LIKE 'pg\\_%' ESCAPE '\\'
+ORDER BY r.rolname, m.rolname NULLS FIRST;";
+
+pub const PG_ROLES_TABLE_GRANTS: &str = "\
+SELECT grantee, table_schema, table_name, privilege_type, is_grantable
+FROM information_schema.role_table_grants
+WHERE grantee NOT IN ('PUBLIC')
+ORDER BY grantee, table_schema, table_name, privilege_type
+LIMIT 2000;";
+
+pub const PG_ROLES_FLAGS: &str = "\
+SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
+       rolcanlogin, rolreplication, rolconnlimit
+FROM pg_roles
+WHERE rolname NOT LIKE 'pg\\_%' ESCAPE '\\'
+ORDER BY 1;";
+
+fn mysql_roles_folder(source_id: &str) -> DbTreeNode {
+    DbTreeNode {
+        id: format!("{source_id}::admin::roles"),
+        label: "Roles & users".into(),
+        kind: DbNodeKind::Admin,
+        source_id: source_id.into(),
+        database: None,
+        schema: None,
+        table: None,
+        query_sql: None,
+        children: vec![
+            admin_query_node(
+                source_id,
+                "roles-users",
+                "Users",
+                "SELECT user, host, account_locked, password_expired\n\
+                 FROM mysql.user ORDER BY user, host LIMIT 500;",
+            ),
+            admin_query_node(
+                source_id,
+                "roles-grants",
+                "Schema privileges",
+                "SELECT GRANTEE, TABLE_SCHEMA, PRIVILEGE_TYPE, IS_GRANTABLE\n\
+                 FROM information_schema.SCHEMA_PRIVILEGES\n\
+                 ORDER BY GRANTEE, TABLE_SCHEMA LIMIT 2000;",
+            ),
+        ],
+        expanded: true,
+    }
+}
+
+fn mssql_roles_folder(source_id: &str) -> DbTreeNode {
+    DbTreeNode {
+        id: format!("{source_id}::admin::roles"),
+        label: "Roles & users".into(),
+        kind: DbNodeKind::Admin,
+        source_id: source_id.into(),
+        database: None,
+        schema: None,
+        table: None,
+        query_sql: None,
+        children: vec![
+            admin_query_node(
+                source_id,
+                "roles-membership",
+                "Role members",
+                "SELECT r.name AS role_name, m.name AS member, m.type_desc AS member_kind\n\
+                 FROM sys.database_role_members drm\n\
+                 JOIN sys.database_principals r ON r.principal_id = drm.role_principal_id\n\
+                 JOIN sys.database_principals m ON m.principal_id = drm.member_principal_id\n\
+                 ORDER BY r.name, m.name;",
+            ),
+            admin_query_node(
+                source_id,
+                "roles-perms",
+                "Permissions",
+                "SELECT TOP 2000 USER_NAME(grantee_principal_id) AS grantee,\n\
+                 \tpermission_name, state_desc, OBJECT_SCHEMA_NAME(major_id) AS [schema],\n\
+                 \tOBJECT_NAME(major_id) AS object_name\n\
+                 FROM sys.database_permissions\n\
+                 WHERE class_desc = 'OBJECT_OR_COLUMN'\n\
+                 ORDER BY grantee, [schema], object_name;",
+            ),
+        ],
+        expanded: true,
+    }
+}
+
 fn mysql_health_folder(source_id: &str) -> DbTreeNode {
     health_folder(
         source_id,
@@ -11855,15 +12046,7 @@ fn admin_folder_for(
                      LEFT JOIN pg_class c ON c.oid = l.relation\n\
                      ORDER BY l.granted, l.pid;",
                 ),
-                admin_query_node(
-                    source_id,
-                    "roles",
-                    "Roles",
-                    "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,\n\
-                     \trolcanlogin, rolreplication, rolconnlimit\n\
-                     FROM pg_roles\n\
-                     ORDER BY 1;",
-                ),
+                postgres_roles_folder(source_id),
                 admin_query_node(
                     source_id,
                     "databases",
@@ -11917,6 +12100,7 @@ fn admin_folder_for(
                 admin_action_node(source_id, "vacuum-analyze", "OPTIMIZE TABLE…"),
                 admin_action_node(source_id, "analyze-table", "ANALYZE TABLE…"),
                 admin_action_node(source_id, "reindex-table", "OPTIMIZE (reindex)…"),
+                mysql_roles_folder(source_id),
                 // Processlist lives under Health → Activity (#290).
                 admin_query_node(
                     source_id,
@@ -11980,6 +12164,7 @@ fn admin_folder_for(
                 admin_action_node(source_id, "vacuum-analyze", "UPDATE STATS + REBUILD…"),
                 admin_action_node(source_id, "analyze-table", "UPDATE STATISTICS…"),
                 admin_action_node(source_id, "reindex-table", "REBUILD indexes…"),
+                mssql_roles_folder(source_id),
                 // Sessions live under Health → Activity (#290).
                 admin_query_node(
                     source_id,
@@ -12573,21 +12758,25 @@ impl DbWorkspace {
         let port = local_port.unwrap_or(if src.port == 0 { 1433 } else { src.port });
         let server = format!("{host},{port}");
 
-        // Prefer mssql-scripter which emits real DDL+DML (#109).
-        if tool_on_path("mssql-scripter") {
-            let mut cmd = Command::new("mssql-scripter");
+        // Prefer mssql-scripter which emits real DDL+DML (#109 / #84 vault+async).
+        if let Ok(bin) = self.resolve_cli("mssql-scripter") {
+            let password = src.resolved_password();
+            let mut cmd = tokio::process::Command::new(&bin);
             cmd.args(["-S", &server, "-d", db, "--file-path", out.to_str().context("path utf8")?]);
             if !src.user.is_empty() {
                 cmd.args(["-U", &src.user]);
             }
-            if !src.password.is_empty() {
-                cmd.args(["-P", &src.password]);
+            if !password.is_empty() {
+                cmd.args(["-P", &password]);
             }
-            let status = cmd
-                .status()
-                .context("spawn mssql-scripter (is it on PATH?)")?;
-            if status.success() {
-                return Ok(out);
+            match cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() => return Ok(out),
+                _ => {}
             }
         }
 
@@ -12795,6 +12984,48 @@ impl DbWorkspace {
     }
 
     /// Dump active database with native tools into `out_dir`. Returns output path.
+    /// Resolve dump/restore binary, discover+persist into `tool_paths` when found (#293).
+    fn resolve_cli(&mut self, tool: &str) -> Result<PathBuf> {
+        if let Some(p) = resolve_tool(tool, &self.tool_paths) {
+            let key = tool.to_string();
+            let path_s = p.display().to_string();
+            if self.tool_paths.get(&key).map(|s| s.as_str()) != Some(path_s.as_str()) {
+                self.tool_paths.insert(key, path_s);
+            }
+            return Ok(p);
+        }
+        bail!("{}", missing_tool_hint(tool))
+    }
+
+    /// Host/port for native CLIs — prefer live SSH tunnel when the source uses one (#84).
+    fn dump_connect_endpoint(&mut self, src: &DataSource) -> Result<(String, u16)> {
+        if src.uses_ssh_tunnel() {
+            let port = self.ensure_ssh_tunnel(src)?;
+            Ok(("127.0.0.1".into(), port))
+        } else {
+            let host = if src.host.is_empty() {
+                "127.0.0.1".into()
+            } else {
+                src.host.clone()
+            };
+            Ok((host, src.port))
+        }
+    }
+
+    /// Schema/table scope from Explorer selection for dump (#108).
+    fn dump_scope_from_explorer(&self) -> (Option<String>, Option<String>) {
+        let Some(e) = self.flat.get(self.selected) else {
+            return (None, None);
+        };
+        match e.kind {
+            DbNodeKind::Table | DbNodeKind::View => {
+                (e.schema.clone(), e.table.clone())
+            }
+            DbNodeKind::Schema => (e.schema.clone(), None),
+            _ => (self.active_schema.clone(), None),
+        }
+    }
+
     pub async fn dump_database(&mut self, out_dir: &Path) -> Result<PathBuf> {
         let Some(source_id) = &self.active_source else {
             bail!("no active source");
@@ -12809,6 +13040,9 @@ impl DbWorkspace {
             .clone();
         std::fs::create_dir_all(out_dir)?;
         let stamp = Local::now().format("%Y%m%d-%H%M%S");
+        let (scope_schema, scope_table) = self.dump_scope_from_explorer();
+        let schema_only = self.dump_schema_only;
+        let data_only = self.dump_data_only;
         match src.driver {
             DbDriver::Postgres => {
                 let db = self
@@ -12822,27 +13056,68 @@ impl DbWorkspace {
                             src.database.clone()
                         }
                     });
-                let out = out_dir.join(format!("{db}-{stamp}.sql"));
-                let mut cmd = Command::new("pg_dump");
-                cmd.env("PGPASSWORD", &src.password)
-                    .args([
-                        "-h",
-                        &src.host,
-                        "-p",
-                        &src.port.to_string(),
-                        "-U",
-                        &src.user,
-                        "-d",
-                        &db,
-                        "-f",
-                        out.to_str().context("path utf8")?,
-                        "--no-owner",
-                        "--no-acl",
-                    ]);
-                let status = cmd.status().context("spawn pg_dump (is it on PATH?)")?;
-                if !status.success() {
-                    bail!("pg_dump failed with {status}");
+                let scope_tag = match (&scope_schema, &scope_table) {
+                    (Some(s), Some(t)) => format!("{s}.{t}-"),
+                    (Some(s), None) => format!("{s}-"),
+                    _ => String::new(),
+                };
+                let out = out_dir.join(format!("{scope_tag}{db}-{stamp}.sql"));
+                let bin = self.resolve_cli("pg_dump")?;
+                let (host, port) = self.dump_connect_endpoint(&src)?;
+                let password = src.resolved_password();
+                let mut args = vec![
+                    "-h".into(),
+                    host,
+                    "-p".into(),
+                    port.to_string(),
+                    "-U".into(),
+                    src.user.clone(),
+                    "-d".into(),
+                    db,
+                    "-f".into(),
+                    out.to_str().context("path utf8")?.to_string(),
+                    "--no-owner".into(),
+                    "--no-acl".into(),
+                ];
+                if schema_only {
+                    args.push("--schema-only".into());
                 }
+                if data_only {
+                    args.push("--data-only".into());
+                }
+                if let Some(schema) = &scope_schema {
+                    if scope_table.is_none() {
+                        args.push("-n".into());
+                        args.push(schema.clone());
+                    }
+                }
+                if let (Some(schema), Some(table)) = (&scope_schema, &scope_table) {
+                    args.push("-t".into());
+                    args.push(format!("{schema}.{table}"));
+                }
+                let output = tokio::process::Command::new(&bin)
+                    .env("PGPASSWORD", password)
+                    .args(&args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .with_context(|| format!("spawn {}", bin.display()))?;
+                if !output.status.success() {
+                    bail!(
+                        "pg_dump failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                self.status = format!(
+                    "dumped {}{}",
+                    out.display(),
+                    match (&scope_schema, &scope_table) {
+                        (Some(s), Some(t)) => format!(" · {s}.{t}"),
+                        (Some(s), _) => format!(" · schema {s}"),
+                        _ => " · full database".into(),
+                    }
+                );
                 Ok(out)
             }
             DbDriver::Mysql => {
@@ -12855,26 +13130,44 @@ impl DbWorkspace {
                     bail!("select a MySQL database first");
                 }
                 let out = out_dir.join(format!("{db}-{stamp}.sql"));
-                let mut cmd = Command::new("mysqldump");
-                // Never put the password on argv (visible in ps/audit); MYSQL_PWD is the
-                // documented env channel for the MySQL client tools (#100).
+                let bin = self.resolve_cli("mysqldump")?;
+                let (host, port) = self.dump_connect_endpoint(&src)?;
                 let password = src.resolved_password();
+                let mut args = vec![
+                    "-h".into(),
+                    host,
+                    "-P".into(),
+                    port.to_string(),
+                    "-u".into(),
+                    src.user.clone(),
+                ];
+                if schema_only {
+                    args.push("--no-data".into());
+                }
+                if data_only {
+                    args.push("--no-create-info".into());
+                }
+                args.push(db.clone());
+                if let Some(table) = &scope_table {
+                    args.push(table.clone());
+                }
+                let file = std::fs::File::create(&out).context("create dump file")?;
+                let mut cmd = tokio::process::Command::new(&bin);
                 if !password.is_empty() {
                     cmd.env("MYSQL_PWD", password);
                 }
-                cmd.args([
-                    "-h",
-                    &src.host,
-                    "-P",
-                    &src.port.to_string(),
-                    "-u",
-                    &src.user,
-                ]);
-                cmd.arg(&db)
-                    .stdout(std::fs::File::create(&out).context("create dump file")?);
-                let status = cmd.status().context("spawn mysqldump (is it on PATH?)")?;
-                if !status.success() {
-                    bail!("mysqldump failed with {status}");
+                let output = cmd
+                    .args(&args)
+                    .stdout(file)
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .with_context(|| format!("spawn {}", bin.display()))?;
+                if !output.status.success() {
+                    bail!(
+                        "mysqldump failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
                 Ok(out)
             }
@@ -12885,10 +13178,14 @@ impl DbWorkspace {
                     src.file.clone()
                 };
                 let out = out_dir.join(format!("sqlite-{stamp}.sql"));
-                let output = Command::new("sqlite3")
+                let bin = self.resolve_cli("sqlite3")?;
+                let output = tokio::process::Command::new(&bin)
                     .args([&file, ".dump"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
                     .output()
-                    .context("spawn sqlite3 (is it on PATH?)")?;
+                    .await
+                    .with_context(|| format!("spawn {}", bin.display()))?;
                 if !output.status.success() {
                     bail!(
                         "sqlite3 .dump failed: {}",
@@ -12932,12 +13229,14 @@ impl DbWorkspace {
         let Some(source_id) = &self.active_source else {
             bail!("no active source");
         };
+        let source_id = source_id.clone();
+        self.guard_writable_op(&source_id, "restore")?;
         let src = self
             .sources
             .iter()
-            .find(|s| &s.id == source_id)
-            .context("missing source")?;
-        self.guard_writable_op(source_id, "restore")?;
+            .find(|s| s.id == source_id)
+            .context("missing source")?
+            .clone();
         let restored: Result<()> = match src.driver {
             DbDriver::Postgres => {
                 let db = self
@@ -12951,13 +13250,16 @@ impl DbWorkspace {
                             src.database.clone()
                         }
                     });
-                let status = Command::new("psql")
-                    .env("PGPASSWORD", &src.password)
+                let bin = self.resolve_cli("psql")?;
+                let (host, port) = self.dump_connect_endpoint(&src)?;
+                let password = src.resolved_password();
+                let output = tokio::process::Command::new(&bin)
+                    .env("PGPASSWORD", password)
                     .args([
                         "-h",
-                        &src.host,
+                        &host,
                         "-p",
-                        &src.port.to_string(),
+                        &port.to_string(),
                         "-U",
                         &src.user,
                         "-d",
@@ -12967,10 +13269,16 @@ impl DbWorkspace {
                         "-f",
                         dump_path.to_str().context("path utf8")?,
                     ])
-                    .status()
-                    .context("spawn psql (is it on PATH?)")?;
-                if !status.success() {
-                    bail!("psql restore failed with {status}");
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .with_context(|| format!("spawn {}", bin.display()))?;
+                if !output.status.success() {
+                    bail!(
+                        "psql restore failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
                 Ok(())
             }
@@ -12983,26 +13291,35 @@ impl DbWorkspace {
                 if db.is_empty() {
                     bail!("select a MySQL database first");
                 }
-                let mut cmd = Command::new("mysql");
-                // Keep the password off argv (ps/audit exposure); MYSQL_PWD is the
-                // documented env channel for the MySQL client tools (#171).
+                let bin = self.resolve_cli("mysql")?;
+                let (host, port) = self.dump_connect_endpoint(&src)?;
                 let password = src.resolved_password();
+                let file = std::fs::File::open(dump_path).context("open dump")?;
+                let mut cmd = tokio::process::Command::new(&bin);
                 if !password.is_empty() {
                     cmd.env("MYSQL_PWD", password);
                 }
-                cmd.args([
-                    "-h",
-                    &src.host,
-                    "-P",
-                    &src.port.to_string(),
-                    "-u",
-                    &src.user,
-                ]);
-                cmd.arg(&db)
-                    .stdin(std::fs::File::open(dump_path).context("open dump")?);
-                let status = cmd.status().context("spawn mysql (is it on PATH?)")?;
-                if !status.success() {
-                    bail!("mysql restore failed with {status}");
+                let output = cmd
+                    .args([
+                        "-h",
+                        &host,
+                        "-P",
+                        &port.to_string(),
+                        "-u",
+                        &src.user,
+                        &db,
+                    ])
+                    .stdin(file)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .with_context(|| format!("spawn {}", bin.display()))?;
+                if !output.status.success() {
+                    bail!(
+                        "mysql restore failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
                 Ok(())
             }
@@ -13012,13 +13329,21 @@ impl DbWorkspace {
                 } else {
                     src.file.clone()
                 };
-                let status = Command::new("sqlite3")
+                let bin = self.resolve_cli("sqlite3")?;
+                let dump = std::fs::File::open(dump_path).context("open dump")?;
+                let output = tokio::process::Command::new(&bin)
                     .arg(&file)
-                    .stdin(std::fs::File::open(dump_path).context("open dump")?)
-                    .status()
-                    .context("spawn sqlite3")?;
-                if !status.success() {
-                    bail!("sqlite3 restore failed with {status}");
+                    .stdin(dump)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+                    .with_context(|| format!("spawn {}", bin.display()))?;
+                if !output.status.success() {
+                    bail!(
+                        "sqlite3 restore failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
                 Ok(())
             }
@@ -13970,16 +14295,6 @@ fn parse_diff_tab_labels(title: &str) -> Result<(String, String)> {
         .split_once("..")
         .context("tab title must be diff left..right")?;
     Ok((a.trim().into(), b.trim().into()))
-}
-
-fn tool_on_path(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 fn split_sql_script(text: &str, mssql: bool) -> Vec<String> {

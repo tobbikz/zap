@@ -232,6 +232,7 @@ impl App {
         app.config.remember_project(&app.workspace.root);
         app.db.query_timeout_secs = app.config.database.query_timeout_secs;
         app.db.select_limit = app.config.database.select_limit;
+        app.db.tool_paths = app.config.database.tool_paths.clone();
         app.apply_studio_layout_from_config();
         app.refresh_queries_dir();
         if app.config.load_corrupt {
@@ -1210,6 +1211,42 @@ impl App {
         self.ui.mode = Mode::ConfirmDeleteSource;
     }
 
+    /// Open table picker first, then confirm (#292) — never silent first-table default.
+    fn start_maintenance_flow(&mut self, op: PostgresMaintenance) {
+        let key = match op {
+            PostgresMaintenance::VacuumAnalyze => "vacuum_analyze",
+            PostgresMaintenance::Analyze => "analyze",
+            PostgresMaintenance::Reindex => "reindex",
+        };
+        self.ui.pending_maintenance = Some(key.into());
+        let items: Vec<(String, String, String)> = self
+            .db
+            .flat
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.kind, ide_db::DbNodeKind::Table))
+            .map(|(i, e)| {
+                let label = match (&e.schema, &e.table) {
+                    (Some(s), Some(t)) => format!("{s}.{t}"),
+                    _ => e.label.clone(),
+                };
+                let sub = e
+                    .database
+                    .clone()
+                    .unwrap_or_else(|| e.source_id.clone());
+                (label, sub, i.to_string())
+            })
+            .collect();
+        if items.is_empty() {
+            self.ui.pending_maintenance = None;
+            self.set_status("expand a schema and pick tables first", true);
+            return;
+        }
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_db_objects(items);
+        self.set_status("pick maintenance target · Enter confirm", false);
+    }
+
     fn start_maintenance_confirm(&mut self, op: PostgresMaintenance) {
         match self.db.preview_maintenance(op) {
             Ok((_sql, msg, source_id, database)) => {
@@ -1236,6 +1273,28 @@ impl App {
             }
             Err(e) => self.set_status(format!("maintenance: {e:#}"), true),
         }
+    }
+
+    fn start_dump_options(&mut self) {
+        let scope = match self.db.flat.get(self.db.selected) {
+            Some(e) if matches!(e.kind, ide_db::DbNodeKind::Table | ide_db::DbNodeKind::View) => {
+                match (&e.schema, &e.table) {
+                    (Some(s), Some(t)) => format!("selection ({s}.{t})"),
+                    _ => "selection".into(),
+                }
+            }
+            Some(e) if matches!(e.kind, ide_db::DbNodeKind::Schema) => {
+                format!("schema ({})", e.schema.as_deref().unwrap_or("?"))
+            }
+            _ => "full database (Explorer selection used if table/schema)".into(),
+        };
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_actions(vec![
+            (format!("Dump · full / Explorer scope — {scope}"), "dump_full".into()),
+            ("Dump · schema only (DDL)".into(), "dump_schema_only".into()),
+            ("Dump · data only".into(), "dump_data_only".into()),
+        ]);
+        self.set_status("dump options · Explorer schema/table scopes the dump", false);
     }
 
     fn confirm_delete_connection(&mut self) -> Result<()> {
@@ -1566,6 +1625,12 @@ impl App {
 
     /// Handle mouse events in Database Studio: click to focus panes, wheel to scroll (#27).
     async fn handle_studio_mouse(&mut self, me: MouseEvent, _term_w: u16, term_h: u16) {
+        // Ignore Moved while a query is RUNNING so hover cannot cancel/re-run (#167 / #76).
+        if matches!(me.kind, MouseEventKind::Moved)
+            && self.ui.busy_label.as_deref() == Some("RUNNING…")
+        {
+            return;
+        }
         // Approximate Studio layout: row 0 = ribbon, row 1.. = panes.
         // Left half: Explorer (top) + Structure (bottom) ≈ studio_left_width.
         // Right half: Console (top) + Results (bottom).
@@ -1615,6 +1680,33 @@ impl App {
                             } else {
                                 let _ = self.db.refresh_structure_for_selection().await;
                             }
+                        }
+                    }
+                    // Console: place caret from click (#167).
+                    if focus == Focus::Editor && me.row >= body_top {
+                        let row_in = (me.row - body_top) as usize;
+                        let col_in = me.column.saturating_sub(left_w).saturating_sub(1) as usize;
+                        let row = self.ui.db_scroll_row + row_in;
+                        let max_row = self.db_line_count().saturating_sub(1);
+                        self.ui.db_cursor.row = row.min(max_row);
+                        let line_len = self.db_line(self.ui.db_cursor.row).chars().count();
+                        let col = self.ui.db_scroll_col + col_in;
+                        self.ui.db_cursor.col = col.min(line_len);
+                        self.ui.mode = Mode::Insert;
+                        self.ui.focus = Focus::Editor;
+                    }
+                    // Results: select cell under mouse (#167).
+                    if focus == Focus::Results {
+                        if let Some(r) = self.db.last_result.as_mut() {
+                            let header = 2u16; // title + column headers approx
+                            let row_in = me.row.saturating_sub(results_top + header) as usize;
+                            let max_row = r.rows.len().saturating_sub(1);
+                            r.cursor_row = row_in.min(max_row);
+                            // Approximate column from x — pinned + windowed grid.
+                            let col_x = me.column.saturating_sub(left_w).saturating_sub(1) as usize;
+                            let approx_col = (col_x / 14).min(r.columns.len().saturating_sub(1));
+                            r.cursor_col = approx_col;
+                            self.ui.bottom = BottomPanel::Results;
                         }
                     }
                 }
@@ -2376,15 +2468,15 @@ impl App {
                         }
                     }
                     Some("vacuum-analyze") => {
-                        self.start_maintenance_confirm(PostgresMaintenance::VacuumAnalyze)
+                        self.start_maintenance_flow(PostgresMaintenance::VacuumAnalyze)
                     }
                     Some("analyze-table") => {
-                        self.start_maintenance_confirm(PostgresMaintenance::Analyze)
+                        self.start_maintenance_flow(PostgresMaintenance::Analyze)
                     }
                     Some("reindex-table") => {
-                        self.start_maintenance_confirm(PostgresMaintenance::Reindex)
+                        self.start_maintenance_flow(PostgresMaintenance::Reindex)
                     }
-                    Some("dump") => self.dump_database().await?,
+                    Some("dump") => self.start_dump_options(),
                     Some("restore") => self.start_restore_dump(),
                     Some("schema-diff") => self.start_schema_diff(),
                     Some("schema-diff-ddl") => self.generate_schema_diff_ddl().await?,
@@ -3390,7 +3482,10 @@ impl App {
         if let Some(path_s) = sql.strip_prefix("__restore_dump__") {
             let path = PathBuf::from(path_s);
             match self.db.restore_database(&path).await {
-                Ok(()) => self.set_status(format!("restored {}", path.display()), false),
+                Ok(()) => {
+                    self.persist_discovered_tool_paths();
+                    self.set_status(format!("restored {}", path.display()), false);
+                }
                 Err(e) => self.set_status(format!("restore: {e:#}"), true),
             }
             return Ok(());
@@ -3521,10 +3616,24 @@ impl App {
     async fn dump_database(&mut self) -> Result<()> {
         let out_dir = self.workspace.root.join("exports");
         match self.db.dump_database(&out_dir).await {
-            Ok(path) => self.set_status(format!("dumped {}", path.display()), false),
+            Ok(path) => {
+                self.persist_discovered_tool_paths();
+                self.set_status(format!("dumped {}", path.display()), false);
+            }
             Err(e) => self.set_status(format!("dump: {e:#}"), true),
         }
+        // Reset one-shot dump flags after run (#108).
+        self.db.dump_schema_only = false;
+        self.db.dump_data_only = false;
         Ok(())
+    }
+
+    fn persist_discovered_tool_paths(&mut self) {
+        if self.db.tool_paths == self.config.database.tool_paths {
+            return;
+        }
+        self.config.database.tool_paths = self.db.tool_paths.clone();
+        let _ = self.config.save();
     }
 
     fn start_restore_dump(&mut self) {
@@ -6297,6 +6406,8 @@ impl App {
                 }
                 if self.ui.mode == Mode::Palette {
                     self.restore_theme_preview();
+                    self.ui.pending_maintenance = None;
+                    self.ui.pending_dump = None;
                 }
                 if self.ui.query_error.is_some() {
                     self.ui.query_error = None;
@@ -7607,7 +7718,9 @@ impl App {
             Action::ExportCsv => self.export_results_csv()?,
             Action::ExportSql => self.export_results_sql()?,
             Action::ImportCsv => self.start_import_csv(),
-            Action::DumpDatabase => self.dump_database().await?,
+            Action::DumpDatabase => {
+                self.start_dump_options();
+            }
             Action::RestoreDump => self.start_restore_dump(),
             Action::SchemaDiff => self.start_schema_diff(),
             Action::SchemaDiffDdl => self.generate_schema_diff_ddl().await?,
@@ -8051,6 +8164,15 @@ impl App {
                 }
             }
             if mode == PaletteMode::DbObjects {
+                // Maintenance target picker → confirm (#292).
+                if let Some(key) = self.ui.pending_maintenance.take() {
+                    let op = match key.as_str() {
+                        "analyze" => PostgresMaintenance::Analyze,
+                        "reindex" => PostgresMaintenance::Reindex,
+                        _ => PostgresMaintenance::VacuumAnalyze,
+                    };
+                    self.start_maintenance_confirm(op);
+                }
                 return Ok(());
             }
             // SearchEverywhere dbobj handled — stop before command match.
@@ -9095,7 +9217,22 @@ impl App {
             "cycle_query_timeout" => self.cycle_query_timeout(),
             "import_csv" => self.start_import_csv(),
             "import_json" => self.start_import_json(),
-            "dump_database" => self.dump_database().await?,
+            "dump_database" => self.start_dump_options(),
+            "dump_full" => {
+                self.db.dump_schema_only = false;
+                self.db.dump_data_only = false;
+                self.dump_database().await?;
+            }
+            "dump_schema_only" => {
+                self.db.dump_schema_only = true;
+                self.db.dump_data_only = false;
+                self.dump_database().await?;
+            }
+            "dump_data_only" => {
+                self.db.dump_schema_only = false;
+                self.db.dump_data_only = true;
+                self.dump_database().await?;
+            }
             "restore_dump" => self.start_restore_dump(),
             "schema_diff" => self.start_schema_diff(),
             "schema_diff_ddl" => self.generate_schema_diff_ddl().await?,
@@ -10154,6 +10291,12 @@ async fn event_loop(
                         }
                     }
                     Event::Mouse(me) => {
+                        // Drop Moved while RUNNING — prevents cancel/re-fire (#167 / #76).
+                        if matches!(me.kind, MouseEventKind::Moved)
+                            && app.ui.busy_label.as_deref() == Some("RUNNING…")
+                        {
+                            continue;
+                        }
                         // Product ribbon click (row 0) — not on Home (no ribbon there).
                         if matches!(me.kind, MouseEventKind::Down(MouseButton::Left))
                             && me.row == 0
@@ -10180,7 +10323,7 @@ async fn event_loop(
                                 }
                             }
                         }
-                        // Database Studio mouse: click to focus panes, wheel to scroll (#27).
+                        // Database Studio mouse: click Explorer/Results/Console (#167).
                         if app.ui.product == ProductMode::Database
                             && app.ui.db_surface == DbSurface::Studio
                             && !app.nvim_active()

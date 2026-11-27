@@ -241,6 +241,11 @@ pub struct UiState {
     pub results_sort_asc: bool,
     /// Results: per-column width override delta (col_index → delta chars) (#31).
     pub results_col_width_delta: std::collections::HashMap<usize, isize>,
+    /// After maintenance target palette picks a table, run this op (#292).
+    /// Values: `vacuum_analyze` | `analyze` | `reindex`.
+    pub pending_maintenance: Option<String>,
+    /// After dump-options palette, run dump with these flags (#108).
+    pub pending_dump: Option<String>,
 }
 
 /// Which column is active on DB Home.
@@ -356,6 +361,8 @@ impl Default for UiState {
             results_sort_asc: true,
             results_col_width_delta: std::collections::HashMap::new(),
             table_filter_order_edit: String::new(),
+            pending_maintenance: None,
+            pending_dump: None,
         }
     }
 }

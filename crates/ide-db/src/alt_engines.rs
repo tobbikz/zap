@@ -46,17 +46,19 @@ pub fn connect_redis(src: &DataSource, local_port: Option<u16>) -> Result<RedisC
     };
     let port = local_port.unwrap_or(if src.port == 0 { 6379 } else { src.port });
     let db_index: u8 = src.database.trim().parse().unwrap_or(0);
-    let url = if src.password.is_empty() {
-        format!("redis://{host}:{port}/{db_index}")
-    } else {
+    let scheme = if src.tls_required() { "rediss" } else { "redis" };
+    let auth = if !src.user.is_empty() {
         format!(
-            "redis://:{}@{}:{}/{}",
-            urlencoding_lite(&src.password),
-            host,
-            port,
-            db_index
+            "{}:{}@",
+            urlencoding_lite(&src.user),
+            urlencoding_lite(&src.password)
         )
+    } else if !src.password.is_empty() {
+        format!(":{}@", urlencoding_lite(&src.password))
+    } else {
+        String::new()
     };
+    let url = format!("{scheme}://{auth}{host}:{port}/{db_index}");
     let client = redis::Client::open(url.as_str()).context("redis client")?;
     Ok(RedisConn { client, db_index })
 }
@@ -94,15 +96,28 @@ pub async fn connect_mongo(src: &DataSource, local_port: Option<u16>) -> Result<
             urlencoding_lite(&src.password)
         )
     };
-    let uri = format!("mongodb://{user_pass}{host}:{port}/");
-    let client = mongodb::Client::with_uri_str(&uri)
-        .await
-        .context("mongodb connect")?;
     let default_db = if src.database.is_empty() {
         "test".into()
     } else {
         src.database.clone()
     };
+    // ACL users need authSource (default admin when database empty) (#160).
+    let uri = if !src.user.is_empty() {
+        let auth_source = if src.database.is_empty() {
+            "admin".to_string()
+        } else {
+            src.database.clone()
+        };
+        format!(
+            "mongodb://{user_pass}{host}:{port}/?authSource={}",
+            urlencoding_lite(&auth_source)
+        )
+    } else {
+        format!("mongodb://{user_pass}{host}:{port}/")
+    };
+    let client = mongodb::Client::with_uri_str(&uri)
+        .await
+        .context("mongodb connect")?;
     Ok(MongoConn {
         client,
         default_db,
@@ -641,12 +656,45 @@ fn duckdb_cell(v: ValueRef<'_>) -> String {
     }
 }
 
+/// Split Redis CLI line into argv, honoring single/double quotes (#160).
+pub fn parse_redis_args(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '\\' if in_single || in_double => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
     let line = line.trim();
     if line.is_empty() {
         bail!("empty command");
     }
-    let mut parts: Vec<&str> = line.split_whitespace().collect();
+    let mut parts = parse_redis_args(line);
+    if parts.is_empty() {
+        bail!("empty command");
+    }
     let cmd = parts.remove(0).to_ascii_uppercase();
     let mut conn = r
         .client
@@ -656,31 +704,70 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
     match cmd.as_str() {
         "GET" => {
             let key = parts.first().context("GET needs key")?;
-            let val: Option<String> = conn.get(*key).await.context("redis GET")?;
+            let val: Option<String> = conn.get(key.as_str()).await.context("redis GET")?;
             Ok(single_col_row("value", val.unwrap_or_else(|| "(nil)".into())))
         }
         "SET" => {
             let key = parts.first().context("SET needs key")?;
             let val = parts.get(1).context("SET needs value")?;
-            let _: () = conn.set(*key, *val).await.context("redis SET")?;
-            Ok(single_col_row("status", "OK".into()))
+            let mut redis_cmd = redis::cmd("SET");
+            redis_cmd.arg(key.as_str()).arg(val.as_str());
+            for opt in parts.iter().skip(2) {
+                redis_cmd.arg(opt.as_str());
+            }
+            let reply: redis::Value = redis_cmd.query_async(&mut conn).await.context("redis SET")?;
+            let status = match reply {
+                redis::Value::Okay => "OK".into(),
+                redis::Value::Nil => "(nil)".into(),
+                redis::Value::SimpleString(s) => s,
+                redis::Value::BulkString(b) => String::from_utf8_lossy(&b).into_owned(),
+                other => format!("{other:?}"),
+            };
+            Ok(single_col_row("status", status))
         }
         "KEYS" => {
-            let pattern = *parts.first().unwrap_or(&"*");
+            let pattern = parts.first().map(|s| s.as_str()).unwrap_or("*");
             let keys: Vec<String> = conn.keys(pattern).await.context("redis KEYS")?;
             list_keys_result(keys)
         }
         "SCAN" => {
-            let mut cursor: u64 = 0;
+            let mut cursor: u64 = parts
+                .first()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let mut match_pat: Option<&str> = None;
+            let mut count: u64 = 100;
+            let mut i = if parts.first().and_then(|s| s.parse::<u64>().ok()).is_some() {
+                1
+            } else {
+                0
+            };
+            while i < parts.len() {
+                let tok = parts[i].to_ascii_uppercase();
+                match tok.as_str() {
+                    "MATCH" => {
+                        match_pat = parts.get(i + 1).map(|s| s.as_str());
+                        i += 2;
+                    }
+                    "COUNT" => {
+                        count = parts
+                            .get(i + 1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(100);
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
             let mut all = Vec::new();
             loop {
-                let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("COUNT")
-                    .arg(100)
-                    .query_async(&mut conn)
-                    .await
-                    .context("redis SCAN")?;
+                let mut c = redis::cmd("SCAN");
+                c.arg(cursor).arg("COUNT").arg(count);
+                if let Some(pat) = match_pat {
+                    c.arg("MATCH").arg(pat);
+                }
+                let (next, batch): (u64, Vec<String>) =
+                    c.query_async(&mut conn).await.context("redis SCAN")?;
                 all.extend(batch);
                 cursor = next;
                 if cursor == 0 || all.len() >= 500 {
@@ -689,11 +776,17 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
             }
             list_keys_result(all)
         }
-        "PING" => Ok(single_col_row("pong", "PONG".into())),
+        "PING" => {
+            let pong: String = redis::cmd("PING")
+                .query_async(&mut conn)
+                .await
+                .context("redis PING")?;
+            Ok(single_col_row("pong", pong))
+        }
         "TYPE" => {
             let key = parts.first().context("TYPE needs key")?;
             let ty: String = redis::cmd("TYPE")
-                .arg(*key)
+                .arg(key.as_str())
                 .query_async(&mut conn)
                 .await
                 .context("redis TYPE")?;
@@ -701,7 +794,7 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
         }
         "TTL" => {
             let key = parts.first().context("TTL needs key")?;
-            let ttl: i64 = conn.ttl(*key).await.context("redis TTL")?;
+            let ttl: i64 = conn.ttl(key.as_str()).await.context("redis TTL")?;
             Ok(single_col_row("ttl", ttl.to_string()))
         }
         "EXPIRE" => {
@@ -711,7 +804,7 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
                 .and_then(|s| s.parse().ok())
                 .context("EXPIRE needs seconds")?;
             let ok: bool = redis::cmd("EXPIRE")
-                .arg(*key)
+                .arg(key.as_str())
                 .arg(secs)
                 .query_async(&mut conn)
                 .await
@@ -719,12 +812,14 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
             Ok(single_col_row("expire", if ok { "1" } else { "0" }.into()))
         }
         "DEL" | "UNLINK" => {
-            let key = parts.first().context("DEL needs key")?;
-            let n: i64 = redis::cmd(cmd.as_str())
-                .arg(*key)
-                .query_async(&mut conn)
-                .await
-                .context("redis DEL")?;
+            if parts.is_empty() {
+                bail!("{cmd} needs at least one key");
+            }
+            let mut c = redis::cmd(cmd.as_str());
+            for k in &parts {
+                c.arg(k.as_str());
+            }
+            let n: i64 = c.query_async(&mut conn).await.context("redis DEL")?;
             Ok(single_col_row("deleted", n.to_string()))
         }
         "DBSIZE" => {
@@ -735,7 +830,7 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
             Ok(single_col_row("keys", n.to_string()))
         }
         "INFO" => {
-            let section = parts.first().copied().unwrap_or("server");
+            let section = parts.first().map(|s| s.as_str()).unwrap_or("server");
             let info: String = redis::cmd("INFO")
                 .arg(section)
                 .query_async(&mut conn)
@@ -750,7 +845,7 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
         "HGETALL" => {
             let key = parts.first().context("HGETALL needs key")?;
             let map: std::collections::HashMap<String, String> =
-                conn.hgetall(*key).await.context("redis HGETALL")?;
+                conn.hgetall(key.as_str()).await.context("redis HGETALL")?;
             let mut q = QueryResult::empty();
             q.columns = vec!["field".into(), "value".into()];
             q.rows = map.into_iter().map(|(k, v)| vec![k, v]).collect();
@@ -761,7 +856,10 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
             let key = parts.first().context("LRANGE needs key")?;
             let start: isize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
             let stop: isize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(99);
-            let vals: Vec<String> = conn.lrange(*key, start, stop).await.context("redis LRANGE")?;
+            let vals: Vec<String> = conn
+                .lrange(key.as_str(), start, stop)
+                .await
+                .context("redis LRANGE")?;
             let mut q = QueryResult::empty();
             q.columns = vec!["index".into(), "value".into()];
             q.rows = vals
@@ -774,7 +872,10 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
         }
         "SMEMBERS" => {
             let key = parts.first().context("SMEMBERS needs key")?;
-            let vals: Vec<String> = conn.smembers(*key).await.context("redis SMEMBERS")?;
+            let vals: Vec<String> = conn
+                .smembers(key.as_str())
+                .await
+                .context("redis SMEMBERS")?;
             list_keys_result(vals)
         }
         "ZRANGE" => {
@@ -782,7 +883,7 @@ pub async fn exec_redis(r: &RedisConn, line: &str) -> Result<QueryResult> {
             let start: isize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
             let stop: isize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(99);
             let vals: Vec<String> = conn
-                .zrange(*key, start, stop)
+                .zrange(key.as_str(), start, stop)
                 .await
                 .context("redis ZRANGE")?;
             let mut q = QueryResult::empty();
@@ -823,7 +924,7 @@ pub fn is_mongo_read_only(line: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(head.as_str(), "find" | "count" | "ping" | "indexes")
+    matches!(head.as_str(), "find" | "count" | "ping" | "indexes" | "show")
 }
 
 /// Elasticsearch: allow GET/HEAD, or POST with `_search` in the path.
@@ -846,12 +947,10 @@ pub fn is_es_read_only(line: &str) -> bool {
 }
 
 pub fn is_redis_read_only(line: &str) -> bool {
-    let head = line
-        .trim()
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
+    let head = parse_redis_args(line)
+        .first()
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_default();
     matches!(
         head.as_str(),
         "GET" | "KEYS" | "SCAN" | "PING" | "TYPE" | "TTL" | "DBSIZE" | "INFO" | "HGETALL"
@@ -877,20 +976,30 @@ pub async fn exec_mongo(m: &MongoConn, line: &str, active_db: Option<&str>) -> R
             .context("mongo ping")?;
         return Ok(single_col_row("pong", "PONG".into()));
     }
+    if lower == "show dbs" || lower == "show databases" {
+        let names = m
+            .client
+            .list_database_names()
+            .await
+            .context("mongo list_database_names")?;
+        let mut q = QueryResult::empty();
+        q.columns = vec!["database".into()];
+        q.rows = names.into_iter().map(|n| vec![n]).collect();
+        q.original_rows = q.rows.clone();
+        return Ok(q);
+    }
     if lower.starts_with("find ") {
         let rest = line[5..].trim();
         let (coll, filter, limit) = parse_mongo_find(rest)?;
         return mongo_find(m, db_name, &coll, filter, limit).await;
     }
     if lower.starts_with("count ") {
-        let coll = line[6..].trim();
-        if coll.is_empty() {
-            bail!("count <collection>");
-        }
+        let rest = line[6..].trim();
+        let (coll, filter) = parse_mongo_count(rest)?;
         let db = m.client.database(db_name);
         let n = db
-            .collection::<Document>(coll)
-            .count_documents(Document::new())
+            .collection::<Document>(&coll)
+            .count_documents(filter)
             .await
             .context("mongo count")?;
         return Ok(single_col_row("count", n.to_string()));
@@ -922,7 +1031,35 @@ pub async fn exec_mongo(m: &MongoConn, line: &str, active_db: Option<&str>) -> R
     if lower.starts_with("select") {
         bail!("MongoDB: use `find collection` (not SQL SELECT)");
     }
-    bail!("MongoDB: `find|count|indexes <collection> …`");
+    bail!("MongoDB: `find|count|indexes <collection> …` · `show dbs`");
+}
+
+fn parse_mongo_count(rest: &str) -> Result<(String, Document)> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        bail!("count <collection> [{{filter}}]");
+    }
+    let mut coll = String::new();
+    let mut i = 0;
+    let bytes = rest.as_bytes();
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'{' {
+        coll.push(bytes[i] as char);
+        i += 1;
+    }
+    if coll.is_empty() {
+        bail!("count <collection>");
+    }
+    let rest = rest[i..].trim_start();
+    if rest.is_empty() {
+        return Ok((coll, Document::new()));
+    }
+    if !rest.starts_with('{') {
+        bail!("count <collection> [{{filter}}] — unexpected `{rest}`");
+    }
+    let end = find_json_object_end(rest).context("unclosed JSON filter")?;
+    let json = &rest[..=end];
+    let v: serde_json::Value = serde_json::from_str(json).context("mongo filter JSON")?;
+    Ok((coll, json_value_to_doc(&v)?))
 }
 
 fn parse_mongo_find(rest: &str) -> Result<(String, Document, i64)> {
@@ -958,10 +1095,24 @@ fn parse_mongo_find(rest: &str) -> Result<(String, Document, i64)> {
     Ok((coll, filter, limit))
 }
 
+/// Brace matcher that ignores `{`/`}` inside JSON strings (#160).
 fn find_json_object_end(s: &str) -> Option<usize> {
     let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
     for (i, c) in s.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match c {
+            '"' => in_string = true,
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -1014,6 +1165,27 @@ fn json_to_bson(v: serde_json::Value) -> Bson {
         serde_json::Value::String(s) => Bson::String(s),
         serde_json::Value::Array(a) => Bson::Array(a.into_iter().map(json_to_bson).collect()),
         serde_json::Value::Object(o) => {
+            // Extended JSON ($oid, $date) (#160).
+            if let Some(oid) = o.get("$oid").and_then(|v| v.as_str()) {
+                if let Ok(oid) = mongodb::bson::oid::ObjectId::parse_str(oid) {
+                    return Bson::ObjectId(oid);
+                }
+            }
+            if let Some(d) = o.get("$date") {
+                if let Some(ms) = d.as_i64() {
+                    return Bson::DateTime(mongodb::bson::DateTime::from_millis(ms));
+                }
+                if let Some(s) = d.as_str() {
+                    if let Ok(dt) = mongodb::bson::DateTime::parse_rfc3339_str(s) {
+                        return Bson::DateTime(dt);
+                    }
+                }
+                if let Some(num) = d.get("$numberLong").and_then(|v| v.as_str()) {
+                    if let Ok(ms) = num.parse::<i64>() {
+                        return Bson::DateTime(mongodb::bson::DateTime::from_millis(ms));
+                    }
+                }
+            }
             let mut d = Document::new();
             for (k, v) in o {
                 d.insert(k, json_to_bson(v));
@@ -1276,12 +1448,39 @@ fn bail_bigquery_errors(v: &serde_json::Value) -> Result<()> {
 }
 
 fn urlencoding_lite(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u8),
-        })
-        .collect()
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod redis_mongo_cli_tests {
+    use super::{find_json_object_end, parse_redis_args, urlencoding_lite};
+
+    #[test]
+    fn redis_args_honors_quotes() {
+        let p = parse_redis_args(r#"SET key "hello world" EX 60"#);
+        assert_eq!(p, vec!["SET", "key", "hello world", "EX", "60"]);
+    }
+
+    #[test]
+    fn json_object_end_ignores_braces_in_strings() {
+        let s = r#"{"a":"}x{","b":1}"#;
+        assert_eq!(find_json_object_end(s), Some(s.len() - 1));
+    }
+
+    #[test]
+    fn urlencoding_encodes_utf8_bytes() {
+        let s = urlencoding_lite("ñoño");
+        assert!(s.contains("%C3%B1"), "{s}");
+    }
 }
 
 #[cfg(test)]
