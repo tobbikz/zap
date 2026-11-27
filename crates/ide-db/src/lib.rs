@@ -320,6 +320,8 @@ impl DataSource {
                     self.database
                 );
                 append_pg_ssl_query(&mut url, ssl_mode, &self.ssl_ca);
+                // Attribute pool backends in pg_stat_activity (#288).
+                append_pg_query_param(&mut url, "application_name", "zap");
                 url
             }
             DbDriver::Mysql => {
@@ -437,13 +439,21 @@ fn append_pg_ssl_query(url: &mut String, ssl_mode: &str, ssl_ca: &str) {
     if mode.is_empty() || mode == "prefer" {
         return;
     }
-    url.push('?');
-    url.push_str("sslmode=");
-    url.push_str(mode);
+    append_pg_query_param(url, "sslmode", mode);
     if !ssl_ca.trim().is_empty() && (mode == "verify-full" || mode == "verify-ca") {
-        url.push_str("&sslrootcert=");
-        url.push_str(&urlencoding_lite(ssl_ca.trim()));
+        append_pg_query_param(url, "sslrootcert", &urlencoding_lite(ssl_ca.trim()));
     }
+}
+
+fn append_pg_query_param(url: &mut String, key: &str, value: &str) {
+    if url.contains('?') {
+        url.push('&');
+    } else {
+        url.push('?');
+    }
+    url.push_str(key);
+    url.push('=');
+    url.push_str(value);
 }
 
 fn append_mysql_ssl_query(url: &mut String, ssl_mode: &str, ssl_ca: &str) {
@@ -5334,8 +5344,9 @@ impl DbWorkspace {
         let url = src.url_via(local_port);
         let pool = match src.driver {
             DbDriver::Postgres => {
+                // Smaller pool: Explorer multi-DB expand used to look like Zap leaks (#288).
                 let p = PgPoolOptions::new()
-                    .max_connections(5)
+                    .max_connections(3)
                     .connect(&url)
                     .await
                     .with_context(|| {
@@ -5354,7 +5365,7 @@ impl DbWorkspace {
             }
             DbDriver::Mysql => {
                 let p = MySqlPoolOptions::new()
-                    .max_connections(5)
+                    .max_connections(3)
                     .connect(&url)
                     .await
                     .with_context(|| {
@@ -11491,12 +11502,33 @@ SELECT metric, value FROM (
 ) x ORDER BY ord;";
 
 pub const PG_HEALTH_ACTIVITY: &str = "\
-SELECT pid, usename, datname, client_addr, state, wait_event_type, wait_event,
-  backend_start, xact_start, query_start,
-  left(query, 160) AS query
-FROM pg_stat_activity
-WHERE pid <> pg_backend_pid()
-ORDER BY state NULLS LAST, query_start DESC NULLS LAST;";
+SELECT
+  CASE WHEN a.backend_type = 'client backend' THEN 'client' ELSE 'worker' END AS class,
+  a.pid,
+  coalesce(a.usename, '—') AS usename,
+  coalesce(a.datname, '—') AS datname,
+  coalesce(nullif(a.application_name, ''), '—') AS app,
+  a.backend_type,
+  coalesce(a.state, '—') AS state,
+  coalesce(a.wait_event, a.wait_event_type, '—') AS wait,
+  left(coalesce(a.query, ''), 120) AS query
+FROM pg_stat_activity a
+WHERE a.pid <> pg_backend_pid()
+  AND (
+    a.backend_type = 'client backend'
+    OR a.state = 'active'
+    OR coalesce(a.wait_event_type, '') <> 'Activity'
+  )
+ORDER BY
+  CASE WHEN a.backend_type = 'client backend' THEN 0 ELSE 1 END,
+  CASE a.state
+    WHEN 'active' THEN 0
+    WHEN 'idle in transaction' THEN 1
+    WHEN 'idle in transaction (aborted)' THEN 1
+    WHEN 'idle' THEN 2
+    ELSE 3
+  END,
+  a.query_start DESC NULLS LAST;";
 
 pub const PG_HEALTH_BLOCKING: &str = "\
 SELECT blocked.pid AS blocked_pid,
@@ -11546,7 +11578,7 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind = 'r'
   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
 ORDER BY pg_total_relation_size(c.oid) DESC
-LIMIT 40;";
+LIMIT 500;";
 
 pub const PG_HEALTH_INDEXES: &str = "\
 SELECT schemaname, relname AS table, indexrelname AS index,
@@ -11554,7 +11586,7 @@ SELECT schemaname, relname AS table, indexrelname AS index,
   pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
 FROM pg_stat_user_indexes
 ORDER BY idx_scan ASC, pg_relation_size(indexrelid) DESC
-LIMIT 40;";
+LIMIT 500;";
 
 // Prefer information_schema — works on MariaDB and MySQL with performance_schema=OFF (#133).
 pub const MYSQL_HEALTH_OVERVIEW: &str = "\
@@ -11570,9 +11602,14 @@ WHERE VARIABLE_NAME = 'max_connections'
 ORDER BY metric;";
 
 pub const MYSQL_HEALTH_ACTIVITY: &str = "\
-SELECT id, user, host, db, command, time, state, left(info, 160) AS info
+SELECT id, user, host, db, command, time,
+  coalesce(state, '—') AS state,
+  left(coalesce(info, ''), 120) AS query
 FROM information_schema.processlist
-ORDER BY time DESC;";
+ORDER BY
+  CASE WHEN command = 'Sleep' THEN 1 ELSE 0 END,
+  time DESC
+LIMIT 500;";
 
 pub const MYSQL_HEALTH_LOCKS: &str = "\
 SELECT id AS session_id, user, host, db, command, time, state,
@@ -11601,7 +11638,7 @@ SELECT id AS session_id, user, host, db, time AS sec,
 FROM information_schema.processlist
 WHERE command <> 'Sleep' AND info IS NOT NULL
 ORDER BY time DESC
-LIMIT 25;";
+LIMIT 200;";
 
 pub const CH_HEALTH_OVERVIEW: &str = "\
 SELECT 'processes' AS metric, toString(count()) AS value FROM system.processes
@@ -11634,7 +11671,7 @@ FROM system.parts
 WHERE active
 GROUP BY database, table
 ORDER BY sum(bytes_on_disk) DESC
-LIMIT 40";
+LIMIT 500";
 
 pub const MSSQL_HEALTH_OVERVIEW: &str = "\
 SELECT metric, value FROM (
@@ -11781,7 +11818,7 @@ OUTER APPLY (
 ORDER BY j.name;";
 
 pub const MSSQL_HEALTH_INDEXES: &str = "\
-SELECT TOP 40
+SELECT TOP 500
   DB_NAME() AS [database],
   OBJECT_SCHEMA_NAME(ips.object_id) AS [schema],
   OBJECT_NAME(ips.object_id) AS [table],
