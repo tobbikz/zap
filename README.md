@@ -158,6 +158,8 @@ Windows PowerShell uses square borders and Consolas-safe icons automatically. In
 | `c` / `u` | Connect / disconnect (Explorer source) |
 | `t` / `x` / `X` | Begin / rollback / commit txn (Console · Results) |
 | `Enter` | Inspect (Results) / open (Explorer) |
+| `f` / `U` | Explorer type filter · toggle system schemas |
+| `←` `→` | Explorer collapse / expand folder (partitions) |
 | `w` / `o` | WHERE / ORDER BY |
 | `m` | Results actions |
 | `?` | Help |

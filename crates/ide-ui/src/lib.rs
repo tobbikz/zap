@@ -1320,16 +1320,29 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
         ))],
     };
     let filter = db.map(|w| w.explorer_filter.trim()).unwrap_or("");
+    let type_f = db
+        .map(|w| w.explorer_type_filter())
+        .unwrap_or_default();
+    let type_bit = if type_f == ide_db::ExplorerTypeFilter::All {
+        String::new()
+    } else {
+        format!(" · {}", type_f.label())
+    };
+    let sys_bit = if db.map(|w| w.explorer_show_system).unwrap_or(false) {
+        " · sys"
+    } else {
+        ""
+    };
     let title = if !filter.is_empty() {
         if focused {
-            format!(" Explorer · /{filter} ")
+            format!(" Explorer{type_bit}{sys_bit} · /{filter} ")
         } else {
-            format!(" explorer · /{filter} ")
+            format!(" explorer{type_bit}{sys_bit} · /{filter} ")
         }
     } else if focused {
-        " Explorer ".into()
+        format!(" Explorer{type_bit}{sys_bit} ")
     } else {
-        " explorer ".into()
+        format!(" explorer{type_bit}{sys_bit} ")
     };
     frame.render_widget(
         List::new(items).block(theme::pane_block(&title, focused)),
@@ -3782,7 +3795,10 @@ fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
             ("Ctrl-P", "command palette"),
             ("Ctrl-W", "close SQL tab"),
             ("Enter", "open / expand"),
+            ("← →", "collapse / expand folder"),
             ("/", "filter tree by name"),
+            ("f", "cycle type filter (tables/views/…)"),
+            ("U", "toggle system schemas"),
             ("c  u", "connect · disconnect source"),
             ("Ctrl+←→", "resize explorer width"),
             ("Ctrl+↑↓", "resize results height"),
@@ -3933,7 +3949,7 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Explorer: Enter open · d DDL · n Create · e edit conn",
+                "Explorer: Enter open · / name · f type · U sys · d DDL · n Create",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(

@@ -614,6 +614,72 @@ pub enum DbNodeKind {
     Routine,
 }
 
+/// Explorer object-type filter (#11). Cycles with `f` when Explorer focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExplorerTypeFilter {
+    #[default]
+    All,
+    Tables,
+    Views,
+    MatViews,
+    Routines,
+    Sequences,
+}
+
+impl ExplorerTypeFilter {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::All => Self::Tables,
+            Self::Tables => Self::Views,
+            Self::Views => Self::MatViews,
+            Self::MatViews => Self::Routines,
+            Self::Routines => Self::Sequences,
+            Self::Sequences => Self::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Tables => "tables",
+            Self::Views => "views",
+            Self::MatViews => "matviews",
+            Self::Routines => "routines",
+            Self::Sequences => "sequences",
+        }
+    }
+
+    fn matches_entry(self, e: &FlatDbEntry) -> bool {
+        match self {
+            Self::All => true,
+            Self::Tables => {
+                matches!(e.kind, DbNodeKind::Table)
+                    && e.query_sql.as_deref() != Some("SEQUENCE")
+                    && e.query_sql.as_deref() != Some("TYPE")
+            }
+            Self::Views => {
+                e.kind == DbNodeKind::View
+                    && e.query_sql.as_deref() != Some("MATERIALIZED VIEW")
+            }
+            Self::MatViews => {
+                e.kind == DbNodeKind::View
+                    && e.query_sql.as_deref() == Some("MATERIALIZED VIEW")
+            }
+            Self::Routines => {
+                e.kind == DbNodeKind::Routine
+                    && !matches!(
+                        e.query_sql.as_deref(),
+                        Some("SEQUENCE") | Some("TYPE")
+                    )
+            }
+            Self::Sequences => {
+                e.kind == DbNodeKind::Routine
+                    && e.query_sql.as_deref() == Some("SEQUENCE")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DbTreeNode {
     pub id: String,
@@ -1602,6 +1668,10 @@ pub struct DbWorkspace {
     pub connection_health: HashMap<String, ConnHealth>,
     /// Local Explorer name filter (`/` when Explorer focused) (#9).
     pub explorer_filter: String,
+    /// Per-connection Explorer type filter (#11). Missing key ⇒ All.
+    pub explorer_type_by_source: HashMap<String, ExplorerTypeFilter>,
+    /// When true, Postgres lists catalog / temp schemas (#11).
+    pub explorer_show_system: bool,
     /// Cell edit undo stack, grouped so paste can undo atomically.
     pub cell_undo: Vec<CellUndoBatch>,
     /// Backend pid/id for the in-flight query connection (PG/MySQL/MSSQL).
@@ -1751,6 +1821,8 @@ impl Default for DbWorkspace {
             select_limit: RESULT_PAGE_SIZE,
             connection_health: HashMap::new(),
             explorer_filter: String::new(),
+            explorer_type_by_source: HashMap::new(),
+            explorer_show_system: false,
             cell_undo: Vec::new(),
             query_backend_pid: Arc::new(AtomicI64::new(0)),
             query_cancel_token: None,
@@ -2283,14 +2355,96 @@ impl DbWorkspace {
         for node in &self.tree {
             flatten(node, 0, &mut full);
         }
+        // Type filter first, then name search (#11 + #9).
+        let typed = filter_flat_by_type(&full, &self.explorer_type_by_source);
         self.flat = if self.explorer_filter.trim().is_empty() {
-            full
+            typed
         } else {
-            filter_flat_with_ancestors(&full, &self.explorer_filter)
+            filter_flat_with_ancestors(&typed, &self.explorer_filter)
         };
         if self.selected >= self.flat.len() {
             self.selected = self.flat.len().saturating_sub(1);
         }
+    }
+
+    /// Active type filter for the selected / active connection (#11).
+    pub fn explorer_type_filter(&self) -> ExplorerTypeFilter {
+        let sid = self
+            .flat
+            .get(self.selected)
+            .map(|e| e.source_id.as_str())
+            .or(self.active_source.as_deref());
+        sid.and_then(|id| self.explorer_type_by_source.get(id).copied())
+            .unwrap_or_default()
+    }
+
+    /// Cycle tables → views → matviews → routines → sequences → all (#11).
+    pub fn cycle_explorer_type_filter(&mut self) {
+        let sid = self
+            .flat
+            .get(self.selected)
+            .map(|e| e.source_id.clone())
+            .or_else(|| self.active_source.clone())
+            .unwrap_or_default();
+        let next = self
+            .explorer_type_by_source
+            .get(&sid)
+            .copied()
+            .unwrap_or_default()
+            .cycle();
+        if next == ExplorerTypeFilter::All {
+            self.explorer_type_by_source.remove(&sid);
+        } else {
+            self.explorer_type_by_source.insert(sid, next);
+        }
+        self.rebuild_flat();
+        self.status = format!("explorer type: {}", next.label());
+    }
+
+    /// Toggle catalog / temp schemas in Explorer (#11). Re-expand source to reload.
+    pub fn toggle_explorer_show_system(&mut self) {
+        self.explorer_show_system = !self.explorer_show_system;
+        self.status = if self.explorer_show_system {
+            "system schemas on — re-expand source to reload".into()
+        } else {
+            "system schemas off — re-expand source to reload".into()
+        };
+    }
+
+    /// Expand the selected explorer node when it has children (←/→ / partitions) (#6).
+    pub fn explorer_expand_selected(&mut self) -> bool {
+        let Some(entry) = self.flat.get(self.selected).cloned() else {
+            return false;
+        };
+        let Some(node) = find_node(&self.tree, &entry.id) else {
+            return false;
+        };
+        if node.children.is_empty() || node.expanded {
+            return false;
+        }
+        if let Some(n) = find_node_mut(&mut self.tree, &entry.id) {
+            n.expanded = true;
+        }
+        self.rebuild_flat();
+        true
+    }
+
+    /// Collapse the selected explorer node (#6).
+    pub fn explorer_collapse_selected(&mut self) -> bool {
+        let Some(entry) = self.flat.get(self.selected).cloned() else {
+            return false;
+        };
+        let Some(node) = find_node(&self.tree, &entry.id) else {
+            return false;
+        };
+        if !node.expanded {
+            return false;
+        }
+        if let Some(n) = find_node_mut(&mut self.tree, &entry.id) {
+            n.expanded = false;
+        }
+        self.rebuild_flat();
+        true
     }
 
     /// Collapse all expanded explorer tree nodes (#34).
@@ -4970,26 +5124,22 @@ impl DbWorkspace {
                         .map(|s| s.driver)
                         .unwrap_or_default();
                     let children = match driver {
-                        // MySQL: database node lists tables directly.
+                        // MySQL: database node lists object folders (#7).
                         DbDriver::Mysql => {
-                            let mut kids = self
-                                .introspect_tables(&entry.source_id, Some(&dbname), &dbname)
-                                .await?;
-                            if let Ok(prog) = self
-                                .introspect_programmability(
-                                    &entry.source_id,
-                                    Some(&dbname),
-                                    &dbname,
-                                )
-                                .await
-                            {
-                                kids.insert(0, prog);
-                            }
-                            kids
+                            self.introspect_schema_explorer(
+                                &entry.source_id,
+                                Some(&dbname),
+                                &dbname,
+                            )
+                            .await?
                         }
                         DbDriver::Clickhouse => {
-                            self.introspect_tables(&entry.source_id, Some(&dbname), &dbname)
-                                .await?
+                            self.introspect_schema_explorer(
+                                &entry.source_id,
+                                Some(&dbname),
+                                &dbname,
+                            )
+                            .await?
                         }
                         DbDriver::Mongo => {
                             self.introspect_mongo_collections(&entry.source_id, &dbname)
@@ -5041,25 +5191,8 @@ impl DbWorkspace {
                                 _ => Vec::new(),
                             }
                         } else {
-                            let mut kids = self
-                                .introspect_tables(&entry.source_id, db, schema)
-                                .await?;
-                            if matches!(
-                                driver,
-                                DbDriver::Postgres | DbDriver::Mysql | DbDriver::Mssql
-                            ) {
-                                if let Ok(prog) = self
-                                    .introspect_programmability(
-                                        &entry.source_id,
-                                        db,
-                                        schema,
-                                    )
-                                    .await
-                                {
-                                    kids.insert(0, prog);
-                                }
-                            }
-                            kids
+                            self.introspect_schema_explorer(&entry.source_id, db, schema)
+                                .await?
                         };
                         if let Some(node) = find_node_mut(&mut self.tree, &entry.id) {
                             node.children = children;
@@ -5069,8 +5202,22 @@ impl DbWorkspace {
                 self.rebuild_flat();
             }
             DbNodeKind::Table | DbNodeKind::View => {
-                // DataGrip-style: Enter opens a table data tab; columns live in Structure.
-                let _ = self.open_selected_table_tab().await?;
+                // Partition parents: first Enter expands Partitions; next opens data (#6).
+                let has_kids = find_node(&self.tree, &entry.id)
+                    .map(|n| !n.children.is_empty())
+                    .unwrap_or(false);
+                let expanded = find_node(&self.tree, &entry.id)
+                    .map(|n| n.expanded)
+                    .unwrap_or(false);
+                if has_kids && !expanded {
+                    if let Some(n) = find_node_mut(&mut self.tree, &entry.id) {
+                        n.expanded = true;
+                    }
+                    self.rebuild_flat();
+                } else {
+                    // DataGrip-style: Enter opens a table data tab; columns live in Structure.
+                    let _ = self.open_selected_table_tab().await?;
+                }
             }
             DbNodeKind::Routine => {
                 // Enter scripts routine DDL into a console tab.
@@ -5669,20 +5816,18 @@ impl DbWorkspace {
         let db_owned = database.map(|s| s.to_string());
         match pool {
             LivePool::Pg(p) => {
-                // Hide catalog + temp schemas (`pg_temp_*`, `pg_toast_temp_*`, …) — #283.
+                // Hide catalog + temp schemas unless explorer_show_system (#283 / #11).
                 let rows = sqlx::query(
-                    "SELECT schema_name FROM information_schema.schemata \
-                     WHERE schema_name NOT IN ('information_schema') \
-                       AND schema_name !~ '^pg_' \
-                     ORDER BY 1",
+                    "SELECT schema_name FROM information_schema.schemata ORDER BY 1",
                 )
                 .fetch_all(p)
                 .await?;
+                let show_system = self.explorer_show_system;
                 Ok(rows
                     .into_iter()
                     .filter_map(|r| {
                         let name: String = r.get("schema_name");
-                        if !is_user_pg_schema(&name) {
+                        if !show_system && !is_user_pg_schema(&name) {
                             return None;
                         }
                         let id_db = db_owned.clone().unwrap_or_default();
@@ -5761,6 +5906,355 @@ impl DbWorkspace {
         }
     }
 
+    /// Schema explorer folders: Tables / Views / … with partitions nested (#7 / #6).
+    async fn introspect_schema_explorer(
+        &self,
+        source_id: &str,
+        database: Option<&str>,
+        schema: &str,
+    ) -> Result<Vec<DbTreeNode>> {
+        let key = Self::pool_key(source_id, database);
+        let pool = self.pools.get(&key).context("not connected")?;
+        let db_owned = database.map(|s| s.to_string());
+        match pool {
+            LivePool::Pg(p) => {
+                let rows = sqlx::query(
+                    "SELECT c.relname AS name, \
+                            CASE c.relkind \
+                              WHEN 'r' THEN 'BASE TABLE' \
+                              WHEN 'p' THEN 'PARTITIONED TABLE' \
+                              WHEN 'v' THEN 'VIEW' \
+                              WHEN 'm' THEN 'MATERIALIZED VIEW' \
+                              ELSE 'OTHER' END AS table_type, \
+                            c.relispartition AS is_partition, \
+                            (SELECT p.relname FROM pg_inherits i \
+                               JOIN pg_class p ON p.oid = i.inhparent \
+                              WHERE i.inhrelid = c.oid LIMIT 1) AS parent_name \
+                     FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = $1 \
+                       AND c.relkind IN ('r','p','v','m') \
+                     ORDER BY c.relname",
+                )
+                .bind(schema)
+                .fetch_all(p)
+                .await?;
+
+                let mut tables: Vec<DbTreeNode> = Vec::new();
+                let mut views: Vec<DbTreeNode> = Vec::new();
+                let mut matviews: Vec<DbTreeNode> = Vec::new();
+                let mut partitions: HashMap<String, Vec<DbTreeNode>> = HashMap::new();
+
+                for r in rows {
+                    let name: String = r.get("name");
+                    let ty: String = r.get("table_type");
+                    let is_partition: bool = r.try_get("is_partition").unwrap_or(false);
+                    let parent: Option<String> = r.try_get("parent_name").ok();
+                    let node = relation_node(
+                        source_id,
+                        db_owned.clone(),
+                        schema,
+                        &name,
+                        &ty,
+                    );
+                    if is_partition {
+                        let key = parent.unwrap_or_else(|| "_orphans".into());
+                        partitions.entry(key).or_default().push(node);
+                        continue;
+                    }
+                    match ty.as_str() {
+                        "VIEW" => views.push(node),
+                        "MATERIALIZED VIEW" => matviews.push(node),
+                        _ => tables.push(node),
+                    }
+                }
+
+                for t in &mut tables {
+                    let Some(tname) = t.table.clone() else {
+                        continue;
+                    };
+                    if let Some(parts) = partitions.remove(&tname) {
+                        t.children = vec![object_folder(
+                            source_id,
+                            db_owned.clone(),
+                            schema,
+                            &format!("partitions::{tname}"),
+                            "Partitions",
+                            parts,
+                        )];
+                    }
+                }
+                // Orphan partitions (parent missing) surface under Tables.
+                if let Some(orphans) = partitions.remove("_orphans") {
+                    tables.extend(orphans);
+                }
+                for (_parent, parts) in partitions {
+                    tables.extend(parts);
+                }
+
+                let mut folders = Vec::new();
+                push_folder_if(
+                    &mut folders,
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    "tables",
+                    "Tables",
+                    tables,
+                );
+                push_folder_if(
+                    &mut folders,
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    "views",
+                    "Views",
+                    views,
+                );
+                push_folder_if(
+                    &mut folders,
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    "matviews",
+                    "Materialized views",
+                    matviews,
+                );
+
+                // Functions / procedures / triggers / sequences / types.
+                let mut functions = Vec::new();
+                let mut procedures = Vec::new();
+                let proc_rows = sqlx::query(
+                    "SELECT p.proname AS name, \
+                            CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS kind \
+                     FROM pg_proc p \
+                     JOIN pg_namespace n ON n.oid = p.pronamespace \
+                     WHERE n.nspname = $1 \
+                     ORDER BY kind, name \
+                     LIMIT 500",
+                )
+                .bind(schema)
+                .fetch_all(p)
+                .await
+                .unwrap_or_default();
+                for r in proc_rows {
+                    let name: String = r.get("name");
+                    let kind: String = r.get("kind");
+                    let node = routine_node(
+                        source_id,
+                        db_owned.clone(),
+                        schema,
+                        &name,
+                        &kind,
+                    );
+                    if kind.eq_ignore_ascii_case("PROCEDURE") {
+                        procedures.push(node);
+                    } else {
+                        functions.push(node);
+                    }
+                }
+                let mut triggers = Vec::new();
+                let trig = sqlx::query(
+                    "SELECT t.tgname AS name \
+                     FROM pg_trigger t \
+                     JOIN pg_class c ON c.oid = t.tgrelid \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE NOT t.tgisinternal AND n.nspname = $1 \
+                     ORDER BY 1 LIMIT 200",
+                )
+                .bind(schema)
+                .fetch_all(p)
+                .await
+                .unwrap_or_default();
+                for r in trig {
+                    let name: String = r.get("name");
+                    triggers.push(routine_node(
+                        source_id,
+                        db_owned.clone(),
+                        schema,
+                        &name,
+                        "TRIGGER",
+                    ));
+                }
+                push_folder_if(
+                    &mut folders,
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    "functions",
+                    "Functions",
+                    functions,
+                );
+                push_folder_if(
+                    &mut folders,
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    "procedures",
+                    "Procedures",
+                    procedures,
+                );
+                push_folder_if(
+                    &mut folders,
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    "triggers",
+                    "Triggers",
+                    triggers,
+                );
+
+                let mut sequences = Vec::new();
+                let seq_rows = sqlx::query(
+                    "SELECT c.relname AS name \
+                     FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = $1 AND c.relkind = 'S' \
+                     ORDER BY 1 LIMIT 500",
+                )
+                .bind(schema)
+                .fetch_all(p)
+                .await
+                .unwrap_or_default();
+                for r in seq_rows {
+                    let name: String = r.get("name");
+                    sequences.push(routine_node(
+                        source_id,
+                        db_owned.clone(),
+                        schema,
+                        &name,
+                        "SEQUENCE",
+                    ));
+                }
+                push_folder_if(
+                    &mut folders,
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    "sequences",
+                    "Sequences",
+                    sequences,
+                );
+
+                let mut types = Vec::new();
+                let type_rows = sqlx::query(
+                    "SELECT t.typname AS name, \
+                            CASE t.typtype WHEN 'e' THEN 'ENUM' WHEN 'd' THEN 'DOMAIN' \
+                              ELSE 'TYPE' END AS kind \
+                     FROM pg_type t \
+                     JOIN pg_namespace n ON n.oid = t.typnamespace \
+                     WHERE n.nspname = $1 \
+                       AND t.typtype IN ('c','e','d') \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM pg_class c \
+                         WHERE c.reltype = t.oid OR c.reloftype = t.oid \
+                       ) \
+                     ORDER BY 1 LIMIT 300",
+                )
+                .bind(schema)
+                .fetch_all(p)
+                .await
+                .unwrap_or_default();
+                for r in type_rows {
+                    let name: String = r.get("name");
+                    types.push(routine_node(
+                        source_id,
+                        db_owned.clone(),
+                        schema,
+                        &name,
+                        "TYPE",
+                    ));
+                }
+                push_folder_if(
+                    &mut folders,
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    "types",
+                    "Types",
+                    types,
+                );
+
+                Ok(folders)
+            }
+            LivePool::Mysql(_)
+            | LivePool::Sqlite(_)
+            | LivePool::Mssql(_)
+            | LivePool::Clickhouse(_)
+            | LivePool::Duckdb(_) => {
+                let flat = self
+                    .introspect_tables(source_id, database, schema)
+                    .await?;
+                let mut folders = group_relation_folders(
+                    source_id,
+                    db_owned.clone(),
+                    schema,
+                    flat,
+                );
+                if matches!(
+                    pool,
+                    LivePool::Mysql(_) | LivePool::Mssql(_)
+                ) {
+                    if let Ok(prog) = self
+                        .introspect_programmability(source_id, database, schema)
+                        .await
+                    {
+                        // Split Programmability children into Functions / Procedures / Triggers.
+                        let mut functions = Vec::new();
+                        let mut procedures = Vec::new();
+                        let mut triggers = Vec::new();
+                        for child in prog.children {
+                            let kind = child
+                                .query_sql
+                                .as_deref()
+                                .unwrap_or("")
+                                .to_ascii_uppercase();
+                            if kind.contains("TRIG") {
+                                triggers.push(child);
+                            } else if kind.contains("PROC") {
+                                procedures.push(child);
+                            } else {
+                                functions.push(child);
+                            }
+                        }
+                        push_folder_if(
+                            &mut folders,
+                            source_id,
+                            db_owned.clone(),
+                            schema,
+                            "functions",
+                            "Functions",
+                            functions,
+                        );
+                        push_folder_if(
+                            &mut folders,
+                            source_id,
+                            db_owned.clone(),
+                            schema,
+                            "procedures",
+                            "Procedures",
+                            procedures,
+                        );
+                        push_folder_if(
+                            &mut folders,
+                            source_id,
+                            db_owned.clone(),
+                            schema,
+                            "triggers",
+                            "Triggers",
+                            triggers,
+                        );
+                    }
+                }
+                Ok(folders)
+            }
+            LivePool::Redis(_)
+            | LivePool::Mongo(_)
+            | LivePool::CloudStub(_)
+            | LivePool::Http(_) => Ok(Vec::new()),
+        }
+    }
+
     async fn introspect_tables(
         &self,
         source_id: &str,
@@ -5772,6 +6266,7 @@ impl DbWorkspace {
         let db_owned = database.map(|s| s.to_string());
         match pool {
             LivePool::Pg(p) => {
+                // Flat list for ER / diff / cache — partitions included as peers here.
                 let rows = sqlx::query(
                     "SELECT table_name, table_type FROM information_schema.tables \
                      WHERE table_schema = $1 \
@@ -5785,24 +6280,7 @@ impl DbWorkspace {
                     .map(|r| {
                         let name: String = r.get("table_name");
                         let ty: String = r.get("table_type");
-                        let kind = if ty.contains("VIEW") {
-                            DbNodeKind::View
-                        } else {
-                            DbNodeKind::Table
-                        };
-                        let id_db = db_owned.clone().unwrap_or_default();
-                        DbTreeNode {
-                            id: format!("{source_id}::table::{id_db}::{schema}::{name}"),
-                            label: name.clone(),
-                            kind,
-                            source_id: source_id.into(),
-                            database: db_owned.clone(),
-                            schema: Some(schema.into()),
-                            table: Some(name),
-                            query_sql: None,
-                            children: Vec::new(),
-                            expanded: false,
-                        }
+                        relation_node(source_id, db_owned.clone(), schema, &name, &ty)
                     })
                     .collect())
             }
@@ -7419,7 +7897,7 @@ impl DbWorkspace {
         false
     }
 
-    /// Expand the target schema in the explorer tree, then select the table (#30).
+    /// Expand the target schema in the explorer tree, then select the table (#30 / #7).
     pub async fn expand_and_select_table(
         &mut self,
         source_id: &str,
@@ -7452,14 +7930,18 @@ impl DbWorkspace {
                 if let Some(node) = find_node_mut(&mut self.tree, &sid) {
                     node.expanded = true;
                 }
-                let children = self.introspect_tables(source_id, database, schema).await?;
+                let children = self
+                    .introspect_schema_explorer(source_id, database, schema)
+                    .await?;
                 if let Some(node) = find_node_mut(&mut self.tree, &sid) {
                     if node.children.is_empty() {
                         node.children = children;
                     }
                 }
-                self.rebuild_flat();
             }
+            // Open Tables / Views / MatViews (+ Partitions) so the leaf is visible (#7 / #6).
+            expand_folders_to_relation(&mut self.tree, &sid, table);
+            self.rebuild_flat();
         }
         Ok(self.select_table_in_explorer(source_id, database, schema, table))
     }
@@ -9808,21 +10290,238 @@ fn filter_flat_with_ancestors(full: &[FlatDbEntry], filter: &str) -> Vec<FlatDbE
             continue;
         }
         keep[i] = true;
-        let mut depth = e.depth;
-        for j in (0..i).rev() {
-            if full[j].depth < depth {
-                keep[j] = true;
-                depth = full[j].depth;
-                if depth == 0 {
-                    break;
-                }
-            }
-        }
+        mark_ancestors(full, i, &mut keep);
     }
     full.iter()
         .enumerate()
         .filter_map(|(i, e)| keep[i].then(|| e.clone()))
         .collect()
+}
+
+/// Per-connection type filter; empty groups drop out with their leaves (#11).
+fn filter_flat_by_type(
+    full: &[FlatDbEntry],
+    by_source: &HashMap<String, ExplorerTypeFilter>,
+) -> Vec<FlatDbEntry> {
+    if by_source.is_empty() {
+        return full.to_vec();
+    }
+    let mut keep = vec![false; full.len()];
+    let mut any_filter = false;
+    for (i, e) in full.iter().enumerate() {
+        let f = by_source
+            .get(&e.source_id)
+            .copied()
+            .unwrap_or(ExplorerTypeFilter::All);
+        if f == ExplorerTypeFilter::All {
+            keep[i] = true;
+            continue;
+        }
+        any_filter = true;
+        if f.matches_entry(e) {
+            keep[i] = true;
+            mark_ancestors(full, i, &mut keep);
+        }
+    }
+    if !any_filter {
+        return full.to_vec();
+    }
+    // Sources / databases with All keep everything already marked; for filtered
+    // sources, also keep non-leaf structural rows only via ancestors.
+    full.iter()
+        .enumerate()
+        .filter_map(|(i, e)| keep[i].then(|| e.clone()))
+        .collect()
+}
+
+fn mark_ancestors(full: &[FlatDbEntry], i: usize, keep: &mut [bool]) {
+    let mut depth = full[i].depth;
+    for j in (0..i).rev() {
+        if full[j].depth < depth {
+            keep[j] = true;
+            depth = full[j].depth;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+}
+
+fn relation_node(
+    source_id: &str,
+    database: Option<String>,
+    schema: &str,
+    name: &str,
+    table_type: &str,
+) -> DbTreeNode {
+    let upper = table_type.to_ascii_uppercase();
+    let (kind, query_sql) = if upper.contains("MATERIALIZED") {
+        (DbNodeKind::View, Some("MATERIALIZED VIEW".into()))
+    } else if upper.contains("VIEW") {
+        (DbNodeKind::View, None)
+    } else {
+        (DbNodeKind::Table, None)
+    };
+    let id_db = database.clone().unwrap_or_default();
+    DbTreeNode {
+        id: format!("{source_id}::table::{id_db}::{schema}::{name}"),
+        label: name.into(),
+        kind,
+        source_id: source_id.into(),
+        database,
+        schema: Some(schema.into()),
+        table: Some(name.into()),
+        query_sql,
+        children: Vec::new(),
+        expanded: false,
+    }
+}
+
+fn object_folder(
+    source_id: &str,
+    database: Option<String>,
+    schema: &str,
+    slug: &str,
+    label: &str,
+    children: Vec<DbTreeNode>,
+) -> DbTreeNode {
+    let id_db = database.clone().unwrap_or_default();
+    DbTreeNode {
+        id: format!("{source_id}::objfolder::{id_db}::{schema}::{slug}"),
+        label: label.into(),
+        kind: DbNodeKind::Group,
+        source_id: source_id.into(),
+        database,
+        schema: Some(schema.into()),
+        table: Some(slug.into()),
+        query_sql: None,
+        children,
+        expanded: false,
+    }
+}
+
+fn push_folder_if(
+    out: &mut Vec<DbTreeNode>,
+    source_id: &str,
+    database: Option<String>,
+    schema: &str,
+    slug: &str,
+    label: &str,
+    children: Vec<DbTreeNode>,
+) {
+    if children.is_empty() {
+        return;
+    }
+    out.push(object_folder(
+        source_id, database, schema, slug, label, children,
+    ));
+}
+
+fn group_relation_folders(
+    source_id: &str,
+    database: Option<String>,
+    schema: &str,
+    nodes: Vec<DbTreeNode>,
+) -> Vec<DbTreeNode> {
+    let mut tables = Vec::new();
+    let mut views = Vec::new();
+    let mut matviews = Vec::new();
+    for n in nodes {
+        match n.kind {
+            DbNodeKind::View
+                if n.query_sql.as_deref() == Some("MATERIALIZED VIEW") =>
+            {
+                matviews.push(n);
+            }
+            DbNodeKind::View => views.push(n),
+            _ => tables.push(n),
+        }
+    }
+    let mut folders = Vec::new();
+    push_folder_if(
+        &mut folders,
+        source_id,
+        database.clone(),
+        schema,
+        "tables",
+        "Tables",
+        tables,
+    );
+    push_folder_if(
+        &mut folders,
+        source_id,
+        database.clone(),
+        schema,
+        "views",
+        "Views",
+        views,
+    );
+    push_folder_if(
+        &mut folders,
+        source_id,
+        database,
+        schema,
+        "matviews",
+        "Materialized views",
+        matviews,
+    );
+    folders
+}
+
+/// Expand Tables/Views/MatViews (+ Partitions) so `table` is reachable without manual open (#7).
+fn expand_folders_to_relation(tree: &mut [DbTreeNode], schema_id: &str, table: &str) {
+    let Some(schema) = find_node_mut(tree, schema_id) else {
+        return;
+    };
+    for folder in &mut schema.children {
+        if folder.kind != DbNodeKind::Group {
+            continue;
+        }
+        let found = folder.children.iter().any(|c| c.table.as_deref() == Some(table))
+            || folder.children.iter().any(|c| {
+                c.children.iter().any(|g| {
+                    g.table.as_deref().is_some_and(|s| s.starts_with("partitions"))
+                        && g.children
+                            .iter()
+                            .any(|p| p.table.as_deref() == Some(table))
+                })
+            });
+        if !found {
+            // Parent of a partition?
+            let parent_hit = folder.children.iter_mut().find(|c| {
+                c.children.iter().any(|g| {
+                    g.children
+                        .iter()
+                        .any(|p| p.table.as_deref() == Some(table))
+                })
+            });
+            if let Some(parent) = parent_hit {
+                folder.expanded = true;
+                parent.expanded = true;
+                for g in &mut parent.children {
+                    if g.table
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("partitions"))
+                    {
+                        g.expanded = true;
+                    }
+                }
+                return;
+            }
+            continue;
+        }
+        folder.expanded = true;
+        for child in &mut folder.children {
+            if child.table.as_deref() == Some(table) {
+                return;
+            }
+            // Expand partition parent when searching for the parent itself with kids.
+            if child.table.as_deref() == Some(table) {
+                child.expanded = true;
+            }
+        }
+        return;
+    }
 }
 
 fn admin_query_node(
@@ -13486,6 +14185,109 @@ mod explorer_schema_filter_tests {
         assert!(!is_user_pg_schema("pg_temp_20"));
         assert!(!is_user_pg_schema("pg_toast_temp_20"));
         assert!(!is_user_pg_schema(""));
+    }
+
+    #[test]
+    fn explorer_type_filter_cycles_and_labels() {
+        let mut f = ExplorerTypeFilter::All;
+        for expected in [
+            ExplorerTypeFilter::Tables,
+            ExplorerTypeFilter::Views,
+            ExplorerTypeFilter::MatViews,
+            ExplorerTypeFilter::Routines,
+            ExplorerTypeFilter::Sequences,
+            ExplorerTypeFilter::All,
+        ] {
+            f = f.cycle();
+            assert_eq!(f, expected);
+            assert!(!f.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn filter_flat_by_type_keeps_ancestors_hides_empty_folders() {
+        let full = vec![
+            FlatDbEntry {
+                id: "src".into(),
+                label: "pg".into(),
+                kind: DbNodeKind::Source,
+                source_id: "s1".into(),
+                database: None,
+                schema: None,
+                table: None,
+                query_sql: None,
+                depth: 0,
+                expanded: true,
+            },
+            FlatDbEntry {
+                id: "schema".into(),
+                label: "public".into(),
+                kind: DbNodeKind::Schema,
+                source_id: "s1".into(),
+                database: Some("db".into()),
+                schema: Some("public".into()),
+                table: None,
+                query_sql: None,
+                depth: 1,
+                expanded: true,
+            },
+            FlatDbEntry {
+                id: "folder-tables".into(),
+                label: "Tables".into(),
+                kind: DbNodeKind::Group,
+                source_id: "s1".into(),
+                database: Some("db".into()),
+                schema: Some("public".into()),
+                table: Some("tables".into()),
+                query_sql: None,
+                depth: 2,
+                expanded: true,
+            },
+            FlatDbEntry {
+                id: "t1".into(),
+                label: "orders".into(),
+                kind: DbNodeKind::Table,
+                source_id: "s1".into(),
+                database: Some("db".into()),
+                schema: Some("public".into()),
+                table: Some("orders".into()),
+                query_sql: None,
+                depth: 3,
+                expanded: false,
+            },
+            FlatDbEntry {
+                id: "folder-views".into(),
+                label: "Views".into(),
+                kind: DbNodeKind::Group,
+                source_id: "s1".into(),
+                database: Some("db".into()),
+                schema: Some("public".into()),
+                table: Some("views".into()),
+                query_sql: None,
+                depth: 2,
+                expanded: true,
+            },
+            FlatDbEntry {
+                id: "v1".into(),
+                label: "v_orders".into(),
+                kind: DbNodeKind::View,
+                source_id: "s1".into(),
+                database: Some("db".into()),
+                schema: Some("public".into()),
+                table: Some("v_orders".into()),
+                query_sql: None,
+                depth: 3,
+                expanded: false,
+            },
+        ];
+        let mut by = HashMap::new();
+        by.insert("s1".into(), ExplorerTypeFilter::Tables);
+        let filtered = filter_flat_by_type(&full, &by);
+        let labels: Vec<_> = filtered.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"orders"));
+        assert!(labels.contains(&"Tables"));
+        assert!(!labels.contains(&"v_orders"));
+        assert!(!labels.contains(&"Views"));
     }
 
     #[test]
