@@ -177,6 +177,8 @@ pub struct App {
     anim_origin: Instant,
     /// Last known terminal width for horizontal-scroll calculations (#26).
     last_term_width: u16,
+    /// Refresh Search Everywhere catalog on next tick after typing (#10).
+    pending_everywhere_refresh: bool,
 }
 
 impl App {
@@ -225,6 +227,7 @@ impl App {
             theme_before_preview: None,
             anim_origin: Instant::now(),
             last_term_width: 120,
+            pending_everywhere_refresh: false,
         };
         app.config.remember_project(&app.workspace.root);
         app.db.query_timeout_secs = app.config.database.query_timeout_secs;
@@ -867,10 +870,55 @@ impl App {
         );
     }
 
-    fn open_search_everywhere(&mut self) {
+    async fn open_search_everywhere(&mut self) {
+        let catalog = self.catalog_palette_rows("").await;
+        let file_tabs = self.sql_tab_palette_items();
         self.ui.mode = Mode::Palette;
-        self.ui.palette = Palette::open_search_everywhere(self.db_object_palette_items());
-        self.set_status("Search Everywhere · tools · objects · commands", false);
+        self.ui.palette = Palette::open_search_everywhere(catalog, file_tabs);
+        self.pending_everywhere_refresh = false;
+        self.set_status(
+            "Search Everywhere · Tab scope · catalog not only Explorer",
+            false,
+        );
+    }
+
+    fn sql_tab_palette_items(&self) -> Vec<(String, String, String)> {
+        self.db
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    t.title.clone(),
+                    "SQL tab".into(),
+                    format!("filetab:{i}"),
+                )
+            })
+            .collect()
+    }
+
+    async fn catalog_palette_rows(&mut self, needle: &str) -> Vec<(String, String, String)> {
+        match self.db.search_catalog(needle, 200).await {
+            Ok(hits) => hits
+                .into_iter()
+                .map(|h| (h.name.clone(), h.subtitle(), h.palette_id()))
+                .collect(),
+            Err(e) => {
+                self.set_status(format!("catalog search: {e:#}"), true);
+                Vec::new()
+            }
+        }
+    }
+
+    async fn refresh_search_everywhere_catalog(&mut self) {
+        if self.ui.mode != Mode::Palette
+            || self.ui.palette.mode != ide_ui::PaletteMode::SearchEverywhere
+        {
+            return;
+        }
+        let q = self.ui.palette.query.clone();
+        let catalog = self.catalog_palette_rows(&q).await;
+        self.ui.palette.replace_everywhere_catalog(catalog);
     }
 
     fn resume_console_editing(&mut self) {
@@ -2144,17 +2192,8 @@ impl App {
                     .unwrap_or_else(|| "source".into());
                 Some((name, msg))
             });
-        // Heavy Structure/STATS: dwell 3s on table/view so fast Explorer nav stays fluid (#284).
-        let heavy = self
-            .db
-            .flat
-            .get(self.db.selected)
-            .is_some_and(|e| matches!(e.kind, DbNodeKind::Table | DbNodeKind::View));
-        if heavy {
-            self.db.schedule_structure_dwell();
-        } else if let Err(e) = self.db.refresh_structure_for_selection().await {
-            self.set_status(format!("structure: {e:#}"), true);
-        }
+        // Dwell for every Explorer move — never await Structure on arrow keys (#5 / #284).
+        self.db.schedule_structure_dwell();
         if let Some((name, msg)) = connect_err {
             self.set_status(format!("{name} · connect error · {msg}"), true);
         } else if let Some(full) = self.db.selection_full_path() {
@@ -2597,6 +2636,9 @@ impl App {
                     if c != '\n' && c != '\r' {
                         self.ui.palette.push_char(c);
                     }
+                }
+                if self.ui.palette.mode == ide_ui::PaletteMode::SearchEverywhere {
+                    self.pending_everywhere_refresh = true;
                 }
                 self.preview_palette_theme();
                 true
@@ -6735,6 +6777,9 @@ impl App {
                 Mode::AgentForm => self.agent_form_pop_char(),
                 Mode::Palette => {
                     self.ui.palette.backspace();
+                    if self.ui.palette.mode == ide_ui::PaletteMode::SearchEverywhere {
+                        self.pending_everywhere_refresh = true;
+                    }
                     self.preview_palette_theme();
                 }
                 Mode::Insert if self.editing_db_sql() => {
@@ -6939,7 +6984,7 @@ impl App {
                     && self.ui.db_surface == DbSurface::Studio
                 {
                     // In Studio prefer Search Everywhere; project grep still available.
-                    self.open_search_everywhere();
+                    self.open_search_everywhere().await;
                 } else {
                     self.ui.mode = Mode::Search;
                     self.ui.search_input.clear();
@@ -6964,7 +7009,7 @@ impl App {
             }
             Action::GoToDdl => self.go_to_ddl().await?,
             Action::OpenCreateMenu => self.open_create_menu(),
-            Action::SearchEverywhere => self.open_search_everywhere(),
+            Action::SearchEverywhere => self.open_search_everywhere().await,
             Action::OpenConsoleDatabase => self.open_console_database_palette().await,
             Action::OpenConsoleSchema => self.open_console_schema_palette().await,
             Action::CycleSelectLimit => self.cycle_select_limit(),
@@ -7199,6 +7244,20 @@ impl App {
             Action::ToggleExplorerSystemSchemas => {
                 self.db.toggle_explorer_show_system();
                 self.set_status(self.db.status.clone(), false);
+            }
+            Action::CycleSearchEverywhereScope => {
+                if self.ui.mode == Mode::Palette
+                    && self.ui.palette.mode == ide_ui::PaletteMode::SearchEverywhere
+                {
+                    self.ui.palette.cycle_everywhere_scope();
+                    self.set_status(
+                        format!(
+                            "Search Everywhere · {}",
+                            self.ui.palette.everywhere_scope.label()
+                        ),
+                        false,
+                    );
+                }
             }
             Action::DeleteDataSource => {
                 if let Some(id) = self.selected_connection_id() {
@@ -7971,6 +8030,37 @@ impl App {
                 return Ok(());
             }
         }
+        if mode == PaletteMode::SearchEverywhere && item.id.starts_with("dbcat:") {
+            if let Some(hit) = ide_db::CatalogHit::parse_palette_id(&item.id) {
+                match self.db.reveal_catalog_hit(&hit).await {
+                    Ok(true) => {
+                        self.db
+                            .ensure_explorer_visible(Self::explorer_view_h(24));
+                        self.ui.focus = Focus::Database;
+                        let _ = self.db.refresh_structure_for_selection().await;
+                        self.set_status(format!("→ {} ({})", hit.name, hit.kind), false);
+                    }
+                    Ok(false) => self.set_status(
+                        format!("catalog hit not in tree yet · {}", hit.name),
+                        true,
+                    ),
+                    Err(e) => self.set_status(format!("reveal: {e:#}"), true),
+                }
+            }
+            return Ok(());
+        }
+        if mode == PaletteMode::SearchEverywhere {
+            if let Some(idx_str) = item.id.strip_prefix("filetab:") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if idx < self.db.tabs.len() {
+                        self.db.select_tab(idx);
+                        self.ui.focus = Focus::Editor;
+                        self.set_status(format!("→ tab {}", item.label), false);
+                    }
+                }
+                return Ok(());
+            }
+        }
         if let Some(idx_str) = item.id.strip_prefix("workspace:") {
             if let Ok(idx) = idx_str.parse::<usize>() {
                 self.open_db_source_at(idx).await;
@@ -8346,7 +8436,7 @@ impl App {
             "create_menu" => self.open_create_menu(),
             "console_database" => self.open_console_database_palette().await,
             "console_schema" => self.open_console_schema_palette().await,
-            "search_everywhere" => self.open_search_everywhere(),
+            "search_everywhere" => self.open_search_everywhere().await,
             "create_query" => match self.db.open_create_stub("create_query") {
                 Ok(()) => {
                     self.ui.focus = Focus::Editor;
@@ -9938,6 +10028,10 @@ async fn event_loop(
         tokio::select! {
             _ = tick.tick() => {
                 app.clear_expired_status();
+                if app.pending_everywhere_refresh {
+                    app.pending_everywhere_refresh = false;
+                    app.refresh_search_everywhere_catalog().await;
+                }
                 // Explorer Structure dwell → load after 3s rest (#284).
                 if app.ui.product == ProductMode::Database
                     && !app.db.query_running
@@ -11499,6 +11593,11 @@ async fn event_loop(
                                         && !key.modifiers.contains(KeyModifiers::SUPER)
                                     {
                                         app.ui.palette.push_char(c);
+                                        if app.ui.palette.mode
+                                            == ide_ui::PaletteMode::SearchEverywhere
+                                        {
+                                            app.pending_everywhere_refresh = true;
+                                        }
                                         app.preview_palette_theme();
                                     }
                                 }

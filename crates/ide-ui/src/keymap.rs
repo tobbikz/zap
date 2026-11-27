@@ -254,6 +254,8 @@ pub enum Action {
     CycleExplorerTypeFilter,
     /// Explorer: toggle system / temp schemas (#11).
     ToggleExplorerSystemSchemas,
+    /// Search Everywhere: cycle All / Database / Actions / Files (#10).
+    CycleSearchEverywhereScope,
     /// Run only the statement under the cursor (or selection) (#20).
     RunQueryAtCursor,
     /// Results: sort focused column ascending/descending/off (#31).
@@ -543,6 +545,7 @@ impl Keymap {
                 (_, KeyCode::Up) => Some(Action::MoveUp),
                 (_, KeyCode::Down) => Some(Action::MoveDown),
                 (_, KeyCode::Backspace) => Some(Action::Backspace),
+                (_, KeyCode::Tab) => Some(Action::CycleSearchEverywhereScope),
                 (true, KeyCode::Char('v') | KeyCode::Char('V')) => Some(Action::ClipboardPaste),
                 _ => None,
             },
