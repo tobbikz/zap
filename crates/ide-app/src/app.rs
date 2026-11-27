@@ -5277,6 +5277,21 @@ impl App {
     }
 
     async fn format_active(&mut self) -> Result<()> {
+        // Studio Console: Format key formats SQL, not the code-editor buffer (#15).
+        if self.ui.product == ProductMode::Database
+            && self.ui.db_surface == DbSurface::Studio
+            && (self.editing_db_sql()
+                || matches!(
+                    self.ui.focus,
+                    Focus::Editor | Focus::Results | Focus::Database | Focus::Structure
+                ))
+        {
+            match self.db.format_active_sql() {
+                Ok(()) => self.set_status(self.db.status.clone(), false),
+                Err(e) => self.set_status(format!("format: {e:#}"), true),
+            }
+            return Ok(());
+        }
         let Some(buf) = self.active_buffer() else {
             self.set_status("no buffer", true);
             return Ok(());

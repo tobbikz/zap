@@ -2592,6 +2592,42 @@ fn split_table_filter_area(inner: Rect) -> (Rect, Rect) {
 }
 
 fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
+    // Query error: dedicated empty state (modal still shows detail) — not a fake 1×1 grid (#23).
+    if let Some(err) = ctx.ui.query_error.as_deref() {
+        let block = theme::pane_block(
+            if ctx.ui.focus == Focus::Results {
+                " Results · error "
+            } else {
+                " results · error "
+            },
+            ctx.ui.focus == Focus::Results,
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let short = if err.chars().count() > 120 {
+            format!("{}…", err.chars().take(119).collect::<String>())
+        } else {
+            err.to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("  Query failed", theme::style_err())),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  {short}"),
+                    theme::style_muted(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Esc dismiss · edit SQL · F5 retry",
+                    theme::style_faint(),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    }
+
     let focused = ctx.ui.focus == Focus::Results;
     let border = theme::border(focused);
     let Some(db) = ctx.db else {
@@ -2629,6 +2665,46 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         return;
     };
 
+    // True void: no columns and no rows — not a 0×0 table grid (#23).
+    if result.columns.is_empty() {
+        let block = theme::pane_block(
+            if focused {
+                " Results · no result set "
+            } else {
+                " results · no result set "
+            },
+            focused,
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let body = if table_tab && inner.height >= 3 {
+            let (filter_area, rest) = split_table_filter_area(inner);
+            render_table_filter_bars(frame, filter_area, ctx, db);
+            rest
+        } else {
+            inner
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  No columns returned",
+                    theme::style_muted(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Empty SELECT without metadata, or a non-query statement.",
+                    theme::style_faint(),
+                )),
+                Line::from(Span::styled(
+                    "  F5 retry · check SQL / connection",
+                    theme::style_faint(),
+                )),
+            ]),
+            body,
+        );
+        return;
+    }
+
     let table_label = match (&result.source_schema, &result.source_table) {
         (Some(s), Some(t)) => format!("{s}.{t}"),
         (None, Some(t)) => t.clone(),
@@ -2648,8 +2724,12 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let nrows = result.rows.len();
     let ncols = result.columns.len();
     let compact = ctx.ui.results_compact;
-    // Quiet title: dims + optional table · dirty. Secondary meta is faint (no chip dump).
-    let mut title_core = format!("{nrows}×{ncols}");
+    // Quiet title: empty-with-columns reads as "0 rows · N cols", not "0×N" (#23).
+    let mut title_core = if nrows == 0 {
+        format!("0 rows · {ncols} cols")
+    } else {
+        format!("{nrows}×{ncols}")
+    };
     if !table_label.is_empty() {
         title_core = format!("{title_core} · {table_label}");
     }
@@ -4452,7 +4532,8 @@ fn studio_context_keys(ui: &UiState) -> Vec<(&'static str, &'static str)> {
 }
 
 fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
-    // Busy spinner · toast · otherwise tuile footer-key chips.
+    // Busy spinner replaces chips (query in flight). Success/info toasts keep a
+    // short key strip so Esc / F5 stay visible (#22).
     if let Some(busy) = ctx.ui.busy_label.as_deref() {
         let line = Line::from(vec![
             Span::styled(
@@ -4467,31 +4548,31 @@ fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         );
         return;
     }
+
+    let width = area.width as usize;
+    let mut spans = Vec::new();
     if let Some(msg) = &ctx.ui.status {
-        let text = if msg.text.chars().count() > 90 {
-            format!("{}…", msg.text.chars().take(89).collect::<String>())
+        let toast_budget = (width / 2).clamp(18, 48);
+        let text = if msg.text.chars().count() > toast_budget {
+            format!(
+                "{}…",
+                msg.text.chars().take(toast_budget.saturating_sub(1)).collect::<String>()
+            )
         } else {
             msg.text.clone()
         };
-        let mut spans = Vec::new();
         match msg.tone {
             StatusTone::Success => spans.push(Span::styled(" ok ", theme::style_ok())),
             StatusTone::Error => spans.push(Span::styled(" err ", theme::style_err())),
             StatusTone::Info => spans.push(Span::styled(" · ", theme::Role::Faint.style())),
         }
         spans.push(Span::styled(format!(" {text} "), theme::Role::Muted.style()));
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
-            area,
-        );
-        return;
+        spans.push(Span::styled("│", theme::Role::Faint.style()));
     }
 
     let keys = studio_context_keys(ctx.ui);
-    let mut spans = Vec::new();
     theme::extend_footer_keys(&mut spans, &keys);
     // Truncate whole chips from the right if the footer is narrow.
-    let width = area.width as usize;
     while spans.len() >= 2 {
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         if used <= width.saturating_sub(1) {

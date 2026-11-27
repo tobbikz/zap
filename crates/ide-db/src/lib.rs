@@ -3305,7 +3305,9 @@ impl DbWorkspace {
                 tab.sql = sql.clone();
                 tab.source_id = Some(entry.source_id.clone());
                 tab.database = db.clone();
+                tab.schema = Some(schema.clone());
             }
+            self.active_schema = Some(schema.clone());
             self.sql = sql;
             self.last_result = None;
         } else {
@@ -3321,7 +3323,7 @@ impl DbWorkspace {
                 table_key: Some(table_key),
                 source_id: Some(entry.source_id.clone()),
                 database: db.clone(),
-                schema: None,
+                schema: Some(schema.clone()),
                 pinned: false,
                 where_clause: String::new(),
                 order_by: String::new(),
@@ -3333,6 +3335,7 @@ impl DbWorkspace {
                 results_filter: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
+            self.active_schema = Some(schema.clone());
             self.sql = sql;
             self.last_result = None;
         }
@@ -3360,6 +3363,33 @@ impl DbWorkspace {
             .get(self.active_tab)
             .map(|t| t.order_by.as_str())
             .unwrap_or("")
+    }
+
+    /// Column names from the loaded Structure cache — fallback when an empty
+    /// SELECT returns no driver column metadata (#23).
+    fn structure_column_names_for(
+        &self,
+        schema: &Option<String>,
+        table: &Option<String>,
+    ) -> Option<Vec<String>> {
+        let (Some(sch), Some(tbl)) = (schema.as_deref(), table.as_deref()) else {
+            return None;
+        };
+        // Prefer matching the active table tab so we don't reuse stale Structure.
+        if let Some(key) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.table_key.as_deref())
+        {
+            let suffix = format!("{sch}.{tbl}");
+            if !key.ends_with(&suffix) && !key.ends_with(&format!(".{tbl}")) {
+                return None;
+            }
+        }
+        if self.structure.is_empty() {
+            return None;
+        }
+        Some(self.structure.iter().map(|c| c.name.clone()).collect())
     }
 
     /// Rebuild SELECT for the active table tab from WHERE / ORDER BY bars.
@@ -6027,6 +6057,13 @@ impl DbWorkspace {
         }
         let elapsed_ms = start.elapsed().as_millis();
         let (schema, table) = parse_select_target(statements.last().map(|s| s.as_str()).unwrap_or(""));
+        // Empty SELECT with no driver column meta: fall back to Structure COLUMNS (#23).
+        if last.columns.is_empty() {
+            if let Some(cols) = self.structure_column_names_for(&schema, &table) {
+                last.columns = cols;
+                last.affected = Some(0);
+            }
+        }
         // Never attach table meta to a still-headerless result (#43).
         if !last.columns.is_empty() {
             let pks = if let (Some(ref sch), Some(ref tbl)) = (&schema, &table) {
@@ -6150,7 +6187,20 @@ impl DbWorkspace {
                 .await
                 .unwrap_or(0);
             self.query_backend_pid.store(id, Ordering::Relaxed);
-            let result = exec_mysql_conn(&mut *conn, exec_sql).await;
+            let mut result = exec_mysql_conn(&mut *conn, exec_sql).await;
+            // Empty SELECT → 0 rows still needs column metadata (#23 / #43).
+            if let Ok(ref mut q) = result {
+                if q.columns.is_empty() && is_query(exec_sql) {
+                    if let Ok(stmt) = conn.prepare(exec_sql).await {
+                        q.columns = stmt
+                            .columns()
+                            .iter()
+                            .map(|c| c.name().to_string())
+                            .collect();
+                        q.affected = Some(0);
+                    }
+                }
+            }
             self.query_backend_pid.store(0, Ordering::Relaxed);
             return result;
         }
