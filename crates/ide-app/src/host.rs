@@ -124,6 +124,7 @@ pub fn keyboard_protocol() -> bool {
 }
 
 fn resolve_glyphs(pref: IconPref, class: FontClass) -> GlyphSet {
+    // Env and explicit config always win (#3).
     if let Ok(raw) = std::env::var("ZAP_ICONS") {
         if let Some(set) = parse_env(&raw) {
             return set;
@@ -134,8 +135,10 @@ fn resolve_glyphs(pref: IconPref, class: FontClass) -> GlyphSet {
         IconPref::Safe => GlyphSet::Safe,
         IconPref::Ascii => GlyphSet::Ascii,
         IconPref::Auto => {
-            // WT + Cascadia Mono NF can draw Nerd PUA; ConPTY may still say "Consolas".
-            if windows_terminal() || class == FontClass::Nerd {
+            // Nerd face → Nerd. WT often lies (ConPTY reports Consolas under Cascadia NF);
+            // trust WT_SESSION for rich PUA so Explorer matches Linux (#3).
+            // Plain Cascadia / JetBrains without NF stay Safe to avoid tofu.
+            if class == FontClass::Nerd || windows_terminal() || force_rich_glyphs() {
                 GlyphSet::Nerd
             } else if cfg!(windows) {
                 GlyphSet::Safe

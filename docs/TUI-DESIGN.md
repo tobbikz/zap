@@ -52,7 +52,7 @@ Disable with `ZAP_ANIMATIONS=0` (or `false` / `off` / `no`).
 
 ## Modals
 
-`widgets::paint_scrim` / `modal_chrome` erase the stage with a real cell fill (Block background alone can leave ghosts). Palette, connect form, cell inspector, admin, and monitor use the opaque scrim.
+`widgets::paint_scrim` / `modal_chrome` paint a **frosted dither wash** (`░` checkerboard on a near-black scrim) so Studio chrome still peeks through — not a hard black Clear wipe. Palette, connect form, cell inspector, admin, and monitor use this scrim.
 
 ## Windows
 

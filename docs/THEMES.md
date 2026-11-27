@@ -64,11 +64,11 @@ icons = "auto"
 | Host | Icons | Borders | Caret |
 |------|--------|---------|--------|
 | Linux / macOS | Nerd Font | rounded | block `▌` |
-| Windows + Nerd Font face | Nerd Font | rounded | block |
-| Windows Terminal (Cascadia) | Consolas-safe (`● ▪ ▶`) | rounded | block |
-| Windows PowerShell (Consolas) | Consolas-safe | square `┌┐` | vertical bar |
+| Windows + Nerd Font face (`… NF`, CaskaydiaCove, …) | Nerd Font | rounded | block |
+| Windows Terminal (`WT_SESSION`) | Nerd Font (ConPTY often misreports Consolas) | rounded | block |
+| Windows PowerShell / conhost (Consolas) | Consolas-safe (`P` `●` `▪`) | square `┌┐` | vertical bar |
 
-Override with `icons` or the `ZAP_ICONS` environment variable (`nerd`, `safe`, `ascii`).
+Override with `[theme] icons = "nerd"` (always wins) or `ZAP_ICONS=nerd|safe|ascii`. Press `?` in Studio to see the active set (`icons: nerd|safe|ascii`).
 
 Motion (busy spinner / pulse) can be disabled with `ZAP_ANIMATIONS=0`.
 
