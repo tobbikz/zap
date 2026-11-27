@@ -569,6 +569,8 @@ impl Keymap {
                 (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
                 (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
                 (false, false, KeyCode::Char('o')) => Some(Action::OpenDbObjectPalette),
+                // `/` filters the visible Explorer tree by name (#9).
+                (false, false, KeyCode::Char('/')) => Some(Action::Find),
                 (false, false, KeyCode::Char('c')) => Some(Action::CollapseAll),
                 (false, true, KeyCode::Char('C')) | (false, false, KeyCode::Char('C')) => {
                     Some(Action::CollapseOthers)

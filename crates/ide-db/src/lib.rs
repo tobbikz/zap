@@ -1600,6 +1600,8 @@ pub struct DbWorkspace {
     pub select_limit: usize,
     /// Explorer health after last expand/ping.
     pub connection_health: HashMap<String, ConnHealth>,
+    /// Local Explorer name filter (`/` when Explorer focused) (#9).
+    pub explorer_filter: String,
     /// Cell edit undo stack, grouped so paste can undo atomically.
     pub cell_undo: Vec<CellUndoBatch>,
     /// Backend pid/id for the in-flight query connection (PG/MySQL/MSSQL).
@@ -1748,6 +1750,7 @@ impl Default for DbWorkspace {
             query_timeout_secs: 120,
             select_limit: RESULT_PAGE_SIZE,
             connection_health: HashMap::new(),
+            explorer_filter: String::new(),
             cell_undo: Vec::new(),
             query_backend_pid: Arc::new(AtomicI64::new(0)),
             query_cancel_token: None,
@@ -2276,10 +2279,15 @@ impl DbWorkspace {
     }
 
     pub fn rebuild_flat(&mut self) {
-        self.flat.clear();
+        let mut full = Vec::new();
         for node in &self.tree {
-            flatten(node, 0, &mut self.flat);
+            flatten(node, 0, &mut full);
         }
+        self.flat = if self.explorer_filter.trim().is_empty() {
+            full
+        } else {
+            filter_flat_with_ancestors(&full, &self.explorer_filter)
+        };
         if self.selected >= self.flat.len() {
             self.selected = self.flat.len().saturating_sub(1);
         }
@@ -9778,6 +9786,43 @@ fn flatten(node: &DbTreeNode, depth: usize, out: &mut Vec<FlatDbEntry>) {
             flatten(c, depth + 1, out);
         }
     }
+}
+
+/// Keep matching rows plus their ancestors so `db / schema / table` stays visible (#9).
+fn filter_flat_with_ancestors(full: &[FlatDbEntry], filter: &str) -> Vec<FlatDbEntry> {
+    let needle = filter.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return full.to_vec();
+    }
+    let mut keep = vec![false; full.len()];
+    for (i, e) in full.iter().enumerate() {
+        let hay = format!(
+            "{} {} {} {}",
+            e.label,
+            e.table.as_deref().unwrap_or(""),
+            e.schema.as_deref().unwrap_or(""),
+            e.database.as_deref().unwrap_or("")
+        )
+        .to_ascii_lowercase();
+        if !hay.contains(&needle) {
+            continue;
+        }
+        keep[i] = true;
+        let mut depth = e.depth;
+        for j in (0..i).rev() {
+            if full[j].depth < depth {
+                keep[j] = true;
+                depth = full[j].depth;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    full.iter()
+        .enumerate()
+        .filter_map(|(i, e)| keep[i].then(|| e.clone()))
+        .collect()
 }
 
 fn admin_query_node(
