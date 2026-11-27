@@ -46,6 +46,17 @@ pub fn paint_scrim(frame: &mut Frame, screen: Rect) {
     frame.render_widget(Paragraph::new(lines), screen);
 }
 
+/// Solid black wash — Admin / dense ops modals (no wallpaper bleed).
+pub fn paint_scrim_solid(frame: &mut Frame, screen: Rect) {
+    if screen.width == 0 || screen.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Block::default().style(Style::default().bg(ratatui::style::Color::Black)),
+        screen,
+    );
+}
+
 /// Opaque modal stack: scrim + plate fill + focused border (caller may re-title).
 pub fn modal_chrome(frame: &mut Frame, screen: Rect, area: Rect) {
     paint_scrim(frame, screen);
